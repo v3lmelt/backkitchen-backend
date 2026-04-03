@@ -5,19 +5,27 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
 from app.schemas.schemas import UserCreate, UserRead
+from app.security import get_current_user, hash_password
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
 
 @router.get("", response_model=list[UserRead])
-def list_users(db: Session = Depends(get_db)) -> list[User]:
+def list_users(
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+) -> list[User]:
+    del current_user
     stmt = select(User).order_by(User.id)
     return list(db.scalars(stmt).all())
 
 
 @router.post("", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-def create_user(payload: UserCreate, db: Session = Depends(get_db)) -> User:
-    # Check for duplicate username
+def create_user(
+    payload: UserCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> User:
+    del current_user
     existing = db.scalars(select(User).where(User.username == payload.username)).first()
     if existing is not None:
         raise HTTPException(
@@ -25,7 +33,6 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)) -> User:
             detail=f"Username '{payload.username}' is already taken.",
         )
 
-    # Check for duplicate email
     if payload.email is not None:
         existing_email = db.scalars(select(User).where(User.email == payload.email)).first()
         if existing_email is not None:
@@ -34,7 +41,11 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)) -> User:
                 detail=f"Email '{payload.email}' is already registered.",
             )
 
-    user = User(**payload.model_dump())
+    data = payload.model_dump()
+    password = data.pop("password", None)
+    if password:
+        data["password"] = hash_password(password)
+    user = User(**data)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -42,7 +53,12 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)) -> User:
 
 
 @router.get("/{user_id}", response_model=UserRead)
-def get_user(user_id: int, db: Session = Depends(get_db)) -> User:
+def get_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> User:
+    del current_user
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")

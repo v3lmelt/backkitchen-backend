@@ -26,22 +26,48 @@ class IssueStatus(str, enum.Enum):
     RESOLVED = "resolved"
 
 
+class IssuePhase(str, enum.Enum):
+    PEER = "peer"
+    MASTERING = "mastering"
+    FINAL_REVIEW = "final_review"
+
+
 class Issue(Base):
     __tablename__ = "issues"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    track_id: Mapped[int] = mapped_column(Integer, ForeignKey("tracks.id"), nullable=False, index=True)
+    track_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tracks.id"), nullable=False, index=True
+    )
     author_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    phase: Mapped[IssuePhase] = mapped_column(
+        Enum(IssuePhase, values_callable=lambda items: [item.value for item in items]),
+        nullable=False,
+        default=IssuePhase.PEER,
+    )
+    workflow_cycle: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    source_version_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("track_source_versions.id"), nullable=True, index=True
+    )
+    master_delivery_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("master_deliveries.id"), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     issue_type: Mapped[IssueType] = mapped_column(
-        Enum(IssueType), nullable=False, default=IssueType.POINT
+        Enum(IssueType, values_callable=lambda items: [item.value for item in items]),
+        nullable=False,
+        default=IssueType.POINT,
     )
     severity: Mapped[IssueSeverity] = mapped_column(
-        Enum(IssueSeverity), nullable=False, default=IssueSeverity.MAJOR
+        Enum(IssueSeverity, values_callable=lambda items: [item.value for item in items]),
+        nullable=False,
+        default=IssueSeverity.MAJOR,
     )
     status: Mapped[IssueStatus] = mapped_column(
-        Enum(IssueStatus), nullable=False, default=IssueStatus.OPEN
+        Enum(IssueStatus, values_callable=lambda items: [item.value for item in items]),
+        nullable=False,
+        default=IssueStatus.OPEN,
     )
     time_start: Mapped[float] = mapped_column(Float, nullable=False)
     time_end: Mapped[float | None] = mapped_column(Float, nullable=True)

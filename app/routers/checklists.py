@@ -4,9 +4,11 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.checklist import ChecklistItem
-from app.models.track import Track
+from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.schemas.schemas import ChecklistItemRead, ChecklistSubmit
+from app.security import get_current_user
+from app.workflow import build_checklist_read, current_source_version, ensure_track_visibility
 
 router = APIRouter(tags=["checklists"])
 
@@ -20,22 +22,30 @@ def submit_checklist(
     track_id: int,
     payload: ChecklistSubmit,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> list[ChecklistItemRead]:
-    # Validate track
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+    if track.status != TrackStatus.PEER_REVIEW or track.peer_reviewer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the assigned peer reviewer can submit the checklist.",
+        )
 
-    # Validate reviewer
-    reviewer = db.get(User, payload.reviewer_id)
-    if reviewer is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reviewer not found.")
+    source_version = current_source_version(track)
+    if source_version is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No source version is available for this track.",
+        )
 
-    # Delete existing checklist items for this track + reviewer, then re-create
     existing = db.scalars(
         select(ChecklistItem).where(
             ChecklistItem.track_id == track_id,
-            ChecklistItem.reviewer_id == payload.reviewer_id,
+            ChecklistItem.reviewer_id == current_user.id,
+            ChecklistItem.source_version_id == source_version.id,
         )
     ).all()
     for item in existing:
@@ -44,59 +54,49 @@ def submit_checklist(
 
     created: list[ChecklistItem] = []
     for item_data in payload.items:
-        ci = ChecklistItem(
+        item = ChecklistItem(
             track_id=track_id,
-            reviewer_id=payload.reviewer_id,
+            reviewer_id=current_user.id,
+            source_version_id=source_version.id,
+            workflow_cycle=track.workflow_cycle,
             label=item_data.label,
             passed=item_data.passed,
             note=item_data.note,
         )
-        db.add(ci)
-        created.append(ci)
+        db.add(item)
+        created.append(item)
 
     db.commit()
-    for ci in created:
-        db.refresh(ci)
-
-    return [
-        ChecklistItemRead(
-            id=ci.id,
-            track_id=ci.track_id,
-            reviewer_id=ci.reviewer_id,
-            label=ci.label,
-            passed=ci.passed,
-            note=ci.note,
-            created_at=ci.created_at,
-        )
-        for ci in created
-    ]
+    for item in created:
+        db.refresh(item)
+    return [build_checklist_read(item) for item in created]
 
 
 @router.get(
     "/api/tracks/{track_id}/checklist",
     response_model=list[ChecklistItemRead],
 )
-def get_checklist(track_id: int, db: Session = Depends(get_db)) -> list[ChecklistItemRead]:
+def get_checklist(
+    track_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[ChecklistItemRead]:
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+    source_version = current_source_version(track)
+    if source_version is None:
+        return []
 
-    stmt = (
-        select(ChecklistItem)
-        .where(ChecklistItem.track_id == track_id)
-        .order_by(ChecklistItem.id)
+    items = list(
+        db.scalars(
+            select(ChecklistItem)
+            .where(
+                ChecklistItem.track_id == track_id,
+                ChecklistItem.source_version_id == source_version.id,
+            )
+            .order_by(ChecklistItem.id)
+        ).all()
     )
-    items = list(db.scalars(stmt).all())
-
-    return [
-        ChecklistItemRead(
-            id=ci.id,
-            track_id=ci.track_id,
-            reviewer_id=ci.reviewer_id,
-            label=ci.label,
-            passed=ci.passed,
-            note=ci.note,
-            created_at=ci.created_at,
-        )
-        for ci in items
-    ]
+    return [build_checklist_read(item) for item in items]

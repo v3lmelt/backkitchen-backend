@@ -12,6 +12,10 @@ class ChecklistItem(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     track_id: Mapped[int] = mapped_column(Integer, ForeignKey("tracks.id"), nullable=False, index=True)
     reviewer_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    source_version_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("track_source_versions.id"), nullable=True, index=True
+    )
+    workflow_cycle: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     label: Mapped[str] = mapped_column(String(100), nullable=False)
     passed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)

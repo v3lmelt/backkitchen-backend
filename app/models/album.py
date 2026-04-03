@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -13,6 +13,10 @@ class Album(Base):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     cover_color: Mapped[str] = mapped_column(String(7), nullable=False, default="#8b5cf6")
+    producer_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
+    mastering_engineer_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
@@ -25,6 +29,15 @@ class Album(Base):
 
     tracks: Mapped[list["Track"]] = relationship(  # noqa: F821
         "Track", back_populates="album", cascade="all, delete-orphan"
+    )
+    producer: Mapped["User | None"] = relationship(  # noqa: F821
+        "User", foreign_keys=[producer_id]
+    )
+    mastering_engineer: Mapped["User | None"] = relationship(  # noqa: F821
+        "User", foreign_keys=[mastering_engineer_id]
+    )
+    members: Mapped[list["AlbumMember"]] = relationship(  # noqa: F821
+        "AlbumMember", back_populates="album", cascade="all, delete-orphan"
     )
 
     def __repr__(self) -> str:

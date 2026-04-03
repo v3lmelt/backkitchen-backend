@@ -6,22 +6,34 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import inspect, select, text
 
 from app.config import settings
 from app.database import Base, SessionLocal, engine
-from app.models.album import Album
-from app.models.checklist import ChecklistItem
-from app.models.comment import Comment
-from app.models.comment_image import CommentImage
-from app.models.issue import Issue, IssueSeverity, IssueStatus, IssueType
-from app.models.track import Track, TrackStatus
-from app.models.user import User
+from app.models import (  # noqa: F401
+    Album,
+    AlbumMember,
+    ChecklistItem,
+    Comment,
+    CommentImage,
+    Issue,
+    IssuePhase,
+    IssueSeverity,
+    IssueStatus,
+    IssueType,
+    MasterDelivery,
+    RejectionMode,
+    Track,
+    TrackSourceVersion,
+    TrackStatus,
+    User,
+)
 from app.routers import albums, auth, checklists, issues, tracks, users
+from app.security import hash_password
+from app.workflow import log_track_event
 
 
 class ConnectionManager:
-    """Manages WebSocket connections grouped by track_id."""
-
     def __init__(self) -> None:
         self.active_connections: dict[int, list[WebSocket]] = defaultdict(list)
 
@@ -49,139 +61,127 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-# ---------------------------------------------------------------------------
-# Seed demo data
-# ---------------------------------------------------------------------------
-def _seed_demo_data() -> None:
+def _run_sqlite_compat_migrations() -> None:
+    if not settings.DATABASE_URL.startswith("sqlite"):
+        return
+
+    inspector = inspect(engine)
+    columns_by_table = {
+        table_name: {column["name"] for column in inspector.get_columns(table_name)}
+        for table_name in inspector.get_table_names()
+    }
+
+    def add_column(table_name: str, column_name: str, definition: str) -> None:
+        if table_name not in columns_by_table or column_name in columns_by_table[table_name]:
+            return
+        with engine.begin() as conn:
+            conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {definition}"))
+
+    add_column("albums", "producer_id", "producer_id INTEGER")
+    add_column("albums", "mastering_engineer_id", "mastering_engineer_id INTEGER")
+    add_column("tracks", "submitter_id", "submitter_id INTEGER")
+    add_column("tracks", "peer_reviewer_id", "peer_reviewer_id INTEGER")
+    add_column("tracks", "rejection_mode", "rejection_mode VARCHAR(20)")
+    add_column("tracks", "workflow_cycle", "workflow_cycle INTEGER NOT NULL DEFAULT 1")
+    add_column("issues", "phase", "phase VARCHAR(20) NOT NULL DEFAULT 'peer'")
+    add_column("issues", "workflow_cycle", "workflow_cycle INTEGER NOT NULL DEFAULT 1")
+    add_column("issues", "source_version_id", "source_version_id INTEGER")
+    add_column("issues", "master_delivery_id", "master_delivery_id INTEGER")
+    add_column("checklist_items", "source_version_id", "source_version_id INTEGER")
+    add_column("checklist_items", "workflow_cycle", "workflow_cycle INTEGER NOT NULL DEFAULT 1")
+
+    with engine.begin() as conn:
+        if "users" in columns_by_table:
+            conn.execute(text("UPDATE users SET role = 'member' WHERE lower(role) IN ('author', 'reviewer')"))
+
+        if "tracks" in columns_by_table:
+            conn.execute(text("UPDATE tracks SET status = 'submitted' WHERE lower(status) = 'submitted' OR status = 'SUBMITTED'"))
+            conn.execute(text("UPDATE tracks SET status = 'peer_review' WHERE lower(status) = 'in_review' OR status = 'IN_REVIEW'"))
+            conn.execute(text("UPDATE tracks SET status = 'peer_revision' WHERE lower(status) = 'revision' OR status = 'REVISION'"))
+            conn.execute(text("UPDATE tracks SET status = 'completed' WHERE lower(status) = 'approved' OR status = 'APPROVED'"))
+
+        if "issues" in columns_by_table:
+            conn.execute(text("UPDATE issues SET issue_type = 'point' WHERE lower(issue_type) = 'point' OR issue_type = 'POINT'"))
+            conn.execute(text("UPDATE issues SET issue_type = 'range' WHERE lower(issue_type) = 'range' OR issue_type = 'RANGE'"))
+            conn.execute(text("UPDATE issues SET severity = 'critical' WHERE lower(severity) = 'critical' OR severity = 'CRITICAL'"))
+            conn.execute(text("UPDATE issues SET severity = 'major' WHERE lower(severity) = 'major' OR severity = 'MAJOR'"))
+            conn.execute(text("UPDATE issues SET severity = 'minor' WHERE lower(severity) = 'minor' OR severity = 'MINOR'"))
+            conn.execute(text("UPDATE issues SET severity = 'suggestion' WHERE lower(severity) = 'suggestion' OR severity = 'SUGGESTION'"))
+            conn.execute(text("UPDATE issues SET status = 'open' WHERE lower(status) = 'open' OR status = 'OPEN'"))
+            conn.execute(text("UPDATE issues SET status = 'will_fix' WHERE lower(status) = 'will_fix' OR status = 'WILL_FIX'"))
+            conn.execute(text("UPDATE issues SET status = 'disagreed' WHERE lower(status) = 'disagreed' OR status = 'DISAGREED'"))
+            conn.execute(text("UPDATE issues SET status = 'resolved' WHERE lower(status) = 'resolved' OR status = 'RESOLVED'"))
+
+
+def _backfill_workflow_data() -> None:
     db = SessionLocal()
     try:
-        # Only seed if database is empty
-        if db.query(User).first() is not None:
+        users = list(db.scalars(select(User).order_by(User.id)).all())
+        if not users:
             return
 
-        now = datetime.now(timezone.utc)
+        albums = list(db.scalars(select(Album).order_by(Album.id)).all())
+        for album in albums:
+            if album.producer_id is None:
+                producer = next((user for user in users if user.role == "producer"), users[0])
+                album.producer_id = producer.id
+            if album.mastering_engineer_id is None:
+                mastering_engineer = next(
+                    (user for user in users if user.id != album.producer_id),
+                    users[0],
+                )
+                album.mastering_engineer_id = mastering_engineer.id
 
-        # --- Users ---
-        kira = User(
-            username="kira",
-            display_name="Kira",
-            role="producer",
-            avatar_color="#f43f5e",
-            created_at=now,
-        )
-        nova = User(
-            username="nova",
-            display_name="Nova",
-            role="author",
-            avatar_color="#3b82f6",
-            created_at=now,
-        )
-        echo = User(
-            username="echo",
-            display_name="Echo",
-            role="reviewer",
-            avatar_color="#10b981",
-            created_at=now,
-        )
-        db.add_all([kira, nova, echo])
-        db.flush()
+            if not album.members:
+                for user in users:
+                    db.add(AlbumMember(album_id=album.id, user_id=user.id))
 
-        # --- Album ---
-        album = Album(
-            title="BACK KITCHEN Vol.1",
-            description="First compilation of the BACK KITCHEN doujin electronic music circle.",
-            cover_color="#8b5cf6",
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(album)
-        db.flush()
+        tracks = list(db.scalars(select(Track).order_by(Track.id)).all())
+        for track in tracks:
+            album = db.get(Album, track.album_id)
+            if album is None:
+                continue
 
-        # --- Tracks ---
-        track1 = Track(
-            title="Neon Drizzle",
-            artist="Kira",
-            album_id=album.id,
-            duration=245.0,
-            bpm=128,
-            status=TrackStatus.IN_REVIEW,
-            version=1,
-            created_at=now,
-            updated_at=now,
-        )
-        track2 = Track(
-            title="Phantom Signal",
-            artist="Nova",
-            album_id=album.id,
-            duration=198.5,
-            bpm=140,
-            status=TrackStatus.REVISION,
-            version=2,
-            created_at=now,
-            updated_at=now,
-        )
-        track3 = Track(
-            title="Starlit Protocol",
-            artist="Kira",
-            album_id=album.id,
-            duration=312.0,
-            bpm=174,
-            status=TrackStatus.APPROVED,
-            version=1,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add_all([track1, track2, track3])
-        db.flush()
+            if track.submitter_id is None:
+                matching_user = next(
+                    (
+                        user
+                        for user in users
+                        if user.display_name.lower() == track.artist.lower()
+                        or user.username.lower() == track.artist.lower()
+                    ),
+                    None,
+                )
+                fallback_user = next(
+                    (user for user in users if user.id != album.producer_id),
+                    users[0],
+                )
+                track.submitter_id = (matching_user or fallback_user).id
 
-        # --- Issues for track2 (the one in revision) ---
-        issue1 = Issue(
-            track_id=track2.id,
-            author_id=echo.id,
-            title="Low-end too muddy around drop",
-            description="The sub-bass and kick overlap between 1:20-1:35, causing muddiness.",
-            issue_type=IssueType.RANGE,
-            severity=IssueSeverity.MAJOR,
-            status=IssueStatus.WILL_FIX,
-            time_start=80.0,
-            time_end=95.0,
-            created_at=now,
-            updated_at=now,
-        )
-        issue2 = Issue(
-            track_id=track2.id,
-            author_id=echo.id,
-            title="Clipping on master at peak",
-            description="There is audible clipping at 2:10. Reduce limiter ceiling.",
-            issue_type=IssueType.POINT,
-            severity=IssueSeverity.CRITICAL,
-            status=IssueStatus.OPEN,
-            time_start=130.0,
-            time_end=None,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add_all([issue1, issue2])
-        db.flush()
+            if track.peer_reviewer_id is None:
+                issue_author = next((issue.author_id for issue in track.issues if issue.author_id != track.submitter_id), None)
+                checklist_reviewer = next((item.reviewer_id for item in track.checklist_items if item.reviewer_id != track.submitter_id), None)
+                track.peer_reviewer_id = issue_author or checklist_reviewer
 
-        # --- Checklist for track3 (the approved one) ---
-        checklist_labels = [
-            "Mix Balance",
-            "Low-End",
-            "Stereo Image",
-            "Loudness",
-            "Format Compliance",
-        ]
-        for label in checklist_labels:
-            ci = ChecklistItem(
-                track_id=track3.id,
-                reviewer_id=echo.id,
-                label=label,
-                passed=True,
-                note=None,
-                created_at=now,
-            )
-            db.add(ci)
+            for issue in track.issues:
+                if not issue.workflow_cycle:
+                    issue.workflow_cycle = track.workflow_cycle
+
+            for item in track.checklist_items:
+                if not item.workflow_cycle:
+                    item.workflow_cycle = track.workflow_cycle
+
+            if track.file_path and not track.source_versions:
+                db.add(
+                    TrackSourceVersion(
+                        track_id=track.id,
+                        workflow_cycle=track.workflow_cycle,
+                        version_number=track.version,
+                        file_path=track.file_path,
+                        duration=track.duration,
+                        uploaded_by_id=track.submitter_id,
+                    )
+                )
 
         db.commit()
     except Exception:
@@ -191,30 +191,100 @@ def _seed_demo_data() -> None:
         db.close()
 
 
-# ---------------------------------------------------------------------------
-# App lifespan
-# ---------------------------------------------------------------------------
+def _seed_demo_data() -> None:
+    db = SessionLocal()
+    try:
+        if db.query(User).first() is not None:
+            return
+
+        now = datetime.now(timezone.utc)
+        producer = User(
+            username="kira",
+            display_name="Kira",
+            role="producer",
+            avatar_color="#f43f5e",
+            email="kira@example.com",
+            password=hash_password("password123"),
+            created_at=now,
+        )
+        submitter = User(
+            username="nova",
+            display_name="Nova",
+            role="member",
+            avatar_color="#3b82f6",
+            email="nova@example.com",
+            password=hash_password("password123"),
+            created_at=now,
+        )
+        mastering_engineer = User(
+            username="echo",
+            display_name="Echo",
+            role="mastering_engineer",
+            avatar_color="#10b981",
+            email="echo@example.com",
+            password=hash_password("password123"),
+            created_at=now,
+        )
+        db.add_all([producer, submitter, mastering_engineer])
+        db.flush()
+
+        album = Album(
+            title="BACK KITCHEN Vol.1",
+            description="Demo workflow album for reviewing doujin submissions.",
+            cover_color="#8b5cf6",
+            producer_id=producer.id,
+            mastering_engineer_id=mastering_engineer.id,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(album)
+        db.flush()
+
+        db.add_all(
+            [
+                AlbumMember(album_id=album.id, user_id=producer.id, created_at=now),
+                AlbumMember(album_id=album.id, user_id=submitter.id, created_at=now),
+                AlbumMember(album_id=album.id, user_id=mastering_engineer.id, created_at=now),
+            ]
+        )
+
+        track = Track(
+            title="Neon Drizzle",
+            artist="Nova",
+            album_id=album.id,
+            submitter_id=submitter.id,
+            status=TrackStatus.SUBMITTED,
+            version=1,
+            workflow_cycle=1,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(track)
+        db.flush()
+        log_track_event(db, track, submitter, "track_submitted", to_status=TrackStatus.SUBMITTED)
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     Base.metadata.create_all(bind=engine)
-    upload_path = settings.get_upload_path()  # ensure uploads dir exists
+    _run_sqlite_compat_migrations()
+    Base.metadata.create_all(bind=engine)
+    _backfill_workflow_data()
+    upload_path = settings.get_upload_path()
     (upload_path / "comment_images").mkdir(parents=True, exist_ok=True)
     _seed_demo_data()
     yield
-    # Shutdown (nothing to clean up)
 
 
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title=settings.APP_NAME,
-    version="1.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title=settings.APP_NAME, version="2.0.0", lifespan=lifespan)
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -223,7 +293,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(albums.router)
@@ -231,39 +300,29 @@ app.include_router(tracks.router)
 app.include_router(issues.router)
 app.include_router(checklists.router)
 
-# Static file serving for uploads
 try:
     upload_path = settings.get_upload_path()
     app.mount("/uploads", StaticFiles(directory=str(upload_path)), name="uploads")
 except Exception:
-    pass  # uploads dir will be created on startup anyway
+    pass
 
 
-# ---------------------------------------------------------------------------
-# WebSocket endpoint
-# ---------------------------------------------------------------------------
+@app.get("/api/health")
+def healthcheck() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.websocket("/ws/tracks/{track_id}")
 async def websocket_track(websocket: WebSocket, track_id: int) -> None:
     await manager.connect(track_id, websocket)
     try:
         while True:
             data = await websocket.receive_text()
-            # Parse and re-broadcast the message to all connected clients
             try:
                 message = json.loads(data)
             except json.JSONDecodeError:
                 message = {"type": "message", "content": data}
-
-            # Add metadata
             message["track_id"] = track_id
             await manager.broadcast(track_id, message)
     except WebSocketDisconnect:
         manager.disconnect(track_id, websocket)
-
-
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-@app.get("/api/health")
-def health_check() -> dict[str, str]:
-    return {"status": "ok"}
