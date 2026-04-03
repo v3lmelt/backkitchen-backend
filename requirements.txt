@@ -8,3 +8,6 @@ python-multipart>=0.0.18
 aiofiles>=24.1.0
 websockets>=14.1
 mutagen>=1.47.0
+pytest>=8.3.0
+pytest-cov>=6.0.0
+httpx>=0.28.0
