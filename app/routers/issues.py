@@ -34,6 +34,23 @@ IMAGE_EXT_MAP = {
 router = APIRouter(tags=["issues"])
 
 
+def _validate_issue_timing(issue_type: str, time_start: float, time_end: float | None) -> float | None:
+    if issue_type == "range":
+        if time_end is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="time_end is required for RANGE issues.",
+            )
+        if time_end <= time_start:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="time_end must be greater than time_start for RANGE issues.",
+            )
+        return time_end
+
+    return None
+
+
 def _issue_to_read(issue: Issue) -> IssueRead:
     return IssueRead(
         id=issue.id,
@@ -72,12 +89,7 @@ def create_issue(
     if author is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Author not found.")
 
-    # Validate time_end for RANGE type
-    if payload.issue_type.value == "range" and payload.time_end is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="time_end is required for RANGE issues.",
-        )
+    time_end = _validate_issue_timing(payload.issue_type.value, payload.time_start, payload.time_end)
 
     issue = Issue(
         track_id=track_id,
@@ -87,7 +99,7 @@ def create_issue(
         issue_type=payload.issue_type,
         severity=payload.severity,
         time_start=payload.time_start,
-        time_end=payload.time_end,
+        time_end=time_end,
     )
     db.add(issue)
     db.commit()
