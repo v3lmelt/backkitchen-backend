@@ -11,6 +11,8 @@ from app.config import settings
 from app.database import Base, SessionLocal, engine
 from app.models.album import Album
 from app.models.checklist import ChecklistItem
+from app.models.comment import Comment
+from app.models.comment_image import CommentImage
 from app.models.issue import Issue, IssueSeverity, IssueStatus, IssueType
 from app.models.track import Track, TrackStatus
 from app.models.user import User
@@ -196,7 +198,8 @@ def _seed_demo_data() -> None:
 async def lifespan(app: FastAPI):
     # Startup
     Base.metadata.create_all(bind=engine)
-    settings.get_upload_path()  # ensure uploads dir exists
+    upload_path = settings.get_upload_path()  # ensure uploads dir exists
+    (upload_path / "comment_images").mkdir(parents=True, exist_ok=True)
     _seed_demo_data()
     yield
     # Shutdown (nothing to clean up)

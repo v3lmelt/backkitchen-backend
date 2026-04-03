@@ -1,14 +1,19 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.models.comment import Comment
+from app.models.comment_image import CommentImage
 from app.models.issue import Issue
 from app.models.track import Track
 from app.models.user import User
 from app.schemas.schemas import (
-    CommentCreate,
+    CommentImageRead,
     CommentRead,
     CommentWithAuthor,
     IssueCreate,
@@ -17,6 +22,14 @@ from app.schemas.schemas import (
     IssueUpdate,
     UserRead,
 )
+
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+IMAGE_EXT_MAP = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
 
 router = APIRouter(tags=["issues"])
 
@@ -108,6 +121,15 @@ def get_issue(issue_id: int, db: Session = Depends(get_db)) -> IssueDetail:
     for c in issue.comments:
         c_author = db.get(User, c.author_id)
         c_author_read = UserRead.model_validate(c_author) if c_author else None
+        images = [
+            CommentImageRead(
+                id=img.id,
+                comment_id=img.comment_id,
+                image_url=f"/uploads/{img.file_path}",
+                created_at=img.created_at,
+            )
+            for img in c.images
+        ]
         comments_with_authors.append(
             CommentWithAuthor(
                 id=c.id,
@@ -116,6 +138,7 @@ def get_issue(issue_id: int, db: Session = Depends(get_db)) -> IssueDetail:
                 content=c.content,
                 created_at=c.created_at,
                 author=c_author_read,
+                images=images,
             )
         )
 
@@ -162,25 +185,61 @@ def update_issue(
     response_model=CommentRead,
     status_code=status.HTTP_201_CREATED,
 )
-def add_comment(
+async def add_comment(
     issue_id: int,
-    payload: CommentCreate,
+    author_id: int = Form(...),
+    content: str = Form(..., min_length=1),
+    images: list[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
 ) -> CommentRead:
     issue = db.get(Issue, issue_id)
     if issue is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
 
-    author = db.get(User, payload.author_id)
+    author = db.get(User, author_id)
     if author is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Author not found.")
 
+    # Validate image MIME types
+    for img_file in images:
+        if img_file.content_type not in ALLOWED_IMAGE_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported file type: {img_file.content_type}. Allowed: jpeg, png, gif, webp.",
+            )
+
     comment = Comment(
         issue_id=issue_id,
-        author_id=payload.author_id,
-        content=payload.content,
+        author_id=author_id,
+        content=content,
     )
     db.add(comment)
+    db.flush()
+
+    # Save uploaded images
+    image_reads: list[CommentImageRead] = []
+    if images:
+        comment_images_dir = settings.get_upload_path() / "comment_images"
+        comment_images_dir.mkdir(parents=True, exist_ok=True)
+        for img_file in images:
+            ext = IMAGE_EXT_MAP.get(img_file.content_type or "", ".jpg")
+            filename = f"{uuid.uuid4()}{ext}"
+            file_path = f"comment_images/{filename}"
+            dest = comment_images_dir / filename
+            data = await img_file.read()
+            dest.write_bytes(data)
+            ci = CommentImage(comment_id=comment.id, file_path=file_path)
+            db.add(ci)
+            db.flush()
+            image_reads.append(
+                CommentImageRead(
+                    id=ci.id,
+                    comment_id=ci.comment_id,
+                    image_url=f"/uploads/{file_path}",
+                    created_at=ci.created_at,
+                )
+            )
+
     db.commit()
     db.refresh(comment)
     return CommentRead(
@@ -189,4 +248,5 @@ def add_comment(
         author_id=comment.author_id,
         content=comment.content,
         created_at=comment.created_at,
+        images=image_reads,
     )

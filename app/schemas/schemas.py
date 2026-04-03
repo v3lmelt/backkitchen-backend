@@ -138,6 +138,15 @@ class IssueRead(IssueBase):
 # ---------------------------------------------------------------------------
 # Comment
 # ---------------------------------------------------------------------------
+class CommentImageRead(BaseModel):
+    id: int
+    comment_id: int
+    image_url: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class CommentBase(BaseModel):
     content: str = Field(..., min_length=1)
 
@@ -151,6 +160,7 @@ class CommentRead(CommentBase):
     issue_id: int
     author_id: int
     created_at: datetime
+    images: list[CommentImageRead] = []
 
     model_config = ConfigDict(from_attributes=True)
 
