@@ -1,0 +1,10 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+sqlalchemy>=2.0.36
+alembic>=1.14.0
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+python-multipart>=0.0.18
+aiofiles>=24.1.0
+websockets>=14.1
+mutagen>=1.47.0
