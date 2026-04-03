@@ -17,14 +17,21 @@ class UserBase(BaseModel):
 
 
 class UserCreate(UserBase):
-    pass
+    email: str | None = None
+    password: str | None = None
 
 
 class UserRead(UserBase):
     id: int
+    email: str | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
 
 # ---------------------------------------------------------------------------

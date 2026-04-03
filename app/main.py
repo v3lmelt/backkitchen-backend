@@ -16,7 +16,7 @@ from app.models.comment_image import CommentImage
 from app.models.issue import Issue, IssueSeverity, IssueStatus, IssueType
 from app.models.track import Track, TrackStatus
 from app.models.user import User
-from app.routers import albums, checklists, issues, tracks, users
+from app.routers import albums, auth, checklists, issues, tracks, users
 
 
 class ConnectionManager:
@@ -224,6 +224,7 @@ app.add_middleware(
 )
 
 # Routers
+app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(albums.router)
 app.include_router(tracks.router)

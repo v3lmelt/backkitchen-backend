@@ -25,6 +25,15 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)) -> User:
             detail=f"Username '{payload.username}' is already taken.",
         )
 
+    # Check for duplicate email
+    if payload.email is not None:
+        existing_email = db.scalars(select(User).where(User.email == payload.email)).first()
+        if existing_email is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Email '{payload.email}' is already registered.",
+            )
+
     user = User(**payload.model_dump())
     db.add(user)
     db.commit()
