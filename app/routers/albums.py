@@ -1,15 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func as sqlfunc, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
+from app.models.issue import Issue, IssueStatus
 from app.models.track import Track
 from app.models.user import User
-from app.schemas.schemas import AlbumCreate, AlbumRead, AlbumTeamUpdate, TrackRead, UserRead
+from app.models.workflow_event import WorkflowEvent
+from app.schemas.schemas import AlbumCreate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackRead, UserRead
 from app.security import get_current_user
-from app.workflow import build_track_read, ensure_album_visibility, get_album_member_ids
+from app.workflow import build_event_read, build_track_read, ensure_album_visibility, get_album_member_ids
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
@@ -133,6 +135,45 @@ def update_album_team(
     db.commit()
     db.refresh(album)
     return _album_to_read(album, db)
+
+
+@router.get("/{album_id}/stats", response_model=AlbumStats)
+def get_album_stats(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AlbumStats:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    ensure_album_visibility(album, current_user, db)
+
+    tracks = list(db.scalars(select(Track).where(Track.album_id == album_id)).all())
+
+    by_status: dict[str, int] = {}
+    for track in tracks:
+        key = track.status.value
+        by_status[key] = by_status.get(key, 0) + 1
+
+    open_issues = db.scalar(
+        select(sqlfunc.count(Issue.id))
+        .join(Track, Issue.track_id == Track.id)
+        .where(Track.album_id == album_id, Issue.status == IssueStatus.OPEN)
+    ) or 0
+
+    recent_events = list(db.scalars(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.album_id == album_id)
+        .order_by(WorkflowEvent.created_at.desc())
+        .limit(10)
+    ).all())
+
+    return AlbumStats(
+        total_tracks=len(tracks),
+        by_status=by_status,
+        open_issues=open_issues,
+        recent_events=[build_event_read(e, db) for e in recent_events],
+    )
 
 
 @router.get("/{album_id}/tracks", response_model=list[TrackRead])

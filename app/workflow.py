@@ -196,6 +196,7 @@ def build_comment_read(comment: Comment, db: Session) -> CommentRead:
         issue_id=comment.issue_id,
         author_id=comment.author_id,
         content=comment.content,
+        is_status_note=comment.is_status_note,
         created_at=comment.created_at,
         author=_user_read(author),
         images=images,
@@ -244,6 +245,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         issues=issues,
         checklist_items=checklist_items,
         events=events,
+        source_versions=[TrackSourceVersionRead.model_validate(v) for v in track.source_versions],
     )
 
 

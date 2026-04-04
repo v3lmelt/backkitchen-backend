@@ -13,7 +13,8 @@ from app.models.comment_image import CommentImage
 from app.models.issue import Issue, IssuePhase
 from app.models.track import Track, TrackStatus
 from app.models.user import User
-from app.schemas.schemas import CommentRead, IssueCreate, IssueDetail, IssueRead, IssueUpdate
+from app.notifications import notify
+from app.schemas.schemas import CommentRead, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead, IssueUpdate
 from app.security import get_current_user
 from app.workflow import (
     build_comment_read,
@@ -72,18 +73,17 @@ def _ensure_issue_permission(track: Track, album: Album, user: User, phase: Issu
 
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User) -> None:
     if issue.phase == IssuePhase.PEER and user.id not in {track.submitter_id, track.peer_reviewer_id}:
-        raise HTTPException(status_code=403, detail="You cannot update this peer review issue.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this peer review issue.")
     if issue.phase == IssuePhase.MASTERING and user.id not in {
         track.submitter_id,
         album.mastering_engineer_id,
     }:
-        raise HTTPException(status_code=403, detail="You cannot update this mastering issue.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this mastering issue.")
     if issue.phase == IssuePhase.FINAL_REVIEW and user.id not in {
         track.submitter_id,
         album.producer_id,
-        album.mastering_engineer_id,
     }:
-        raise HTTPException(status_code=403, detail="You cannot update this final review issue.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this final review issue.")
 
 
 @router.post(
@@ -108,18 +108,23 @@ def create_issue(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="time_end is required for RANGE issues.",
         )
+    if payload.time_end is not None and payload.time_end <= payload.time_start:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="time_end must be greater than time_start.",
+        )
 
     source_version_id = None
     master_delivery_id = None
     if payload.phase in {IssuePhase.PEER, IssuePhase.MASTERING}:
         source_version = current_source_version(track)
         if source_version is None:
-            raise HTTPException(status_code=409, detail="No source version available.")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No source version available.")
         source_version_id = source_version.id
     if payload.phase == IssuePhase.FINAL_REVIEW:
         delivery = current_master_delivery(track)
         if delivery is None:
-            raise HTTPException(status_code=409, detail="No master delivery available.")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No master delivery available.")
         master_delivery_id = delivery.id
 
     issue = Issue(
@@ -144,6 +149,11 @@ def create_issue(
         "issue_created",
         payload={"phase": payload.phase.value, "title": payload.title},
     )
+    db.flush()
+    if current_user.id != track.submitter_id:
+        notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
+               f"「{track.title}」上有新的审核问题",
+               related_track_id=track.id, related_issue_id=issue.id)
     db.commit()
     db.refresh(issue)
     return build_issue_read(issue, db)
@@ -197,9 +207,19 @@ def update_issue(
     ensure_track_visibility(track, current_user, db)
     _ensure_issue_update_permission(issue, track, album, current_user)
 
-    update_data = payload.model_dump(exclude_unset=True)
+    old_status = issue.status
+    update_data = payload.model_dump(exclude_unset=True, exclude={"status_note"})
     for field, value in update_data.items():
         setattr(issue, field, value)
+
+    new_status = issue.status
+    if payload.status_note and old_status != new_status:
+        db.add(Comment(issue_id=issue.id, author_id=current_user.id, content=payload.status_note, is_status_note=True))
+
+    if old_status != new_status and current_user.id != issue.author_id:
+        notify(db, [issue.author_id], "issue_status_changed", "问题状态已更新",
+               f"「{issue.title}」被标记为 {new_status.value}",
+               related_issue_id=issue.id)
 
     log_track_event(
         db,
@@ -263,6 +283,48 @@ async def add_comment(
         "issue_comment_added",
         payload={"issue_id": issue.id},
     )
+
+    participant_ids = [issue.author_id] + [c.author_id for c in issue.comments if c.id != comment.id]
+    notify_ids = [uid for uid in dict.fromkeys(participant_ids) if uid != current_user.id]
+    if notify_ids:
+        notify(db, notify_ids, "new_comment", "新评论",
+               f"「{issue.title}」有新评论", related_issue_id=issue.id)
+
     db.commit()
     db.refresh(comment)
     return build_comment_read(comment, db)
+
+
+@router.patch("/api/tracks/{track_id}/issues/batch", response_model=list[IssueRead])
+def batch_update_issues(
+    track_id: int,
+    payload: IssueBatchUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[IssueRead]:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = _album_for_track(track, db)
+    ensure_track_visibility(track, current_user, db)
+
+    issues = list(db.scalars(
+        select(Issue).where(Issue.id.in_(payload.issue_ids), Issue.track_id == track_id)
+    ).all())
+
+    for issue in issues:
+        _ensure_issue_update_permission(issue, track, album, current_user)
+        old_status = issue.status
+        issue.status = payload.status
+        if payload.status_note and old_status != payload.status:
+            db.add(Comment(
+                issue_id=issue.id,
+                author_id=current_user.id,
+                content=payload.status_note,
+                is_status_note=True,
+            ))
+
+    db.commit()
+    for issue in issues:
+        db.refresh(issue)
+    return [build_issue_read(issue, db) for issue in issues]

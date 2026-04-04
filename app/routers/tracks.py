@@ -24,6 +24,7 @@ from app.schemas.schemas import (
     TrackRead,
     PeerReviewDecisionRequest,
 )
+from app.notifications import notify
 from app.security import get_current_user
 from app.services.audio import extract_audio_metadata
 from app.workflow import (
@@ -39,6 +40,9 @@ from app.workflow import (
 )
 
 router = APIRouter(prefix="/api/tracks", tags=["tracks"])
+
+# Resolved once at startup to avoid a mkdir syscall on every file-serve request.
+_UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
 
 
 def _save_upload(file: UploadFile) -> tuple[str, float | None]:
@@ -68,7 +72,11 @@ def _track_list_item(track: Track, user: User, album: Album) -> TrackListItem:
 
 
 def _serve_path(path_str: str, filename_prefix: str) -> FileResponse:
-    file_path = Path(path_str)
+    file_path = Path(path_str).resolve()
+    try:
+        file_path.relative_to(_UPLOAD_BASE)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     if not file_path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file missing from disk.")
     mime_map = {
@@ -244,6 +252,8 @@ def intake_decision(
             to_status=track.status,
             payload={"peer_reviewer_id": selected},
         )
+        notify(db, [track.submitter_id], "track_status_changed", "曲目进入审核",
+               f"「{track.title}」已进入同行审核阶段", related_track_id=track.id)
     else:
         track.status = TrackStatus.REJECTED
         track.peer_reviewer_id = None
@@ -259,6 +269,8 @@ def intake_decision(
             to_status=track.status,
             payload={"rejection_mode": track.rejection_mode.value},
         )
+        notify(db, [track.submitter_id], "track_status_changed", "曲目被退回",
+               f"「{track.title}」已被退回", related_track_id=track.id)
 
     db.commit()
     db.refresh(track)
@@ -306,6 +318,14 @@ def finish_peer_review(
         to_status=track.status,
         payload={"decision": payload.decision, "source_version_id": source_version.id},
     )
+    if payload.decision == "needs_revision":
+        notify(db, [track.submitter_id], "track_status_changed", "需要修改",
+               f"「{track.title}」需要修改", related_track_id=track.id)
+        notify(db, [track.peer_reviewer_id], "track_status_changed", "已发送修改请求",
+               f"「{track.title}」的修改请求已发送给作者", related_track_id=track.id)
+    else:
+        notify(db, [album.producer_id], "track_status_changed", "同行审核通过",
+               f"「{track.title}」同行审核已通过", related_track_id=track.id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -340,6 +360,12 @@ def producer_gate(
         to_status=track.status,
         payload={"decision": payload.decision},
     )
+    if payload.decision == "send_to_mastering":
+        notify(db, [album.mastering_engineer_id], "track_status_changed", "曲目进入混音阶段",
+               f"「{track.title}」已进入混音阶段", related_track_id=track.id)
+    else:
+        notify(db, [track.submitter_id, track.peer_reviewer_id], "track_status_changed",
+               "制作人要求重新审核", f"「{track.title}」制作人要求重新进行同行审核", related_track_id=track.id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -368,6 +394,8 @@ def request_mastering_revision(
         from_status=previous_status,
         to_status=track.status,
     )
+    notify(db, [track.submitter_id], "track_status_changed", "混音师请求源文件修改",
+           f"「{track.title}」混音师请求修改源文件", related_track_id=track.id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -411,6 +439,8 @@ def upload_master_delivery(
         to_status=track.status,
         payload={"delivery_number": delivery_number},
     )
+    notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "主控文件已上传",
+           f"「{track.title}」主控文件已上传，等待审核", related_track_id=track.id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -451,6 +481,9 @@ def approve_final_review(
         to_status=track.status,
         payload={"delivery_id": delivery.id},
     )
+    if track.status == TrackStatus.COMPLETED:
+        notify(db, [track.submitter_id, album.mastering_engineer_id], "track_status_changed",
+               "曲目已完成！", f"「{track.title}」已完成所有审核流程！", related_track_id=track.id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -499,6 +532,8 @@ def return_to_mastering(
         to_status=track.status,
         payload={"delivery_id": delivery.id, "issue_count": len(open_final_review_issues)},
     )
+    notify(db, [album.mastering_engineer_id], "track_status_changed", "曲目退回混音阶段",
+           f"「{track.title}」已退回混音阶段", related_track_id=track.id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -537,6 +572,25 @@ def serve_audio(
     if not track.file_path:
         raise HTTPException(status_code=404, detail="No source audio is available for this track.")
     return _serve_path(track.file_path, track.title)
+
+
+@router.get("/{track_id}/source-versions/{version_id}/audio")
+def get_source_version_audio(
+    track_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FileResponse:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+
+    version = db.get(TrackSourceVersion, version_id)
+    if version is None or version.track_id != track_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found.")
+
+    return _serve_path(version.file_path, f"{track.title}-v{version.version_number}")
 
 
 @router.get("/{track_id}/master-audio")
