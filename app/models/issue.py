@@ -28,6 +28,7 @@ class IssueStatus(str, enum.Enum):
 
 class IssuePhase(str, enum.Enum):
     PEER = "peer"
+    PRODUCER = "producer"
     MASTERING = "mastering"
     FINAL_REVIEW = "final_review"
 

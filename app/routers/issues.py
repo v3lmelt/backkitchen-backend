@@ -52,6 +52,13 @@ def _ensure_issue_permission(track: Track, album: Album, user: User, phase: Issu
                 detail="Only the assigned peer reviewer can create peer review issues.",
             )
         return
+    if phase == IssuePhase.PRODUCER:
+        if track.status != TrackStatus.PRODUCER_MASTERING_GATE or album.producer_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the album producer can create producer review issues.",
+            )
+        return
     if phase == IssuePhase.MASTERING:
         if track.status != TrackStatus.MASTERING or album.mastering_engineer_id != user.id:
             raise HTTPException(
@@ -74,6 +81,11 @@ def _ensure_issue_permission(track: Track, album: Album, user: User, phase: Issu
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User) -> None:
     if issue.phase == IssuePhase.PEER and user.id not in {track.submitter_id, track.peer_reviewer_id}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this peer review issue.")
+    if issue.phase == IssuePhase.PRODUCER and user.id not in {
+        track.submitter_id,
+        album.producer_id,
+    }:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this producer review issue.")
     if issue.phase == IssuePhase.MASTERING and user.id not in {
         track.submitter_id,
         album.mastering_engineer_id,
@@ -116,7 +128,7 @@ def create_issue(
 
     source_version_id = None
     master_delivery_id = None
-    if payload.phase in {IssuePhase.PEER, IssuePhase.MASTERING}:
+    if payload.phase in {IssuePhase.PEER, IssuePhase.PRODUCER, IssuePhase.MASTERING}:
         source_version = current_source_version(track)
         if source_version is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No source version available.")
