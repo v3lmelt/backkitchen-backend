@@ -1,5 +1,6 @@
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
@@ -154,14 +155,14 @@ def create_issue(
         time_end=payload.time_end,
     )
     db.add(issue)
+    db.flush()  # assign issue.id before logging
     log_track_event(
         db,
         track,
         current_user,
         "issue_created",
-        payload={"phase": payload.phase.value, "title": payload.title},
+        payload={"phase": payload.phase.value, "title": payload.title, "issue_id": issue.id},
     )
-    db.flush()
     if current_user.id != track.submitter_id:
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
@@ -252,11 +253,14 @@ def update_issue(
 )
 async def add_comment(
     issue_id: int,
-    content: str = Form(default=''),
+    content: Optional[str] = Form(default=None),
     images: list[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> CommentRead:
+    # Normalise: pydantic v2 + python-multipart may deliver empty fields as None
+    effective_content = (content or '').strip()
+
     issue = db.get(Issue, issue_id)
     if issue is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
@@ -265,7 +269,7 @@ async def add_comment(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
 
-    if not content.strip() and not images:
+    if not effective_content and not images:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A comment must have text content or at least one image.",
@@ -278,7 +282,7 @@ async def add_comment(
                 detail=f"Unsupported file type: {img_file.content_type}. Allowed: jpeg, png, gif, webp.",
             )
 
-    comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content)
+    comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content or '')
     db.add(comment)
     db.flush()
 
