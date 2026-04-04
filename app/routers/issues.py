@@ -208,14 +208,13 @@ def update_issue(
     _ensure_issue_update_permission(issue, track, album, current_user)
 
     old_status = issue.status
-    status_note = payload.status_note
     update_data = payload.model_dump(exclude_unset=True, exclude={"status_note"})
     for field, value in update_data.items():
         setattr(issue, field, value)
 
     new_status = issue.status
-    if status_note and old_status != new_status:
-        db.add(Comment(issue_id=issue.id, author_id=current_user.id, content=status_note, is_status_note=True))
+    if payload.status_note and old_status != new_status:
+        db.add(Comment(issue_id=issue.id, author_id=current_user.id, content=payload.status_note, is_status_note=True))
 
     if old_status != new_status and current_user.id != issue.author_id:
         notify(db, [issue.author_id], "issue_status_changed", "问题状态已更新",
@@ -285,7 +284,6 @@ async def add_comment(
         payload={"issue_id": issue.id},
     )
 
-    # Notify all participants (issue author + all comment authors), excluding current user
     participant_ids = [issue.author_id] + [c.author_id for c in issue.comments if c.id != comment.id]
     notify_ids = [uid for uid in dict.fromkeys(participant_ids) if uid != current_user.id]
     if notify_ids:
@@ -314,7 +312,6 @@ def batch_update_issues(
         select(Issue).where(Issue.id.in_(payload.issue_ids), Issue.track_id == track_id)
     ).all())
 
-    updated = []
     for issue in issues:
         _ensure_issue_update_permission(issue, track, album, current_user)
         old_status = issue.status
@@ -326,9 +323,8 @@ def batch_update_issues(
                 content=payload.status_note,
                 is_status_note=True,
             ))
-        updated.append(issue)
 
     db.commit()
-    for issue in updated:
+    for issue in issues:
         db.refresh(issue)
-    return [build_issue_read(issue, db) for issue in updated]
+    return [build_issue_read(issue, db) for issue in issues]

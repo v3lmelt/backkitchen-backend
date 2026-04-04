@@ -11,7 +11,7 @@ from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.schemas.schemas import AlbumCreate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackRead, UserRead
 from app.security import get_current_user
-from app.workflow import build_track_read, build_workflow_event_read, ensure_album_visibility, get_album_member_ids
+from app.workflow import build_event_read, build_track_read, ensure_album_visibility, get_album_member_ids
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
@@ -172,7 +172,7 @@ def get_album_stats(
         total_tracks=len(tracks),
         by_status=by_status,
         open_issues=open_issues,
-        recent_events=[build_workflow_event_read(e, db) for e in recent_events],
+        recent_events=[build_event_read(e, db) for e in recent_events],
     )
 
 
