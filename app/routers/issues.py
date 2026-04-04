@@ -252,7 +252,7 @@ def update_issue(
 )
 async def add_comment(
     issue_id: int,
-    content: str = Form(..., min_length=1),
+    content: str = Form(default=''),
     images: list[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -264,6 +264,12 @@ async def add_comment(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
+
+    if not content.strip() and not images:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A comment must have text content or at least one image.",
+        )
 
     for img_file in images:
         if img_file.content_type not in ALLOWED_IMAGE_TYPES:
