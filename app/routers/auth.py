@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User
-from app.schemas.schemas import AuthResponse, LoginRequest, RegisterRequest, UserRead
+from app.schemas.schemas import AuthResponse, ChangePasswordRequest, LoginRequest, RegisterRequest, UserRead, UserUpdateProfile
 from app.security import create_access_token, get_current_user, hash_password, verify_password
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -58,3 +58,37 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> AuthRes
 @router.get("/me", response_model=UserRead)
 def get_me(current_user: User = Depends(get_current_user)) -> UserRead:
     return UserRead.model_validate(current_user)
+
+
+@router.patch("/me", response_model=UserRead)
+def update_me(
+    payload: UserUpdateProfile,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UserRead:
+    changed = False
+    if payload.display_name is not None:
+        current_user.display_name = payload.display_name
+        changed = True
+    if payload.email is not None:
+        existing = db.scalars(select(User).where(User.email == payload.email, User.id != current_user.id)).first()
+        if existing is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email is already registered.")
+        current_user.email = payload.email
+        changed = True
+    if changed:
+        db.commit()
+        db.refresh(current_user)
+    return UserRead.model_validate(current_user)
+
+
+@router.post("/me/change-password", status_code=status.HTTP_204_NO_CONTENT)
+def change_password(
+    payload: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    if not verify_password(payload.current_password, current_user.password or ""):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect.")
+    current_user.password = hash_password(payload.new_password)
+    db.commit()
