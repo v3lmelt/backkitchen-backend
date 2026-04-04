@@ -24,7 +24,9 @@ from app.models.master_delivery import MasterDelivery
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
-from app.routers import albums, auth, checklists, issues, tracks, users
+from app.models.invitation import Invitation
+from app.models.notification import Notification
+from app.routers import albums, auth, checklists, invitations, issues, notifications, tracks, users
 from app.security import create_access_token
 
 
@@ -90,6 +92,8 @@ def client(
     app.include_router(tracks.router)
     app.include_router(issues.router)
     app.include_router(checklists.router)
+    app.include_router(invitations.router)
+    app.include_router(notifications.router)
     app.dependency_overrides[get_db] = override_get_db
     app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
 
@@ -274,6 +278,50 @@ class Factory:
         self.session.commit()
         self.session.refresh(issue)
         return issue
+
+    def notification(
+        self,
+        *,
+        user: User,
+        type: str = "track_status_changed",
+        title: str = "Test notification",
+        body: str = "Test body",
+        is_read: bool = False,
+        related_track_id: int | None = None,
+        related_issue_id: int | None = None,
+    ) -> Notification:
+        notif = Notification(
+            user_id=user.id,
+            type=type,
+            title=title,
+            body=body,
+            is_read=is_read,
+            related_track_id=related_track_id,
+            related_issue_id=related_issue_id,
+        )
+        self.session.add(notif)
+        self.session.commit()
+        self.session.refresh(notif)
+        return notif
+
+    def invitation(
+        self,
+        *,
+        album: Album,
+        user: User,
+        invited_by: User,
+        invitation_status: str = "pending",
+    ) -> Invitation:
+        inv = Invitation(
+            album_id=album.id,
+            user_id=user.id,
+            invited_by_user_id=invited_by.id,
+            status=invitation_status,
+        )
+        self.session.add(inv)
+        self.session.commit()
+        self.session.refresh(inv)
+        return inv
 
     def checklist(
         self,

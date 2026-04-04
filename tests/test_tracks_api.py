@@ -221,6 +221,293 @@ def test_return_to_mastering_requires_open_final_review_issue(client, db_session
     assert success.json()["status"] == TrackStatus.MASTERING.value
 
 
+def test_get_track_detail(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.PEER_REVIEW,
+        peer_reviewer=reviewer,
+    )
+
+    response = client.get(f"/api/tracks/{track.id}", headers=auth_headers(submitter))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["track"]["id"] == track.id
+    assert "issues" in body
+    assert "checklist_items" in body
+    assert "events" in body
+    assert "source_versions" in body
+
+
+def test_get_track_not_found(client, factory, auth_headers):
+    user = factory.user()
+    response = client.get("/api/tracks/99999", headers=auth_headers(user))
+    assert response.status_code == 404
+
+
+def test_intake_accept_assigns_peer_reviewer(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/intake-decision",
+        headers=auth_headers(producer),
+        json={"decision": "accept"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == TrackStatus.PEER_REVIEW.value
+    assert body["peer_reviewer_id"] is not None
+
+
+def test_intake_reject_resubmittable(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/intake-decision",
+        headers=auth_headers(producer),
+        json={"decision": "reject_resubmittable"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == TrackStatus.REJECTED.value
+    assert body["rejection_mode"] == RejectionMode.RESUBMITTABLE.value
+
+
+def test_intake_reject_final(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/intake-decision",
+        headers=auth_headers(producer),
+        json={"decision": "reject_final"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == TrackStatus.REJECTED.value
+    assert body["rejection_mode"] == RejectionMode.FINAL.value
+
+
+def test_intake_forbidden_for_non_producer(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/intake-decision",
+        headers=auth_headers(submitter),
+        json={"decision": "accept"},
+    )
+    assert response.status_code == 403
+
+
+def test_producer_gate_send_to_mastering(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PRODUCER_MASTERING_GATE)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/producer-gate",
+        headers=auth_headers(producer),
+        json={"decision": "send_to_mastering"},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == TrackStatus.MASTERING.value
+
+
+def test_producer_gate_request_peer_revision(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PRODUCER_MASTERING_GATE)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/producer-gate",
+        headers=auth_headers(producer),
+        json={"decision": "request_peer_revision"},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == TrackStatus.PEER_REVISION.value
+
+
+def test_producer_gate_forbidden_for_non_producer(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PRODUCER_MASTERING_GATE)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/producer-gate",
+        headers=auth_headers(submitter),
+        json={"decision": "send_to_mastering"},
+    )
+    assert response.status_code == 403
+
+
+def test_mastering_request_revision(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.MASTERING)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/mastering/request-revision",
+        headers=auth_headers(mastering),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == TrackStatus.MASTERING_REVISION.value
+
+
+def test_mastering_request_revision_forbidden_for_non_mastering(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.MASTERING)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/mastering/request-revision",
+        headers=auth_headers(submitter),
+    )
+    assert response.status_code == 403
+
+
+def test_upload_source_version_from_peer_revision(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.PEER_REVISION,
+        peer_reviewer=reviewer,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(submitter),
+        files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == TrackStatus.PEER_REVIEW.value
+    assert body["version"] == 2
+
+
+def test_upload_source_version_from_mastering_revision(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.MASTERING_REVISION,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(submitter),
+        files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == TrackStatus.MASTERING.value
+    assert body["version"] == 2
+
+
+def test_upload_source_version_wrong_status_fails(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PEER_REVIEW)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(submitter),
+        files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
+    )
+    assert response.status_code == 409
+
+
+def test_upload_source_version_forbidden_for_non_submitter(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PEER_REVISION)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(producer),
+        files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
+    )
+    assert response.status_code == 403
+
+
+def test_finish_peer_review_needs_revision(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.PEER_REVIEW,
+        peer_reviewer=reviewer,
+    )
+    source_version = track.source_versions[-1]
+    factory.checklist(track=track, reviewer=reviewer, source_version_id=source_version.id)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/peer-review/finish",
+        headers=auth_headers(reviewer),
+        json={"decision": "needs_revision"},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == TrackStatus.PEER_REVISION.value
+
+
+def test_delete_track_forbidden_for_outsider(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    outsider = factory.user(username="outsider")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, outsider])
+    track = factory.track(album=album, submitter=submitter)
+
+    response = client.delete(f"/api/tracks/{track.id}", headers=auth_headers(outsider))
+    assert response.status_code == 403
+
+
 def test_delete_track_removes_audio_file(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
