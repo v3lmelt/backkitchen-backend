@@ -40,6 +40,9 @@ from app.workflow import (
 
 router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 
+# Resolved once at startup to avoid a mkdir syscall on every file-serve request.
+_UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
+
 
 def _save_upload(file: UploadFile) -> tuple[str, float | None]:
     upload_dir = settings.get_upload_path()
@@ -68,7 +71,11 @@ def _track_list_item(track: Track, user: User, album: Album) -> TrackListItem:
 
 
 def _serve_path(path_str: str, filename_prefix: str) -> FileResponse:
-    file_path = Path(path_str)
+    file_path = Path(path_str).resolve()
+    try:
+        file_path.relative_to(_UPLOAD_BASE)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     if not file_path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file missing from disk.")
     mime_map = {

@@ -67,6 +67,35 @@ class AlbumTeamUpdate(BaseModel):
     member_ids: list[int] = []
 
 
+class InvitationCreate(BaseModel):
+    user_id: int
+
+
+class InvitationRead(BaseModel):
+    id: int
+    album_id: int
+    user_id: int
+    invited_by_user_id: int
+    status: str
+    created_at: datetime
+    album: "AlbumSummary" | None = None
+    user: UserRead | None = None
+    invited_by_user: UserRead | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AlbumSummary(BaseModel):
+    id: int
+    title: str
+    cover_color: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+InvitationRead.model_rebuild()
+
+
 class AlbumRead(AlbumBase):
     id: int
     producer_id: int | None = None

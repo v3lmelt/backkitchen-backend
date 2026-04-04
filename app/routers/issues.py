@@ -72,18 +72,17 @@ def _ensure_issue_permission(track: Track, album: Album, user: User, phase: Issu
 
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User) -> None:
     if issue.phase == IssuePhase.PEER and user.id not in {track.submitter_id, track.peer_reviewer_id}:
-        raise HTTPException(status_code=403, detail="You cannot update this peer review issue.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this peer review issue.")
     if issue.phase == IssuePhase.MASTERING and user.id not in {
         track.submitter_id,
         album.mastering_engineer_id,
     }:
-        raise HTTPException(status_code=403, detail="You cannot update this mastering issue.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this mastering issue.")
     if issue.phase == IssuePhase.FINAL_REVIEW and user.id not in {
         track.submitter_id,
         album.producer_id,
-        album.mastering_engineer_id,
     }:
-        raise HTTPException(status_code=403, detail="You cannot update this final review issue.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this final review issue.")
 
 
 @router.post(
@@ -108,18 +107,23 @@ def create_issue(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="time_end is required for RANGE issues.",
         )
+    if payload.time_end is not None and payload.time_end <= payload.time_start:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="time_end must be greater than time_start.",
+        )
 
     source_version_id = None
     master_delivery_id = None
     if payload.phase in {IssuePhase.PEER, IssuePhase.MASTERING}:
         source_version = current_source_version(track)
         if source_version is None:
-            raise HTTPException(status_code=409, detail="No source version available.")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No source version available.")
         source_version_id = source_version.id
     if payload.phase == IssuePhase.FINAL_REVIEW:
         delivery = current_master_delivery(track)
         if delivery is None:
-            raise HTTPException(status_code=409, detail="No master delivery available.")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No master delivery available.")
         master_delivery_id = delivery.id
 
     issue = Issue(

@@ -9,6 +9,9 @@ from app.security import create_access_token, get_current_user, hash_password, v
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
+# Computed once at startup; used to prevent timing-based email enumeration.
+_DUMMY_HASH = hash_password("__dummy_timing_guard__")
+
 
 def _build_auth_response(user: User) -> AuthResponse:
     return AuthResponse(access_token=create_access_token(user), user=UserRead.model_validate(user))
@@ -17,17 +20,27 @@ def _build_auth_response(user: User) -> AuthResponse:
 @router.post("/login", response_model=AuthResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
     user = db.scalars(select(User).where(User.email == payload.email)).first()
-    if user is None or not verify_password(payload.password, user.password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    stored = user.password if user is not None else _DUMMY_HASH
+    if not verify_password(payload.password, stored):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
     return _build_auth_response(user)
 
 
 @router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> AuthResponse:
     if db.scalars(select(User).where(User.email == payload.email)).first() is not None:
-        raise HTTPException(status_code=409, detail="Email is already registered.")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email is already registered.",
+        )
     if db.scalars(select(User).where(User.username == payload.username)).first() is not None:
-        raise HTTPException(status_code=409, detail="Username is already taken.")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Username is already taken.",
+        )
 
     user = User(
         username=payload.username,

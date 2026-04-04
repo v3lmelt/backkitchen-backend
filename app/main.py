@@ -1,9 +1,10 @@
 import json
+import logging
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, select, text
@@ -16,6 +17,7 @@ from app.models import (  # noqa: F401
     ChecklistItem,
     Comment,
     CommentImage,
+    Invitation,
     Issue,
     IssuePhase,
     IssueSeverity,
@@ -28,8 +30,8 @@ from app.models import (  # noqa: F401
     TrackStatus,
     User,
 )
-from app.routers import albums, auth, checklists, issues, tracks, users
-from app.security import hash_password
+from app.routers import albums, auth, checklists, issues, invitations, tracks, users
+from app.security import _decode_token, hash_password
 from app.workflow import log_track_event
 
 
@@ -52,7 +54,8 @@ class ConnectionManager:
         for ws in self.active_connections.get(track_id, []):
             try:
                 await ws.send_text(payload)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning("WebSocket send failed: %s", exc)
                 dead.append(ws)
         for ws in dead:
             self.disconnect(track_id, ws)
@@ -279,7 +282,8 @@ async def lifespan(app: FastAPI):
     _backfill_workflow_data()
     upload_path = settings.get_upload_path()
     (upload_path / "comment_images").mkdir(parents=True, exist_ok=True)
-    _seed_demo_data()
+    if settings.SEED_DEMO_DATA:
+        _seed_demo_data()
     yield
 
 
@@ -289,7 +293,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -299,6 +303,7 @@ app.include_router(albums.router)
 app.include_router(tracks.router)
 app.include_router(issues.router)
 app.include_router(checklists.router)
+app.include_router(invitations.router)
 
 try:
     upload_path = settings.get_upload_path()
@@ -313,7 +318,15 @@ def healthcheck() -> dict[str, str]:
 
 
 @app.websocket("/ws/tracks/{track_id}")
-async def websocket_track(websocket: WebSocket, track_id: int) -> None:
+async def websocket_track(websocket: WebSocket, track_id: int, token: str | None = None) -> None:
+    if token is None:
+        await websocket.close(code=4001)
+        return
+    try:
+        _decode_token(token)
+    except HTTPException:
+        await websocket.close(code=4001)
+        return
     await manager.connect(track_id, websocket)
     try:
         while True:

@@ -35,7 +35,7 @@ def verify_password(password: str, stored: str | None) -> bool:
     try:
         algorithm, iteration_text, salt, digest = stored.split("$", 3)
     except ValueError:
-        return stored == password
+        return False
     if algorithm != "pbkdf2_sha256":
         return False
     calculated = hashlib.pbkdf2_hmac(
