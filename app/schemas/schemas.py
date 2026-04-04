@@ -34,6 +34,16 @@ class UserRead(UserBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class UserUpdateProfile(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=100)
+    email: str | None = Field(default=None, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=8)
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -67,6 +77,14 @@ class AlbumTeamUpdate(BaseModel):
     member_ids: list[int] = []
 
 
+class AlbumSummary(BaseModel):
+    id: int
+    title: str
+    cover_color: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class InvitationCreate(BaseModel):
     user_id: int
 
@@ -78,22 +96,11 @@ class InvitationRead(BaseModel):
     invited_by_user_id: int
     status: str
     created_at: datetime
-    album: "AlbumSummary" | None = None
+    album: AlbumSummary | None = None
     user: UserRead | None = None
     invited_by_user: UserRead | None = None
 
     model_config = ConfigDict(from_attributes=True)
-
-
-class AlbumSummary(BaseModel):
-    id: int
-    title: str
-    cover_color: str
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-InvitationRead.model_rebuild()
 
 
 class AlbumRead(AlbumBase):
@@ -201,6 +208,7 @@ class IssueUpdate(BaseModel):
     description: str | None = None
     status: IssueStatus | None = None
     severity: IssueSeverity | None = None
+    status_note: str | None = None
 
 
 class IssueRead(IssueBase):
@@ -234,6 +242,7 @@ class CommentRead(BaseModel):
     issue_id: int
     author_id: int
     content: str
+    is_status_note: bool = False
     created_at: datetime
     author: UserRead | None = None
     images: list[CommentImageRead] = []
@@ -281,3 +290,31 @@ class TrackDetailResponse(BaseModel):
     issues: list[IssueRead]
     checklist_items: list[ChecklistItemRead]
     events: list[WorkflowEventRead]
+    source_versions: list[TrackSourceVersionRead] = []
+
+
+class NotificationRead(BaseModel):
+    id: int
+    user_id: int
+    type: str
+    title: str
+    body: str
+    related_track_id: int | None = None
+    related_issue_id: int | None = None
+    is_read: bool
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AlbumStats(BaseModel):
+    total_tracks: int
+    by_status: dict[str, int]
+    open_issues: int
+    recent_events: list[WorkflowEventRead]
+
+
+class IssueBatchUpdate(BaseModel):
+    issue_ids: list[int]
+    status: IssueStatus
+    status_note: str | None = None

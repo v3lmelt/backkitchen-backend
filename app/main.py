@@ -24,13 +24,14 @@ from app.models import (  # noqa: F401
     IssueStatus,
     IssueType,
     MasterDelivery,
+    Notification,
     RejectionMode,
     Track,
     TrackSourceVersion,
     TrackStatus,
     User,
 )
-from app.routers import albums, auth, checklists, issues, invitations, tracks, users
+from app.routers import albums, auth, checklists, issues, invitations, notifications, tracks, users
 from app.security import _decode_token, hash_password
 from app.workflow import log_track_event
 
@@ -92,6 +93,7 @@ def _run_sqlite_compat_migrations() -> None:
     add_column("issues", "master_delivery_id", "master_delivery_id INTEGER")
     add_column("checklist_items", "source_version_id", "source_version_id INTEGER")
     add_column("checklist_items", "workflow_cycle", "workflow_cycle INTEGER NOT NULL DEFAULT 1")
+    add_column("comments", "is_status_note", "is_status_note BOOLEAN NOT NULL DEFAULT 0")
 
     with engine.begin() as conn:
         if "users" in columns_by_table:
@@ -304,6 +306,7 @@ app.include_router(tracks.router)
 app.include_router(issues.router)
 app.include_router(checklists.router)
 app.include_router(invitations.router)
+app.include_router(notifications.router)
 
 try:
     upload_path = settings.get_upload_path()

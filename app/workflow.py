@@ -196,6 +196,7 @@ def build_comment_read(comment: Comment, db: Session) -> CommentRead:
         issue_id=comment.issue_id,
         author_id=comment.author_id,
         content=comment.content,
+        is_status_note=comment.is_status_note,
         created_at=comment.created_at,
         author=_user_read(author),
         images=images,
@@ -212,6 +213,10 @@ def build_checklist_read(item: ChecklistItem) -> ChecklistItemRead:
     return ChecklistItemRead.model_validate(item)
 
 
+def build_source_version_read(version: TrackSourceVersion) -> TrackSourceVersionRead:
+    return TrackSourceVersionRead.model_validate(version)
+
+
 def build_event_read(event: WorkflowEvent, db: Session) -> WorkflowEventRead:
     actor = db.get(User, event.actor_user_id) if event.actor_user_id else None
     payload = json.loads(event.payload) if event.payload else None
@@ -224,6 +229,9 @@ def build_event_read(event: WorkflowEvent, db: Session) -> WorkflowEventRead:
         created_at=event.created_at,
         actor=_user_read(actor),
     )
+
+
+build_workflow_event_read = build_event_read
 
 
 def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResponse:
@@ -244,6 +252,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         issues=issues,
         checklist_items=checklist_items,
         events=events,
+        source_versions=[build_source_version_read(v) for v in track.source_versions],
     )
 
 
