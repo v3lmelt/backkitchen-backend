@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,11 +45,27 @@ router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 # Resolved once at startup to avoid a mkdir syscall on every file-serve request.
 _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
 
+_UNSAFE_CHARS = re.compile(r'[^\w\s\-]', re.UNICODE)
+_COLLAPSE = re.compile(r'[\s_]+')
 
-def _save_upload(file: UploadFile) -> tuple[str, float | None]:
+
+def sanitize_filename(name: str) -> str:
+    """Return a filesystem-safe stem from an arbitrary Unicode string.
+
+    Unsafe characters are replaced with underscores; consecutive underscores
+    and whitespace are collapsed.  Truncated to 200 chars to leave room for
+    a version suffix and file extension.
+    """
+    s = _UNSAFE_CHARS.sub('_', name)
+    s = _COLLAPSE.sub('_', s)
+    s = s.strip('_')
+    return s[:200] or 'untitled'
+
+
+def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float | None]:
     upload_dir = settings.get_upload_path()
-    ext = Path(file.filename).suffix if file.filename else ".bin"
-    unique_name = f"{uuid.uuid4().hex}{ext}"
+    ext = Path(file.filename).suffix.lower() if file.filename else ".bin"
+    unique_name = f"{stem or uuid.uuid4().hex}{ext}"
     dest = upload_dir / unique_name
     content = file.file.read()
     dest.write_bytes(content)
@@ -110,7 +127,7 @@ def create_track(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
 
-    file_path, duration = _save_upload(file)
+    file_path, duration = _save_upload(file, f"{sanitize_filename(title)}_v1")
     track = Track(
         title=title,
         artist=artist,
@@ -203,7 +220,7 @@ def upload_source_version(
         raise HTTPException(status_code=409, detail="This track is not waiting for a new source version.")
 
     previous_status = track.status
-    file_path, duration = _save_upload(file)
+    file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_v{track.version + 1}")
     track.version += 1
     track.file_path = file_path
     track.duration = duration
@@ -415,11 +432,11 @@ def upload_master_delivery(
     if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
         raise HTTPException(status_code=403, detail="Only the mastering engineer can upload a master delivery.")
 
-    file_path, _duration = _save_upload(file)
     delivery_number = 1
     current_delivery = current_master_delivery(track)
     if current_delivery and current_delivery.workflow_cycle == track.workflow_cycle:
         delivery_number = current_delivery.delivery_number + 1
+    file_path, _duration = _save_upload(file, f"{sanitize_filename(track.title)}_master_v{delivery_number}")
     delivery = MasterDelivery(
         track_id=track.id,
         workflow_cycle=track.workflow_cycle,
