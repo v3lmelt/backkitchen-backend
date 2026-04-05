@@ -28,8 +28,8 @@ class CircleMember(Base):
     __tablename__ = "circle_members"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    circle_id: Mapped[int] = mapped_column(Integer, ForeignKey("circles.id"), nullable=False)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    circle_id: Mapped[int] = mapped_column(Integer, ForeignKey("circles.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     role: Mapped[str] = mapped_column(String(30), nullable=False, default="member")
     joined_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False

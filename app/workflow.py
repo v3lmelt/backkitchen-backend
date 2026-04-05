@@ -42,6 +42,14 @@ def get_album_member_ids(db: Session, album_id: int) -> set[int]:
     return {row.user_id for row in rows}
 
 
+def get_all_album_member_ids(db: Session) -> dict[int, set[int]]:
+    """Batch-fetch all album→member mappings in a single query."""
+    result: dict[int, set[int]] = {}
+    for m in db.scalars(select(AlbumMember)).all():
+        result.setdefault(m.album_id, set()).add(m.user_id)
+    return result
+
+
 def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
     album = db.get(Album, album_id)
     if album is None:
@@ -180,8 +188,12 @@ def build_issue_read(
     issue: Issue,
     db: Session,
     source_version_numbers: dict[int, int] | None = None,
+    users_cache: dict[int, User] | None = None,
 ) -> IssueRead:
-    author = db.get(User, issue.author_id)
+    if users_cache and issue.author_id in users_cache:
+        author = users_cache[issue.author_id]
+    else:
+        author = db.get(User, issue.author_id)
     source_version_number = None
     if issue.source_version_id:
         if source_version_numbers is not None:
@@ -212,8 +224,11 @@ def build_issue_read(
     )
 
 
-def build_comment_read(comment: Comment, db: Session) -> CommentRead:
-    author = db.get(User, comment.author_id)
+def build_comment_read(comment: Comment, db: Session, users_cache: dict[int, User] | None = None) -> CommentRead:
+    if users_cache and comment.author_id in users_cache:
+        author = users_cache[comment.author_id]
+    else:
+        author = db.get(User, comment.author_id)
     images = [
         CommentImageRead(
             id=image.id,
@@ -248,8 +263,11 @@ def build_comment_read(comment: Comment, db: Session) -> CommentRead:
 
 
 def build_issue_detail(issue: Issue, db: Session) -> IssueDetail:
-    issue_read = build_issue_read(issue, db)
-    comments = [build_comment_read(comment, db) for comment in issue.comments]
+    # Pre-fetch users for this issue's comments
+    user_ids = {issue.author_id} | {c.author_id for c in issue.comments}
+    users_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(user_ids))).all()}
+    issue_read = build_issue_read(issue, db, users_cache=users_by_id)
+    comments = [build_comment_read(comment, db, users_cache=users_by_id) for comment in issue.comments]
     return IssueDetail(**issue_read.model_dump(), comments=comments)
 
 
@@ -257,8 +275,13 @@ def build_checklist_read(item: ChecklistItem) -> ChecklistItemRead:
     return ChecklistItemRead.model_validate(item)
 
 
-def build_event_read(event: WorkflowEvent, db: Session) -> WorkflowEventRead:
-    actor = db.get(User, event.actor_user_id) if event.actor_user_id else None
+def build_event_read(event: WorkflowEvent, db: Session, users_cache: dict[int, User] | None = None) -> WorkflowEventRead:
+    if users_cache and event.actor_user_id and event.actor_user_id in users_cache:
+        actor = users_cache[event.actor_user_id]
+    elif event.actor_user_id:
+        actor = db.get(User, event.actor_user_id)
+    else:
+        actor = None
     payload = json.loads(event.payload) if event.payload else None
     return WorkflowEventRead(
         id=event.id,
@@ -273,9 +296,26 @@ def build_event_read(event: WorkflowEvent, db: Session) -> WorkflowEventRead:
 
 def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResponse:
     album = ensure_track_visibility(track, user, db)
+
+    # Pre-fetch all user IDs we'll need to avoid N+1
+    user_ids: set[int] = set()
+    for issue in track.issues:
+        user_ids.add(issue.author_id)
+        for comment in issue.comments:
+            user_ids.add(comment.author_id)
+    for event in track.workflow_events:
+        if event.actor_user_id:
+            user_ids.add(event.actor_user_id)
+    user_ids.discard(None)
+
+    users_by_id: dict[int, User] = {}
+    if user_ids:
+        fetched = db.scalars(select(User).where(User.id.in_(user_ids))).all()
+        users_by_id = {u.id: u for u in fetched}
+
     source_version_numbers = {version.id: version.version_number for version in track.source_versions}
     issues = [
-        build_issue_read(issue, db, source_version_numbers)
+        build_issue_read(issue, db, source_version_numbers, users_by_id)
         for issue in sorted(track.issues, key=lambda row: (row.created_at, row.id))
     ]
     current_source = current_source_version(track)
@@ -284,7 +324,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         for item in track.checklist_items
         if current_source is None or item.source_version_id == current_source.id
     ]
-    events = [build_event_read(event, db) for event in track.workflow_events]
+    events = [build_event_read(event, db, users_by_id) for event in track.workflow_events]
     discussions = [
         DiscussionRead(
             id=d.id,

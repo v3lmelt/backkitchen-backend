@@ -17,7 +17,7 @@ class MasterDelivery(Base):
     delivery_number: Mapped[int] = mapped_column(Integer, nullable=False)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
     uploaded_by_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("users.id"), nullable=True
+        Integer, ForeignKey("users.id"), nullable=True, index=True
     )
     producer_approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     submitter_approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

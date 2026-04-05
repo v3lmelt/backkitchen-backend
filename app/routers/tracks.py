@@ -1,3 +1,4 @@
+import hashlib
 import re
 import uuid
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models.album import Album
+from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
 from app.models.issue import Issue, IssuePhase, IssueStatus
 from app.models.master_delivery import MasterDelivery
@@ -26,8 +28,9 @@ from app.schemas.schemas import (
     PeerReviewDecisionRequest,
 )
 from app.notifications import notify
-from app.security import get_current_user
+from app.security import _decode_token, get_current_user, get_current_user_optional
 from app.services.audio import extract_audio_metadata
+from app.services.upload import stream_upload_sync
 from app.workflow import (
     assign_random_peer_reviewer,
     build_track_detail,
@@ -36,6 +39,7 @@ from app.workflow import (
     current_source_version,
     ensure_album_visibility,
     ensure_track_visibility,
+    get_all_album_member_ids,
     get_album_member_ids,
     log_track_event,
 )
@@ -44,6 +48,23 @@ router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 
 # Resolved once at startup to avoid a mkdir syscall on every file-serve request.
 _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
+
+# One day in seconds — audio files are immutable (new versions create new files).
+_AUDIO_CACHE_MAX_AGE = 86400
+
+
+def _get_user_from_token_param(
+    token: str | None = Query(default=None, alias="token"),
+    db: Session = Depends(get_db),
+) -> User | None:
+    """Resolve a user from a ``?token=`` query parameter (for <audio> src URLs)."""
+    if token is None:
+        return None
+    payload = _decode_token(token)
+    user = db.get(User, int(payload["sub"]))
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found.")
+    return user
 
 _UNSAFE_CHARS = re.compile(r'[^\w\s\-]', re.UNICODE)
 _COLLAPSE = re.compile(r'[\s_]+')
@@ -77,13 +98,7 @@ def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float 
     upload_dir = settings.get_upload_path()
     unique_name = f"{stem or uuid.uuid4().hex}{ext}"
     dest = upload_dir / unique_name
-    content = file.file.read()
-    if len(content) > MAX_AUDIO_UPLOAD_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Audio file too large. Maximum size is {MAX_AUDIO_UPLOAD_SIZE // (1024 * 1024)} MB.",
-        )
-    dest.write_bytes(content)
+    stream_upload_sync(file, dest, MAX_AUDIO_UPLOAD_SIZE)
     meta = extract_audio_metadata(dest)
     return str(dest), meta.duration
 
@@ -120,10 +135,21 @@ def _serve_path(path_str: str, filename_prefix: str) -> FileResponse:
         ".m4a": "audio/mp4",
     }
     media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
+
+    # Build a stable ETag from file path + size + mtime so browsers can cache.
+    stat = file_path.stat()
+    etag_raw = f"{file_path.name}-{stat.st_size}-{stat.st_mtime_ns}"
+    etag = hashlib.md5(etag_raw.encode()).hexdigest()
+
     return FileResponse(
         path=str(file_path),
         media_type=media_type,
         filename=f"{filename_prefix}{file_path.suffix}",
+        headers={
+            "Cache-Control": f"private, max-age={_AUDIO_CACHE_MAX_AGE}, immutable",
+            "ETag": f'"{etag}"',
+            "Accept-Ranges": "bytes",
+        },
     )
 
 
@@ -176,11 +202,12 @@ def list_tracks(
     current_user: User = Depends(get_current_user),
 ) -> list[TrackListItem]:
     albums = list(db.scalars(select(Album)).all())
+    members_by_album = get_all_album_member_ids(db)
     visible_album_ids = {
         album.id
         for album in albums
         if current_user.id
-        in ({album.producer_id, album.mastering_engineer_id} | get_album_member_ids(db, album.id))
+        in ({album.producer_id, album.mastering_engineer_id} | members_by_album.get(album.id, set()))
     }
     stmt = select(Track).order_by(Track.id)
     if status_filter is not None:
@@ -621,12 +648,25 @@ def delete_track(
     db.commit()
 
 
+def _resolve_audio_user(
+    bearer_user: User | None,
+    token_user: User | None,
+) -> User:
+    """Pick the authenticated user from either Bearer header or ?token= param."""
+    user = bearer_user or token_user
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    return user
+
+
 @router.get("/{track_id}/audio")
 def serve_audio(
     track_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    bearer_user: User | None = Depends(get_current_user_optional),
+    token_user: User | None = Depends(_get_user_from_token_param),
 ) -> FileResponse:
+    current_user = _resolve_audio_user(bearer_user, token_user)
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
@@ -641,8 +681,10 @@ def get_source_version_audio(
     track_id: int,
     version_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    bearer_user: User | None = Depends(get_current_user_optional),
+    token_user: User | None = Depends(_get_user_from_token_param),
 ) -> FileResponse:
+    current_user = _resolve_audio_user(bearer_user, token_user)
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
@@ -659,8 +701,10 @@ def get_source_version_audio(
 def serve_master_audio(
     track_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    bearer_user: User | None = Depends(get_current_user_optional),
+    token_user: User | None = Depends(_get_user_from_token_param),
 ) -> FileResponse:
+    current_user = _resolve_audio_user(bearer_user, token_user)
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")

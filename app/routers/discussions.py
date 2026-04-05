@@ -15,6 +15,7 @@ from app.models.user import User
 from app.notifications import notify
 from app.schemas.schemas import DiscussionImageRead, DiscussionRead, UserRead
 from app.security import get_current_user
+from app.services.upload import stream_upload
 from app.workflow import ensure_track_visibility
 
 router = APIRouter(tags=["discussions"])
@@ -109,15 +110,9 @@ async def create_discussion(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"Unsupported image extension: {ext}",
                 )
-            data = await img_file.read()
-            if len(data) > MAX_IMAGE_UPLOAD_SIZE:
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"Image too large. Maximum size is {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)} MB.",
-                )
             filename = f"{uuid.uuid4().hex}{ext}"
             file_path = upload_dir / filename
-            file_path.write_bytes(data)
+            await stream_upload(img_file, file_path, MAX_IMAGE_UPLOAD_SIZE)
             db.add(
                 TrackDiscussionImage(
                     discussion_id=discussion.id,

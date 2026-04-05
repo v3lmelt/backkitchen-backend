@@ -104,15 +104,14 @@ def _decode_token(token: str) -> dict:
     return payload
 
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    db: Session = Depends(get_db),
-) -> User:
+def _resolve_bearer_user(
+    credentials: HTTPAuthorizationCredentials | None,
+    db: Session,
+) -> User | None:
+    """Shared logic: decode Bearer credentials and look up the user.
+    Returns ``None`` when *credentials* is ``None``."""
     if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required.",
-        )
+        return None
     payload = _decode_token(credentials.credentials)
     user = db.get(User, int(payload["sub"]))
     if user is None:
@@ -121,3 +120,26 @@ def get_current_user(
             detail="Authenticated user no longer exists.",
         )
     return user
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: Session = Depends(get_db),
+) -> User:
+    user = _resolve_bearer_user(credentials, db)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+    return user
+
+
+def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: Session = Depends(get_db),
+) -> User | None:
+    """Same as ``get_current_user`` but returns ``None`` instead of raising
+    when no Bearer header is present.  Used by endpoints that also accept a
+    ``?token=`` query-param fallback (e.g. audio streaming)."""
+    return _resolve_bearer_user(credentials, db)
