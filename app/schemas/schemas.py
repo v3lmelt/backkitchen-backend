@@ -71,6 +71,7 @@ class AlbumBase(BaseModel):
 class AlbumCreate(AlbumBase):
     release_date: date | None = None
     catalog_number: str | None = Field(default=None, max_length=50)
+    circle_id: int | None = None
     circle_name: str | None = Field(default=None, max_length=200)
     genres: list[str] | None = None
 
@@ -125,6 +126,7 @@ class AlbumRead(AlbumBase):
     id: int
     release_date: date | None = None
     catalog_number: str | None = None
+    circle_id: int | None = None
     circle_name: str | None = None
     genres: list[str] | None = None
     cover_image: str | None = None
@@ -140,6 +142,76 @@ class AlbumRead(AlbumBase):
     members: list[AlbumMemberRead] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class CircleMemberRead(BaseModel):
+    id: int
+    circle_id: int
+    user_id: int
+    role: str
+    joined_at: datetime
+    user: UserRead
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CircleBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str | None = None
+    website: str | None = Field(default=None, max_length=200)
+
+
+class CircleCreate(CircleBase):
+    pass
+
+
+class CircleUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    website: str | None = Field(default=None, max_length=200)
+
+
+class CircleRead(CircleBase):
+    id: int
+    logo_url: str | None = None
+    created_by: int
+    created_at: datetime
+    members: list[CircleMemberRead] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CircleSummary(BaseModel):
+    id: int
+    name: str
+    description: str | None = None
+    logo_url: str | None = None
+    created_by: int
+    member_count: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class InviteCodeCreate(BaseModel):
+    role: str = Field(default="member", pattern=r"^(member|mastering_engineer)$")
+    expires_in_days: int = Field(default=7, ge=1, le=30)
+
+
+class InviteCodeRead(BaseModel):
+    id: int
+    circle_id: int
+    code: str
+    role: str
+    expires_at: datetime
+    is_active: bool
+    created_at: datetime
+    created_by_user: UserRead
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class JoinCircleRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=16)
 
 
 class TrackSourceVersionRead(BaseModel):

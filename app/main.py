@@ -15,6 +15,9 @@ from app.models import (  # noqa: F401
     Album,
     AlbumMember,
     ChecklistItem,
+    Circle,
+    CircleInviteCode,
+    CircleMember,
     Comment,
     CommentImage,
     Invitation,
@@ -31,7 +34,7 @@ from app.models import (  # noqa: F401
     TrackStatus,
     User,
 )
-from app.routers import albums, auth, checklists, discussions, issues, invitations, notifications, tracks, users
+from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users
 from app.security import _decode_token, hash_password
 from app.workflow import log_track_event
 
@@ -104,6 +107,7 @@ def _run_sqlite_compat_migrations() -> None:
     add_column("albums", "circle_name", "circle_name VARCHAR(200)")
     add_column("albums", "genres", "genres TEXT")
     add_column("albums", "cover_image", "cover_image VARCHAR(500)")
+    add_column("albums", "circle_id", "circle_id INTEGER REFERENCES circles(id)")
 
     with engine.begin() as conn:
         if "users" in columns_by_table:
@@ -243,10 +247,28 @@ def _seed_demo_data() -> None:
         db.add_all([producer, submitter, mastering_engineer])
         db.flush()
 
+        circle = Circle(
+            name="Back Kitchen",
+            description="Demo doujin circle. All demo members belong here.",
+            created_by=producer.id,
+            created_at=now,
+        )
+        db.add(circle)
+        db.flush()
+
+        db.add_all(
+            [
+                CircleMember(circle_id=circle.id, user_id=producer.id, role="owner", joined_at=now),
+                CircleMember(circle_id=circle.id, user_id=submitter.id, role="member", joined_at=now),
+                CircleMember(circle_id=circle.id, user_id=mastering_engineer.id, role="mastering_engineer", joined_at=now),
+            ]
+        )
+
         album = Album(
             title="BACK KITCHEN Vol.1",
             description="Demo workflow album for reviewing doujin submissions.",
             cover_color="#8b5cf6",
+            circle_id=circle.id,
             producer_id=producer.id,
             mastering_engineer_id=mastering_engineer.id,
             created_at=now,
@@ -312,6 +334,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(users.router)
+app.include_router(circles.router)
 app.include_router(albums.router)
 app.include_router(tracks.router)
 app.include_router(issues.router)

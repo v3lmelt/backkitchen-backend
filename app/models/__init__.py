@@ -1,5 +1,6 @@
 from app.models.album import Album
 from app.models.album_member import AlbumMember
+from app.models.circle import Circle, CircleInviteCode, CircleMember
 from app.models.checklist import ChecklistItem
 from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
@@ -17,6 +18,9 @@ from app.models.workflow_event import WorkflowEvent
 __all__ = [
     "Album",
     "AlbumMember",
+    "Circle",
+    "CircleInviteCode",
+    "CircleMember",
     "ChecklistItem",
     "Comment",
     "CommentAudio",

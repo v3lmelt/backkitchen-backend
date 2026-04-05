@@ -45,6 +45,7 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         cover_color=album.cover_color,
         release_date=album.release_date,
         catalog_number=album.catalog_number,
+        circle_id=album.circle_id,
         circle_name=album.circle_name,
         genres=genres,
         cover_image=album.cover_image,
