@@ -1,10 +1,11 @@
 import io
 import json
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func as sqlfunc, select
 from sqlalchemy.orm import Session
@@ -17,7 +18,7 @@ from app.models.issue import Issue, IssueStatus
 from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
-from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig
+from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig
 from app.security import get_current_user
 from app.services.webhook import build_webhook_payload, post_webhook
 from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids
@@ -36,11 +37,17 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         for member in album.members
     ]
     phase_deadlines = json.loads(album.phase_deadlines) if album.phase_deadlines else None
+    genres = json.loads(album.genres) if album.genres else None
     return AlbumRead(
         id=album.id,
         title=album.title,
         description=album.description,
         cover_color=album.cover_color,
+        release_date=album.release_date,
+        catalog_number=album.catalog_number,
+        circle_name=album.circle_name,
+        genres=genres,
+        cover_image=album.cover_image,
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
         deadline=album.deadline,
@@ -64,7 +71,11 @@ def create_album(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
-    album = Album(**payload.model_dump(), producer_id=current_user.id)
+    album_data = payload.model_dump()
+    genres = album_data.pop("genres", None)
+    album = Album(**album_data, producer_id=current_user.id)
+    if genres:
+        album.genres = json.dumps(genres, ensure_ascii=False)
     db.add(album)
     db.flush()
     db.add(AlbumMember(album_id=album.id, user_id=current_user.id))
@@ -152,6 +163,60 @@ def update_deadlines(
     album = ensure_album_producer(album_id, current_user, db)
     album.deadline = payload.deadline
     album.phase_deadlines = json.dumps(payload.phase_deadlines) if payload.phase_deadlines else None
+    db.commit()
+    db.refresh(album)
+    return _album_to_read(album, db)
+
+
+@router.patch("/{album_id}/metadata", response_model=AlbumRead)
+def update_album_metadata(
+    album_id: int,
+    payload: AlbumMetadataUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AlbumRead:
+    album = ensure_album_producer(album_id, current_user, db)
+    album.release_date = payload.release_date
+    album.catalog_number = payload.catalog_number
+    album.circle_name = payload.circle_name
+    album.genres = json.dumps(payload.genres, ensure_ascii=False) if payload.genres else None
+    db.commit()
+    db.refresh(album)
+    return _album_to_read(album, db)
+
+
+@router.post("/{album_id}/cover", response_model=AlbumRead)
+async def upload_album_cover(
+    album_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AlbumRead:
+    album = ensure_album_producer(album_id, current_user, db)
+
+    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only JPEG, PNG, WebP, and GIF images are allowed.",
+        )
+
+    ext = Path(file.filename).suffix if file.filename else ".jpg"
+    filename = f"{album_id}_{uuid.uuid4().hex}{ext}"
+    cover_dir = settings.get_upload_path() / "covers"
+    cover_dir.mkdir(parents=True, exist_ok=True)
+
+    content = await file.read()
+    with open(cover_dir / filename, "wb") as f:
+        f.write(content)
+
+    # Remove old cover file
+    if album.cover_image:
+        old_path = settings.get_upload_path() / album.cover_image
+        if old_path.exists():
+            old_path.unlink(missing_ok=True)
+
+    album.cover_image = f"covers/{filename}"
     db.commit()
     db.refresh(album)
     return _album_to_read(album, db)

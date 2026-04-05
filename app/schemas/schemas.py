@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -69,7 +69,17 @@ class AlbumBase(BaseModel):
 
 
 class AlbumCreate(AlbumBase):
-    pass
+    release_date: date | None = None
+    catalog_number: str | None = Field(default=None, max_length=50)
+    circle_name: str | None = Field(default=None, max_length=200)
+    genres: list[str] | None = None
+
+
+class AlbumMetadataUpdate(BaseModel):
+    release_date: date | None = None
+    catalog_number: str | None = Field(default=None, max_length=50)
+    circle_name: str | None = Field(default=None, max_length=200)
+    genres: list[str] | None = None
 
 
 class AlbumTeamUpdate(BaseModel):
@@ -81,6 +91,9 @@ class AlbumSummary(BaseModel):
     id: int
     title: str
     cover_color: str
+    cover_image: str | None = None
+    circle_name: str | None = None
+    catalog_number: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -110,6 +123,11 @@ class AlbumDeadlineUpdate(BaseModel):
 
 class AlbumRead(AlbumBase):
     id: int
+    release_date: date | None = None
+    catalog_number: str | None = None
+    circle_name: str | None = None
+    genres: list[str] | None = None
+    cover_image: str | None = None
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
     deadline: datetime | None = None

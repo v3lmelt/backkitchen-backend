@@ -99,6 +99,11 @@ def _run_sqlite_compat_migrations() -> None:
     add_column("albums", "deadline", "deadline DATETIME")
     add_column("albums", "phase_deadlines", "phase_deadlines TEXT")
     add_column("albums", "webhook_config", "webhook_config TEXT")
+    add_column("albums", "release_date", "release_date DATE")
+    add_column("albums", "catalog_number", "catalog_number VARCHAR(50)")
+    add_column("albums", "circle_name", "circle_name VARCHAR(200)")
+    add_column("albums", "genres", "genres TEXT")
+    add_column("albums", "cover_image", "cover_image VARCHAR(500)")
 
     with engine.begin() as conn:
         if "users" in columns_by_table:
@@ -289,6 +294,7 @@ async def lifespan(app: FastAPI):
     _backfill_workflow_data()
     upload_path = settings.get_upload_path()
     (upload_path / "comment_images").mkdir(parents=True, exist_ok=True)
+    (upload_path / "covers").mkdir(parents=True, exist_ok=True)
     if settings.SEED_DEMO_DATA:
         _seed_demo_data()
     yield
