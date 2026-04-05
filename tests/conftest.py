@@ -26,7 +26,7 @@ from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.invitation import Invitation
 from app.models.notification import Notification
-from app.routers import albums, auth, checklists, invitations, issues, notifications, tracks, users
+from app.routers import admin, albums, auth, checklists, invitations, issues, notifications, tracks, users
 from app.security import create_access_token
 
 
@@ -94,6 +94,7 @@ def client(
     app.include_router(checklists.router)
     app.include_router(invitations.router)
     app.include_router(notifications.router)
+    app.include_router(admin.router)
     app.dependency_overrides[get_db] = override_get_db
     app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
 
@@ -124,6 +125,7 @@ class Factory:
         username: str | None = None,
         display_name: str | None = None,
         email: str | None = None,
+        is_admin: bool = False,
     ) -> User:
         key = username or self._next(role)
         user = User(
@@ -133,6 +135,7 @@ class Factory:
             role=role,
             avatar_color="#123456",
             password="pw",
+            is_admin=is_admin,
         )
         self.session.add(user)
         self.session.commit()
