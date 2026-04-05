@@ -103,10 +103,17 @@ class InvitationRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class AlbumDeadlineUpdate(BaseModel):
+    deadline: datetime | None = None
+    phase_deadlines: dict[str, str] | None = None
+
+
 class AlbumRead(AlbumBase):
     id: int
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
+    deadline: datetime | None = None
+    phase_deadlines: dict[str, str] | None = None
     created_at: datetime
     updated_at: datetime
     track_count: int = 0
@@ -149,8 +156,13 @@ class TrackBase(BaseModel):
     bpm: int | None = None
 
 
+class TrackOrderUpdate(BaseModel):
+    track_ids: list[int]
+
+
 class TrackRead(TrackBase):
     id: int
+    track_number: int | None = None
     file_path: str | None = None
     duration: float | None = None
     status: TrackStatus
@@ -237,6 +249,17 @@ class CommentImageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class CommentAudioRead(BaseModel):
+    id: int
+    comment_id: int
+    audio_url: str
+    original_filename: str
+    duration: float | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class CommentRead(BaseModel):
     id: int
     issue_id: int
@@ -246,12 +269,29 @@ class CommentRead(BaseModel):
     created_at: datetime
     author: UserRead | None = None
     images: list[CommentImageRead] = []
+    audios: list[CommentAudioRead] = []
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class IssueDetail(IssueRead):
     comments: list[CommentRead] = []
+
+
+class ChecklistTemplateItem(BaseModel):
+    label: str = Field(..., min_length=1, max_length=100)
+    description: str | None = None
+    required: bool = True
+    sort_order: int = 0
+
+
+class ChecklistTemplateRead(BaseModel):
+    items: list[ChecklistTemplateItem]
+    is_default: bool = False
+
+
+class ChecklistTemplateUpdate(BaseModel):
+    items: list[ChecklistTemplateItem]
 
 
 class ChecklistItemBase(BaseModel):
@@ -291,6 +331,7 @@ class TrackDetailResponse(BaseModel):
     checklist_items: list[ChecklistItemRead]
     events: list[WorkflowEventRead]
     source_versions: list[TrackSourceVersionRead] = []
+    discussions: list["DiscussionRead"] = []
 
 
 class NotificationRead(BaseModel):
@@ -312,6 +353,29 @@ class AlbumStats(BaseModel):
     by_status: dict[str, int]
     open_issues: int
     recent_events: list[WorkflowEventRead]
+    deadline: datetime | None = None
+    overdue_track_count: int = 0
+
+
+class DiscussionImageRead(BaseModel):
+    id: int
+    discussion_id: int
+    image_url: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DiscussionRead(BaseModel):
+    id: int
+    track_id: int
+    author_id: int
+    content: str
+    created_at: datetime
+    author: UserRead | None = None
+    images: list[DiscussionImageRead] = []
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class IssueBatchUpdate(BaseModel):

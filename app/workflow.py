@@ -10,6 +10,7 @@ from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
 from app.models.comment import Comment
+from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
 from app.models.issue import Issue, IssueStatus
 from app.models.master_delivery import MasterDelivery
@@ -20,8 +21,11 @@ from app.models.workflow_event import WorkflowEvent
 from app.schemas.schemas import (
     AlbumMemberRead,
     ChecklistItemRead,
+    CommentAudioRead,
     CommentImageRead,
     CommentRead,
+    DiscussionImageRead,
+    DiscussionRead,
     IssueDetail,
     IssueRead,
     MasterDeliveryRead,
@@ -134,6 +138,7 @@ def build_track_read(track: Track, user: User, album: Album) -> TrackRead:
         artist=track.artist,
         album_id=track.album_id,
         bpm=track.bpm,
+        track_number=track.track_number,
         file_path=track.file_path,
         duration=track.duration,
         status=track.status,
@@ -191,6 +196,17 @@ def build_comment_read(comment: Comment, db: Session) -> CommentRead:
         )
         for image in comment.images
     ]
+    audios = [
+        CommentAudioRead(
+            id=audio.id,
+            comment_id=audio.comment_id,
+            audio_url=f"/uploads/{audio.file_path}",
+            original_filename=audio.original_filename,
+            duration=audio.duration,
+            created_at=audio.created_at,
+        )
+        for audio in comment.audios
+    ]
     return CommentRead(
         id=comment.id,
         issue_id=comment.issue_id,
@@ -200,6 +216,7 @@ def build_comment_read(comment: Comment, db: Session) -> CommentRead:
         created_at=comment.created_at,
         author=_user_read(author),
         images=images,
+        audios=audios,
     )
 
 
@@ -240,12 +257,33 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         if current_source is None or item.source_version_id == current_source.id
     ]
     events = [build_event_read(event, db) for event in track.workflow_events]
+    discussions = [
+        DiscussionRead(
+            id=d.id,
+            track_id=d.track_id,
+            author_id=d.author_id,
+            content=d.content,
+            created_at=d.created_at,
+            author=_user_read(d.author),
+            images=[
+                DiscussionImageRead(
+                    id=img.id,
+                    discussion_id=img.discussion_id,
+                    image_url=f"/uploads/{img.file_path}",
+                    created_at=img.created_at,
+                )
+                for img in d.images
+            ],
+        )
+        for d in track.discussions
+    ]
     return TrackDetailResponse(
         track=build_track_read(track, user, album),
         issues=issues,
         checklist_items=checklist_items,
         events=events,
         source_versions=[TrackSourceVersionRead.model_validate(v) for v in track.source_versions],
+        discussions=discussions,
     )
 
 

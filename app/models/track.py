@@ -42,6 +42,7 @@ class Track(Base):
     file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     duration: Mapped[float | None] = mapped_column(Float, nullable=True)
     bpm: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    track_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[TrackStatus] = mapped_column(
         Enum(TrackStatus, values_callable=lambda items: [item.value for item in items]),
         nullable=False,
@@ -93,6 +94,12 @@ class Track(Base):
         back_populates="track",
         cascade="all, delete-orphan",
         order_by="WorkflowEvent.created_at",
+    )
+    discussions: Mapped[list["TrackDiscussion"]] = relationship(  # noqa: F821
+        "TrackDiscussion",
+        back_populates="track",
+        cascade="all, delete-orphan",
+        order_by="TrackDiscussion.created_at",
     )
 
     def __repr__(self) -> str:

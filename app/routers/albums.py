@@ -1,17 +1,25 @@
+import io
+import json
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func as sqlfunc, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.issue import Issue, IssueStatus
-from app.models.track import Track
+from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
-from app.schemas.schemas import AlbumCreate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackRead, UserRead
+from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead
 from app.security import get_current_user
-from app.workflow import build_event_read, build_track_read, ensure_album_visibility, get_album_member_ids
+from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_visibility, get_album_member_ids
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
@@ -26,6 +34,7 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         }
         for member in album.members
     ]
+    phase_deadlines = json.loads(album.phase_deadlines) if album.phase_deadlines else None
     return AlbumRead(
         id=album.id,
         title=album.title,
@@ -33,6 +42,8 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         cover_color=album.cover_color,
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
+        deadline=album.deadline,
+        phase_deadlines=phase_deadlines,
         created_at=album.created_at,
         updated_at=album.updated_at,
         track_count=len(album.tracks),
@@ -137,6 +148,28 @@ def update_album_team(
     return _album_to_read(album, db)
 
 
+@router.patch("/{album_id}/deadlines", response_model=AlbumRead)
+def update_deadlines(
+    album_id: int,
+    payload: AlbumDeadlineUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AlbumRead:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    if album.producer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the producer can update deadlines.",
+        )
+    album.deadline = payload.deadline
+    album.phase_deadlines = json.dumps(payload.phase_deadlines) if payload.phase_deadlines else None
+    db.commit()
+    db.refresh(album)
+    return _album_to_read(album, db)
+
+
 @router.get("/{album_id}/stats", response_model=AlbumStats)
 def get_album_stats(
     album_id: int,
@@ -168,11 +201,35 @@ def get_album_stats(
         .limit(10)
     ).all())
 
+    overdue_count = 0
+    if album.phase_deadlines:
+        deadlines = json.loads(album.phase_deadlines)
+        now = datetime.now(timezone.utc)
+        phase_status_map = {
+            "peer_review": {"peer_review", "peer_revision"},
+            "mastering": {"mastering", "mastering_revision"},
+            "final_review": {"final_review"},
+        }
+        for track in tracks:
+            for phase_key, statuses in phase_status_map.items():
+                if track.status.value in statuses and phase_key in deadlines:
+                    try:
+                        dl = datetime.fromisoformat(deadlines[phase_key])
+                        if dl.tzinfo is None:
+                            dl = dl.replace(tzinfo=timezone.utc)
+                        if now > dl:
+                            overdue_count += 1
+                            break
+                    except (ValueError, TypeError):
+                        pass
+
     return AlbumStats(
         total_tracks=len(tracks),
         by_status=by_status,
         open_issues=open_issues,
         recent_events=[build_event_read(e, db) for e in recent_events],
+        deadline=album.deadline,
+        overdue_track_count=overdue_count,
     )
 
 
@@ -187,5 +244,114 @@ def list_album_tracks(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
 
-    tracks = list(db.scalars(select(Track).where(Track.album_id == album_id).order_by(Track.id)).all())
+    tracks = list(db.scalars(
+        select(Track).where(Track.album_id == album_id)
+        .order_by(Track.track_number.asc().nulls_last(), Track.id)
+    ).all())
     return [build_track_read(track, current_user, album) for track in tracks]
+
+
+@router.patch("/{album_id}/track-order", response_model=list[TrackRead])
+def reorder_tracks(
+    album_id: int,
+    payload: TrackOrderUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[TrackRead]:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    if album.producer_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the producer can reorder tracks.")
+    ensure_album_visibility(album, current_user, db)
+
+    tracks = list(db.scalars(select(Track).where(Track.album_id == album_id)).all())
+    track_map = {t.id: t for t in tracks}
+    for i, tid in enumerate(payload.track_ids, 1):
+        if tid not in track_map:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Track {tid} not in this album.")
+        track_map[tid].track_number = i
+    for t in tracks:
+        if t.id not in payload.track_ids:
+            t.track_number = None
+    db.commit()
+    for t in tracks:
+        db.refresh(t)
+    ordered = sorted(tracks, key=lambda x: (x.track_number is None, x.track_number or 0, x.id))
+    return [build_track_read(t, current_user, album) for t in ordered]
+
+
+@router.get("/{album_id}/export")
+def export_album(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    if album.producer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the producer can export the album.",
+        )
+
+    completed_tracks = list(
+        db.scalars(
+            select(Track)
+            .where(Track.album_id == album_id, Track.status == TrackStatus.COMPLETED)
+            .order_by(Track.track_number.asc().nulls_last(), Track.id)
+        ).all()
+    )
+
+    if not completed_tracks:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No completed tracks to export.",
+        )
+
+    upload_dir = settings.get_upload_path()
+    buffer = io.BytesIO()
+    manifest_entries: list[dict] = []
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for track in completed_tracks:
+            delivery = current_master_delivery(track)
+            if delivery is None:
+                continue
+            file_path = Path(delivery.file_path)
+            if not file_path.is_absolute():
+                file_path = upload_dir / file_path
+            if not file_path.exists():
+                continue
+            ext = file_path.suffix
+            num = track.track_number or 0
+            safe_title = track.title.replace("/", "_").replace("\\", "_")
+            safe_artist = track.artist.replace("/", "_").replace("\\", "_")
+            zip_name = f"{num:02d} - {safe_artist} - {safe_title}{ext}"
+            zf.write(str(file_path), zip_name)
+            manifest_entries.append(
+                {
+                    "track_number": num,
+                    "title": track.title,
+                    "artist": track.artist,
+                    "duration": track.duration,
+                    "bpm": track.bpm,
+                    "file": zip_name,
+                }
+            )
+
+        manifest = json.dumps(
+            {"album": album.title, "tracks": manifest_entries},
+            indent=2,
+            ensure_ascii=False,
+        )
+        zf.writestr("manifest.json", manifest)
+
+    buffer.seek(0)
+    safe_album_title = album.title.replace(" ", "_").replace("/", "_").replace("\\", "_")
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_album_title}.zip"'},
+    )

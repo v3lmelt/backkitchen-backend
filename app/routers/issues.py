@@ -10,7 +10,9 @@ from app.config import settings
 from app.database import get_db
 from app.models.album import Album
 from app.models.comment import Comment
+from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
+from app.services.audio import extract_audio_metadata
 from app.models.issue import Issue, IssuePhase
 from app.models.track import Track, TrackStatus
 from app.models.user import User
@@ -34,6 +36,18 @@ IMAGE_EXT_MAP = {
     "image/gif": ".gif",
     "image/webp": ".webp",
 }
+
+ALLOWED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/flac", "audio/aac", "audio/ogg", "audio/x-flac", "audio/x-wav"}
+AUDIO_EXT_MAP = {
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+}
+MAX_AUDIOS_PER_COMMENT = 3
 
 router = APIRouter(tags=["issues"])
 
@@ -255,6 +269,7 @@ async def add_comment(
     issue_id: int,
     content: Optional[str] = Form(default=None),
     images: list[UploadFile] = File(default=[]),
+    audios: list[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> CommentRead:
@@ -269,10 +284,10 @@ async def add_comment(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
 
-    if not effective_content and not images:
+    if not effective_content and not images and not audios:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="A comment must have text content or at least one image.",
+            detail="A comment must have text content, at least one image, or at least one audio file.",
         )
 
     for img_file in images:
@@ -280,6 +295,18 @@ async def add_comment(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Unsupported file type: {img_file.content_type}. Allowed: jpeg, png, gif, webp.",
+            )
+
+    if len(audios) > MAX_AUDIOS_PER_COMMENT:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"A comment may contain at most {MAX_AUDIOS_PER_COMMENT} audio files.",
+        )
+    for audio_file in audios:
+        if audio_file.content_type not in ALLOWED_AUDIO_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported audio type: {audio_file.content_type}. Allowed: mp3, wav, flac, aac, ogg.",
             )
 
     comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content or '')
@@ -297,6 +324,25 @@ async def add_comment(
             data = await img_file.read()
             dest.write_bytes(data)
             db.add(CommentImage(comment_id=comment.id, file_path=file_path))
+
+    if audios:
+        comment_audios_dir = settings.get_upload_path() / "comment_audios"
+        comment_audios_dir.mkdir(parents=True, exist_ok=True)
+        for audio_file in audios:
+            ext = AUDIO_EXT_MAP.get(audio_file.content_type or "", ".mp3")
+            filename = f"{uuid.uuid4()}{ext}"
+            file_path = f"comment_audios/{filename}"
+            dest = comment_audios_dir / filename
+            data = await audio_file.read()
+            dest.write_bytes(data)
+            duration = extract_audio_metadata(dest).duration
+            original_filename = audio_file.filename or filename
+            db.add(CommentAudio(
+                comment_id=comment.id,
+                file_path=file_path,
+                original_filename=original_filename,
+                duration=duration,
+            ))
 
     log_track_event(
         db,

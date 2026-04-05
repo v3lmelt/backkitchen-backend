@@ -31,7 +31,7 @@ from app.models import (  # noqa: F401
     TrackStatus,
     User,
 )
-from app.routers import albums, auth, checklists, issues, invitations, notifications, tracks, users
+from app.routers import albums, auth, checklists, discussions, issues, invitations, notifications, tracks, users
 from app.security import _decode_token, hash_password
 from app.workflow import log_track_event
 
@@ -94,6 +94,10 @@ def _run_sqlite_compat_migrations() -> None:
     add_column("checklist_items", "source_version_id", "source_version_id INTEGER")
     add_column("checklist_items", "workflow_cycle", "workflow_cycle INTEGER NOT NULL DEFAULT 1")
     add_column("comments", "is_status_note", "is_status_note BOOLEAN NOT NULL DEFAULT 0")
+    add_column("tracks", "track_number", "track_number INTEGER")
+    add_column("albums", "checklist_template", "checklist_template TEXT")
+    add_column("albums", "deadline", "deadline DATETIME")
+    add_column("albums", "phase_deadlines", "phase_deadlines TEXT")
 
     with engine.begin() as conn:
         if "users" in columns_by_table:
@@ -295,7 +299,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -307,6 +311,7 @@ app.include_router(issues.router)
 app.include_router(checklists.router)
 app.include_router(invitations.router)
 app.include_router(notifications.router)
+app.include_router(discussions.router)
 
 try:
     upload_path = settings.get_upload_path()

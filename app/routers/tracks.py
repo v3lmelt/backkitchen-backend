@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, func as sqlfunc, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -128,12 +128,16 @@ def create_track(
     ensure_album_visibility(album, current_user, db)
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(title)}_v1")
+    max_num = db.scalar(
+        select(sqlfunc.max(Track.track_number)).where(Track.album_id == album_id)
+    ) or 0
     track = Track(
         title=title,
         artist=artist,
         album_id=album_id,
         submitter_id=current_user.id,
         bpm=bpm,
+        track_number=max_num + 1,
         file_path=file_path,
         duration=duration,
         status=TrackStatus.SUBMITTED,
