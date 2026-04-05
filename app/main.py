@@ -98,6 +98,7 @@ def _run_sqlite_compat_migrations() -> None:
     add_column("albums", "checklist_template", "checklist_template TEXT")
     add_column("albums", "deadline", "deadline DATETIME")
     add_column("albums", "phase_deadlines", "phase_deadlines TEXT")
+    add_column("albums", "webhook_config", "webhook_config TEXT")
 
     with engine.begin() as conn:
         if "users" in columns_by_table:
