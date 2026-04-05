@@ -62,12 +62,27 @@ def sanitize_filename(name: str) -> str:
     return s[:200] or 'untitled'
 
 
+ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a", ".wma"}
+
+
 def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float | None]:
-    upload_dir = settings.get_upload_path()
+    from app.config import MAX_AUDIO_UPLOAD_SIZE
+
     ext = Path(file.filename).suffix.lower() if file.filename else ".bin"
+    if ext not in ALLOWED_AUDIO_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unsupported audio format: {ext}. Allowed: {', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}",
+        )
+    upload_dir = settings.get_upload_path()
     unique_name = f"{stem or uuid.uuid4().hex}{ext}"
     dest = upload_dir / unique_name
     content = file.file.read()
+    if len(content) > MAX_AUDIO_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Audio file too large. Maximum size is {MAX_AUDIO_UPLOAD_SIZE // (1024 * 1024)} MB.",
+        )
     dest.write_bytes(content)
     meta = extract_audio_metadata(dest)
     return str(dest), meta.duration

@@ -29,9 +29,17 @@ class RegisterRequest(BaseModel):
 class UserRead(UserBase):
     id: int
     email: str | None = None
+    email_verified: bool = False
+    is_admin: bool = False
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AdminUserUpdate(BaseModel):
+    role: str | None = Field(default=None, pattern=r"^(member|producer|mastering_engineer)$")
+    is_admin: bool | None = None
+    email_verified: bool | None = None
 
 
 class UserUpdateProfile(BaseModel):
@@ -53,6 +61,11 @@ class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserRead
+
+
+class RegisterResponse(BaseModel):
+    email: str
+    message: str = "Verification email sent. Please check your inbox."
 
 
 class AlbumMemberRead(BaseModel):

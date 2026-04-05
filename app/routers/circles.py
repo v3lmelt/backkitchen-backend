@@ -182,14 +182,25 @@ async def upload_logo(
         raise HTTPException(status_code=404, detail="Circle not found")
     _ensure_circle_producer(circle, current_user)
 
+    from app.config import MAX_IMAGE_UPLOAD_SIZE
+
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
     upload_dir = settings.get_upload_path()
-    ext = Path(file.filename or "logo.jpg").suffix or ".jpg"
+    ext = (Path(file.filename or "logo.jpg").suffix or ".jpg").lower()
+    if ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail=f"Unsupported image extension: {ext}")
     filename = f"{uuid.uuid4()}{ext}"
     dest = upload_dir / filename
-    dest.write_bytes(await file.read())
+    data = await file.read()
+    if len(data) > MAX_IMAGE_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image too large. Maximum size is {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)} MB.",
+        )
+    dest.write_bytes(data)
 
     circle.logo_url = f"/uploads/{filename}"
     db.commit()

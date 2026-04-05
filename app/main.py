@@ -20,6 +20,7 @@ from app.models import (  # noqa: F401
     CircleMember,
     Comment,
     CommentImage,
+    EmailVerificationToken,
     Invitation,
     Issue,
     IssuePhase,
@@ -34,6 +35,7 @@ from app.models import (  # noqa: F401
     TrackStatus,
     User,
 )
+from app.routers import admin as admin_router
 from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users
 from app.security import _decode_token, hash_password
 from app.workflow import log_track_event
@@ -108,6 +110,9 @@ def _run_sqlite_compat_migrations() -> None:
     add_column("albums", "genres", "genres TEXT")
     add_column("albums", "cover_image", "cover_image VARCHAR(500)")
     add_column("albums", "circle_id", "circle_id INTEGER REFERENCES circles(id)")
+    # Existing users (before email verification feature) are grandfathered as verified
+    add_column("users", "email_verified", "email_verified BOOLEAN NOT NULL DEFAULT 1")
+    add_column("users", "is_admin", "is_admin BOOLEAN NOT NULL DEFAULT 0")
 
     with engine.begin() as conn:
         if "users" in columns_by_table:
@@ -224,6 +229,7 @@ def _seed_demo_data() -> None:
             avatar_color="#f43f5e",
             email="kira@example.com",
             password=hash_password("password123"),
+            email_verified=True,
             created_at=now,
         )
         submitter = User(
@@ -233,6 +239,7 @@ def _seed_demo_data() -> None:
             avatar_color="#3b82f6",
             email="nova@example.com",
             password=hash_password("password123"),
+            email_verified=True,
             created_at=now,
         )
         mastering_engineer = User(
@@ -242,6 +249,7 @@ def _seed_demo_data() -> None:
             avatar_color="#10b981",
             email="echo@example.com",
             password=hash_password("password123"),
+            email_verified=True,
             created_at=now,
         )
         db.add_all([producer, submitter, mastering_engineer])
@@ -319,6 +327,15 @@ async def lifespan(app: FastAPI):
     (upload_path / "covers").mkdir(parents=True, exist_ok=True)
     if settings.SEED_DEMO_DATA:
         _seed_demo_data()
+    if settings.INITIAL_ADMIN_EMAIL:
+        db = SessionLocal()
+        try:
+            user = db.scalars(select(User).where(User.email == settings.INITIAL_ADMIN_EMAIL)).first()
+            if user and not user.is_admin:
+                user.is_admin = True
+                db.commit()
+        finally:
+            db.close()
     yield
 
 
@@ -334,6 +351,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(users.router)
+app.include_router(admin_router.router)
 app.include_router(circles.router)
 app.include_router(albums.router)
 app.include_router(tracks.router)
@@ -361,10 +379,35 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
         await websocket.close(code=4001)
         return
     try:
-        _decode_token(token)
+        payload = _decode_token(token)
     except HTTPException:
         await websocket.close(code=4001)
         return
+
+    # Verify user has access to this track's album
+    db = SessionLocal()
+    try:
+        user = db.get(User, int(payload["sub"]))
+        track = db.get(Track, track_id)
+        if user is None or track is None:
+            await websocket.close(code=4001)
+            return
+        album = db.get(Album, track.album_id)
+        if album is None:
+            await websocket.close(code=4001)
+            return
+        from app.workflow import get_album_member_ids
+        member_ids = get_album_member_ids(db, album.id)
+        has_access = user.id in (
+            {album.producer_id, album.mastering_engineer_id, track.submitter_id, track.peer_reviewer_id}
+            | member_ids
+        )
+        if not has_access:
+            await websocket.close(code=4003)
+            return
+    finally:
+        db.close()
+
     await manager.connect(track_id, websocket)
     try:
         while True:

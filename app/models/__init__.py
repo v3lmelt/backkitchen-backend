@@ -1,4 +1,5 @@
 from app.models.album import Album
+from app.models.email_verification import EmailVerificationToken
 from app.models.album_member import AlbumMember
 from app.models.circle import Circle, CircleInviteCode, CircleMember
 from app.models.checklist import ChecklistItem
@@ -17,6 +18,7 @@ from app.models.workflow_event import WorkflowEvent
 
 __all__ = [
     "Album",
+    "EmailVerificationToken",
     "AlbumMember",
     "Circle",
     "CircleInviteCode",

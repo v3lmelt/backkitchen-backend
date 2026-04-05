@@ -1,20 +1,60 @@
+import logging
+import secrets
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.models.email_verification import EmailVerificationToken
 from app.models.user import User
-from app.schemas.schemas import AuthResponse, ChangePasswordRequest, LoginRequest, RegisterRequest, UserRead, UserUpdateProfile
+from app.schemas.schemas import (
+    AuthResponse,
+    ChangePasswordRequest,
+    LoginRequest,
+    RegisterRequest,
+    RegisterResponse,
+    UserRead,
+    UserUpdateProfile,
+)
 from app.security import create_access_token, get_current_user, hash_password, verify_password
+from app.services.email import send_verification_email
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 # Computed once at startup; used to prevent timing-based email enumeration.
 _DUMMY_HASH = hash_password("__dummy_timing_guard__")
 
+_VERIFICATION_TOKEN_EXPIRE_MINUTES = 30
+
 
 def _build_auth_response(user: User) -> AuthResponse:
     return AuthResponse(access_token=create_access_token(user), user=UserRead.model_validate(user))
+
+
+def _create_verification_token(email: str, db: Session) -> str:
+    # Invalidate any existing unused tokens for this email
+    existing = db.scalars(
+        select(EmailVerificationToken).where(
+            EmailVerificationToken.email == email,
+            EmailVerificationToken.used.is_(False),
+        )
+    ).all()
+    for t in existing:
+        t.used = True
+
+    token = secrets.token_urlsafe(48)
+    record = EmailVerificationToken(
+        token=token,
+        email=email,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=_VERIFICATION_TOKEN_EXPIRE_MINUTES),
+    )
+    db.add(record)
+    db.commit()
+    return token
 
 
 @router.post("/login", response_model=AuthResponse)
@@ -26,11 +66,16 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
         )
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email not verified. Please check your inbox.",
+        )
     return _build_auth_response(user)
 
 
-@router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> AuthResponse:
+@router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
+def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> RegisterResponse:
     if db.scalars(select(User).where(User.email == payload.email)).first() is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -48,11 +93,55 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> AuthRes
         email=payload.email,
         password=hash_password(payload.password),
         role="member",
+        email_verified=False,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    token = _create_verification_token(payload.email, db)
+    send_verification_email(payload.email, token)
+
+    return RegisterResponse(email=payload.email)
+
+
+@router.post("/verify-email", response_model=AuthResponse)
+def verify_email(token: str, db: Session = Depends(get_db)) -> AuthResponse:
+    record = db.scalars(
+        select(EmailVerificationToken).where(EmailVerificationToken.token == token)
+    ).first()
+
+    if record is None or record.used:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired verification link.")
+
+    now = datetime.now(timezone.utc)
+    expires = record.expires_at
+    # Ensure both are offset-aware for comparison
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if now > expires:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Verification link has expired.")
+
+    user = db.scalars(select(User).where(User.email == record.email)).first()
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    user.email_verified = True
+    record.used = True
+    db.commit()
+    db.refresh(user)
+
     return _build_auth_response(user)
+
+
+@router.post("/resend-verification", status_code=status.HTTP_204_NO_CONTENT)
+def resend_verification(email: str, db: Session = Depends(get_db)) -> None:
+    user = db.scalars(select(User).where(User.email == email)).first()
+    # Always return 204 to avoid email enumeration
+    if user is None or user.email_verified:
+        return
+    token = _create_verification_token(email, db)
+    send_verification_email(email, token)
 
 
 @router.get("/me", response_model=UserRead)
