@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -69,7 +69,18 @@ class AlbumBase(BaseModel):
 
 
 class AlbumCreate(AlbumBase):
-    pass
+    release_date: date | None = None
+    catalog_number: str | None = Field(default=None, max_length=50)
+    circle_id: int | None = None
+    circle_name: str | None = Field(default=None, max_length=200)
+    genres: list[str] | None = None
+
+
+class AlbumMetadataUpdate(BaseModel):
+    release_date: date | None = None
+    catalog_number: str | None = Field(default=None, max_length=50)
+    circle_name: str | None = Field(default=None, max_length=200)
+    genres: list[str] | None = None
 
 
 class AlbumTeamUpdate(BaseModel):
@@ -81,6 +92,9 @@ class AlbumSummary(BaseModel):
     id: int
     title: str
     cover_color: str
+    cover_image: str | None = None
+    circle_name: str | None = None
+    catalog_number: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -103,10 +117,23 @@ class InvitationRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class AlbumDeadlineUpdate(BaseModel):
+    deadline: datetime | None = None
+    phase_deadlines: dict[str, str] | None = None
+
+
 class AlbumRead(AlbumBase):
     id: int
+    release_date: date | None = None
+    catalog_number: str | None = None
+    circle_id: int | None = None
+    circle_name: str | None = None
+    genres: list[str] | None = None
+    cover_image: str | None = None
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
+    deadline: datetime | None = None
+    phase_deadlines: dict[str, str] | None = None
     created_at: datetime
     updated_at: datetime
     track_count: int = 0
@@ -115,6 +142,76 @@ class AlbumRead(AlbumBase):
     members: list[AlbumMemberRead] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class CircleMemberRead(BaseModel):
+    id: int
+    circle_id: int
+    user_id: int
+    role: str
+    joined_at: datetime
+    user: UserRead
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CircleBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str | None = None
+    website: str | None = Field(default=None, max_length=200)
+
+
+class CircleCreate(CircleBase):
+    pass
+
+
+class CircleUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    website: str | None = Field(default=None, max_length=200)
+
+
+class CircleRead(CircleBase):
+    id: int
+    logo_url: str | None = None
+    created_by: int
+    created_at: datetime
+    members: list[CircleMemberRead] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CircleSummary(BaseModel):
+    id: int
+    name: str
+    description: str | None = None
+    logo_url: str | None = None
+    created_by: int
+    member_count: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class InviteCodeCreate(BaseModel):
+    role: str = Field(default="member", pattern=r"^(member|mastering_engineer)$")
+    expires_in_days: int = Field(default=7, ge=1, le=30)
+
+
+class InviteCodeRead(BaseModel):
+    id: int
+    circle_id: int
+    code: str
+    role: str
+    expires_at: datetime
+    is_active: bool
+    created_at: datetime
+    created_by_user: UserRead
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class JoinCircleRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=16)
 
 
 class TrackSourceVersionRead(BaseModel):
@@ -149,8 +246,13 @@ class TrackBase(BaseModel):
     bpm: int | None = None
 
 
+class TrackOrderUpdate(BaseModel):
+    track_ids: list[int]
+
+
 class TrackRead(TrackBase):
     id: int
+    track_number: int | None = None
     file_path: str | None = None
     duration: float | None = None
     status: TrackStatus
@@ -218,6 +320,7 @@ class IssueRead(IssueBase):
     phase: IssuePhase
     workflow_cycle: int
     source_version_id: int | None = None
+    source_version_number: int | None = None
     master_delivery_id: int | None = None
     status: IssueStatus
     created_at: datetime
@@ -237,6 +340,17 @@ class CommentImageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class CommentAudioRead(BaseModel):
+    id: int
+    comment_id: int
+    audio_url: str
+    original_filename: str
+    duration: float | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class CommentRead(BaseModel):
     id: int
     issue_id: int
@@ -246,12 +360,29 @@ class CommentRead(BaseModel):
     created_at: datetime
     author: UserRead | None = None
     images: list[CommentImageRead] = []
+    audios: list[CommentAudioRead] = []
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class IssueDetail(IssueRead):
     comments: list[CommentRead] = []
+
+
+class ChecklistTemplateItem(BaseModel):
+    label: str = Field(..., min_length=1, max_length=100)
+    description: str | None = None
+    required: bool = True
+    sort_order: int = 0
+
+
+class ChecklistTemplateRead(BaseModel):
+    items: list[ChecklistTemplateItem]
+    is_default: bool = False
+
+
+class ChecklistTemplateUpdate(BaseModel):
+    items: list[ChecklistTemplateItem]
 
 
 class ChecklistItemBase(BaseModel):
@@ -291,6 +422,7 @@ class TrackDetailResponse(BaseModel):
     checklist_items: list[ChecklistItemRead]
     events: list[WorkflowEventRead]
     source_versions: list[TrackSourceVersionRead] = []
+    discussions: list["DiscussionRead"] = []
 
 
 class NotificationRead(BaseModel):
@@ -312,6 +444,35 @@ class AlbumStats(BaseModel):
     by_status: dict[str, int]
     open_issues: int
     recent_events: list[WorkflowEventRead]
+    deadline: datetime | None = None
+    overdue_track_count: int = 0
+
+
+class DiscussionImageRead(BaseModel):
+    id: int
+    discussion_id: int
+    image_url: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DiscussionRead(BaseModel):
+    id: int
+    track_id: int
+    author_id: int
+    content: str
+    created_at: datetime
+    author: UserRead | None = None
+    images: list[DiscussionImageRead] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WebhookConfig(BaseModel):
+    url: str = ""
+    enabled: bool = False
+    events: list[str] = []
 
 
 class IssueBatchUpdate(BaseModel):

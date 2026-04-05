@@ -1,7 +1,8 @@
 import uuid
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -9,7 +10,9 @@ from app.config import settings
 from app.database import get_db
 from app.models.album import Album
 from app.models.comment import Comment
+from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
+from app.services.audio import extract_audio_metadata
 from app.models.issue import Issue, IssuePhase
 from app.models.track import Track, TrackStatus
 from app.models.user import User
@@ -34,6 +37,18 @@ IMAGE_EXT_MAP = {
     "image/webp": ".webp",
 }
 
+ALLOWED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/flac", "audio/aac", "audio/ogg", "audio/x-flac", "audio/x-wav"}
+AUDIO_EXT_MAP = {
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+}
+MAX_AUDIOS_PER_COMMENT = 3
+
 router = APIRouter(tags=["issues"])
 
 
@@ -50,6 +65,13 @@ def _ensure_issue_permission(track: Track, album: Album, user: User, phase: Issu
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only the assigned peer reviewer can create peer review issues.",
+            )
+        return
+    if phase == IssuePhase.PRODUCER:
+        if track.status != TrackStatus.PRODUCER_MASTERING_GATE or album.producer_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the album producer can create producer review issues.",
             )
         return
     if phase == IssuePhase.MASTERING:
@@ -74,6 +96,11 @@ def _ensure_issue_permission(track: Track, album: Album, user: User, phase: Issu
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User) -> None:
     if issue.phase == IssuePhase.PEER and user.id not in {track.submitter_id, track.peer_reviewer_id}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this peer review issue.")
+    if issue.phase == IssuePhase.PRODUCER and user.id not in {
+        track.submitter_id,
+        album.producer_id,
+    }:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this producer review issue.")
     if issue.phase == IssuePhase.MASTERING and user.id not in {
         track.submitter_id,
         album.mastering_engineer_id,
@@ -94,6 +121,7 @@ def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, us
 def create_issue(
     track_id: int,
     payload: IssueCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> IssueRead:
@@ -116,7 +144,7 @@ def create_issue(
 
     source_version_id = None
     master_delivery_id = None
-    if payload.phase in {IssuePhase.PEER, IssuePhase.MASTERING}:
+    if payload.phase in {IssuePhase.PEER, IssuePhase.PRODUCER, IssuePhase.MASTERING}:
         source_version = current_source_version(track)
         if source_version is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No source version available.")
@@ -142,18 +170,19 @@ def create_issue(
         time_end=payload.time_end,
     )
     db.add(issue)
+    db.flush()  # assign issue.id before logging
     log_track_event(
         db,
         track,
         current_user,
         "issue_created",
-        payload={"phase": payload.phase.value, "title": payload.title},
+        payload={"phase": payload.phase.value, "title": payload.title, "issue_id": issue.id},
     )
-    db.flush()
     if current_user.id != track.submitter_id:
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
-               related_track_id=track.id, related_issue_id=issue.id)
+               related_track_id=track.id, related_issue_id=issue.id,
+               background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(issue)
     return build_issue_read(issue, db)
@@ -194,6 +223,7 @@ def get_issue(
 def update_issue(
     issue_id: int,
     payload: IssueUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> IssueRead:
@@ -217,9 +247,11 @@ def update_issue(
         db.add(Comment(issue_id=issue.id, author_id=current_user.id, content=payload.status_note, is_status_note=True))
 
     if old_status != new_status and current_user.id != issue.author_id:
+        track = db.get(Track, issue.track_id)
         notify(db, [issue.author_id], "issue_status_changed", "问题状态已更新",
                f"「{issue.title}」被标记为 {new_status.value}",
-               related_issue_id=issue.id)
+               related_issue_id=issue.id,
+               background_tasks=background_tasks, album_id=track.album_id if track else None)
 
     log_track_event(
         db,
@@ -240,11 +272,16 @@ def update_issue(
 )
 async def add_comment(
     issue_id: int,
-    content: str = Form(..., min_length=1),
+    background_tasks: BackgroundTasks,
+    content: Optional[str] = Form(default=None),
     images: list[UploadFile] = File(default=[]),
+    audios: list[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> CommentRead:
+    # Normalise: pydantic v2 + python-multipart may deliver empty fields as None
+    effective_content = (content or '').strip()
+
     issue = db.get(Issue, issue_id)
     if issue is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
@@ -253,6 +290,12 @@ async def add_comment(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
 
+    if not effective_content and not images and not audios:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A comment must have text content, at least one image, or at least one audio file.",
+        )
+
     for img_file in images:
         if img_file.content_type not in ALLOWED_IMAGE_TYPES:
             raise HTTPException(
@@ -260,7 +303,19 @@ async def add_comment(
                 detail=f"Unsupported file type: {img_file.content_type}. Allowed: jpeg, png, gif, webp.",
             )
 
-    comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content)
+    if len(audios) > MAX_AUDIOS_PER_COMMENT:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"A comment may contain at most {MAX_AUDIOS_PER_COMMENT} audio files.",
+        )
+    for audio_file in audios:
+        if audio_file.content_type not in ALLOWED_AUDIO_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported audio type: {audio_file.content_type}. Allowed: mp3, wav, flac, aac, ogg.",
+            )
+
+    comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content or '')
     db.add(comment)
     db.flush()
 
@@ -276,6 +331,25 @@ async def add_comment(
             dest.write_bytes(data)
             db.add(CommentImage(comment_id=comment.id, file_path=file_path))
 
+    if audios:
+        comment_audios_dir = settings.get_upload_path() / "comment_audios"
+        comment_audios_dir.mkdir(parents=True, exist_ok=True)
+        for audio_file in audios:
+            ext = AUDIO_EXT_MAP.get(audio_file.content_type or "", ".mp3")
+            filename = f"{uuid.uuid4()}{ext}"
+            file_path = f"comment_audios/{filename}"
+            dest = comment_audios_dir / filename
+            data = await audio_file.read()
+            dest.write_bytes(data)
+            duration = extract_audio_metadata(dest).duration
+            original_filename = audio_file.filename or filename
+            db.add(CommentAudio(
+                comment_id=comment.id,
+                file_path=file_path,
+                original_filename=original_filename,
+                duration=duration,
+            ))
+
     log_track_event(
         db,
         track,
@@ -288,7 +362,8 @@ async def add_comment(
     notify_ids = [uid for uid in dict.fromkeys(participant_ids) if uid != current_user.id]
     if notify_ids:
         notify(db, notify_ids, "new_comment", "新评论",
-               f"「{issue.title}」有新评论", related_issue_id=issue.id)
+               f"「{issue.title}」有新评论", related_issue_id=issue.id,
+               background_tasks=background_tasks, album_id=track.album_id)
 
     db.commit()
     db.refresh(comment)

@@ -10,6 +10,7 @@ from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
 from app.models.comment import Comment
+from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
 from app.models.issue import Issue, IssueStatus
 from app.models.master_delivery import MasterDelivery
@@ -20,8 +21,11 @@ from app.models.workflow_event import WorkflowEvent
 from app.schemas.schemas import (
     AlbumMemberRead,
     ChecklistItemRead,
+    CommentAudioRead,
     CommentImageRead,
     CommentRead,
+    DiscussionImageRead,
+    DiscussionRead,
     IssueDetail,
     IssueRead,
     MasterDeliveryRead,
@@ -36,6 +40,21 @@ from app.schemas.schemas import (
 def get_album_member_ids(db: Session, album_id: int) -> set[int]:
     rows = db.scalars(select(AlbumMember).where(AlbumMember.album_id == album_id)).all()
     return {row.user_id for row in rows}
+
+
+def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Album not found.",
+        )
+    if album.producer_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the album producer can perform this action.",
+        )
+    return album
 
 
 def ensure_album_visibility(album: Album, user: User, db: Session) -> None:
@@ -134,6 +153,7 @@ def build_track_read(track: Track, user: User, album: Album) -> TrackRead:
         artist=track.artist,
         album_id=track.album_id,
         bpm=track.bpm,
+        track_number=track.track_number,
         file_path=track.file_path,
         duration=track.duration,
         status=track.status,
@@ -156,8 +176,19 @@ def build_track_read(track: Track, user: User, album: Album) -> TrackRead:
     )
 
 
-def build_issue_read(issue: Issue, db: Session) -> IssueRead:
+def build_issue_read(
+    issue: Issue,
+    db: Session,
+    source_version_numbers: dict[int, int] | None = None,
+) -> IssueRead:
     author = db.get(User, issue.author_id)
+    source_version_number = None
+    if issue.source_version_id:
+        if source_version_numbers is not None:
+            source_version_number = source_version_numbers.get(issue.source_version_id)
+        else:
+            source_version = db.get(TrackSourceVersion, issue.source_version_id)
+            source_version_number = source_version.version_number if source_version else None
     return IssueRead(
         id=issue.id,
         track_id=issue.track_id,
@@ -165,6 +196,7 @@ def build_issue_read(issue: Issue, db: Session) -> IssueRead:
         phase=issue.phase,
         workflow_cycle=issue.workflow_cycle,
         source_version_id=issue.source_version_id,
+        source_version_number=source_version_number,
         master_delivery_id=issue.master_delivery_id,
         title=issue.title,
         description=issue.description,
@@ -191,6 +223,17 @@ def build_comment_read(comment: Comment, db: Session) -> CommentRead:
         )
         for image in comment.images
     ]
+    audios = [
+        CommentAudioRead(
+            id=audio.id,
+            comment_id=audio.comment_id,
+            audio_url=f"/uploads/{audio.file_path}",
+            original_filename=audio.original_filename,
+            duration=audio.duration,
+            created_at=audio.created_at,
+        )
+        for audio in comment.audios
+    ]
     return CommentRead(
         id=comment.id,
         issue_id=comment.issue_id,
@@ -200,6 +243,7 @@ def build_comment_read(comment: Comment, db: Session) -> CommentRead:
         created_at=comment.created_at,
         author=_user_read(author),
         images=images,
+        audios=audios,
     )
 
 
@@ -229,8 +273,9 @@ def build_event_read(event: WorkflowEvent, db: Session) -> WorkflowEventRead:
 
 def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResponse:
     album = ensure_track_visibility(track, user, db)
+    source_version_numbers = {version.id: version.version_number for version in track.source_versions}
     issues = [
-        build_issue_read(issue, db)
+        build_issue_read(issue, db, source_version_numbers)
         for issue in sorted(track.issues, key=lambda row: (row.created_at, row.id))
     ]
     current_source = current_source_version(track)
@@ -240,12 +285,33 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         if current_source is None or item.source_version_id == current_source.id
     ]
     events = [build_event_read(event, db) for event in track.workflow_events]
+    discussions = [
+        DiscussionRead(
+            id=d.id,
+            track_id=d.track_id,
+            author_id=d.author_id,
+            content=d.content,
+            created_at=d.created_at,
+            author=_user_read(d.author),
+            images=[
+                DiscussionImageRead(
+                    id=img.id,
+                    discussion_id=img.discussion_id,
+                    image_url=f"/uploads/{img.file_path}",
+                    created_at=img.created_at,
+                )
+                for img in d.images
+            ],
+        )
+        for d in track.discussions
+    ]
     return TrackDetailResponse(
         track=build_track_read(track, user, album),
         issues=issues,
         checklist_items=checklist_items,
         events=events,
         source_versions=[TrackSourceVersionRead.model_validate(v) for v in track.source_versions],
+        discussions=discussions,
     )
 
 

@@ -20,6 +20,7 @@ class Comment(Base):
 
     issue: Mapped["Issue"] = relationship("Issue", back_populates="comments")  # noqa: F821
     images: Mapped[list["CommentImage"]] = relationship("CommentImage", cascade="all, delete-orphan", back_populates="comment")  # noqa: F821
+    audios: Mapped[list["CommentAudio"]] = relationship("CommentAudio", cascade="all, delete-orphan", back_populates="comment")  # noqa: F821
 
     def __repr__(self) -> str:
         return f"<Comment(id={self.id}, issue_id={self.issue_id})>"

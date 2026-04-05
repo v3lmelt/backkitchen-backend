@@ -15,6 +15,9 @@ from app.models import (  # noqa: F401
     Album,
     AlbumMember,
     ChecklistItem,
+    Circle,
+    CircleInviteCode,
+    CircleMember,
     Comment,
     CommentImage,
     Invitation,
@@ -31,7 +34,7 @@ from app.models import (  # noqa: F401
     TrackStatus,
     User,
 )
-from app.routers import albums, auth, checklists, issues, invitations, notifications, tracks, users
+from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users
 from app.security import _decode_token, hash_password
 from app.workflow import log_track_event
 
@@ -94,6 +97,17 @@ def _run_sqlite_compat_migrations() -> None:
     add_column("checklist_items", "source_version_id", "source_version_id INTEGER")
     add_column("checklist_items", "workflow_cycle", "workflow_cycle INTEGER NOT NULL DEFAULT 1")
     add_column("comments", "is_status_note", "is_status_note BOOLEAN NOT NULL DEFAULT 0")
+    add_column("tracks", "track_number", "track_number INTEGER")
+    add_column("albums", "checklist_template", "checklist_template TEXT")
+    add_column("albums", "deadline", "deadline DATETIME")
+    add_column("albums", "phase_deadlines", "phase_deadlines TEXT")
+    add_column("albums", "webhook_config", "webhook_config TEXT")
+    add_column("albums", "release_date", "release_date DATE")
+    add_column("albums", "catalog_number", "catalog_number VARCHAR(50)")
+    add_column("albums", "circle_name", "circle_name VARCHAR(200)")
+    add_column("albums", "genres", "genres TEXT")
+    add_column("albums", "cover_image", "cover_image VARCHAR(500)")
+    add_column("albums", "circle_id", "circle_id INTEGER REFERENCES circles(id)")
 
     with engine.begin() as conn:
         if "users" in columns_by_table:
@@ -233,10 +247,28 @@ def _seed_demo_data() -> None:
         db.add_all([producer, submitter, mastering_engineer])
         db.flush()
 
+        circle = Circle(
+            name="Back Kitchen",
+            description="Demo doujin circle. All demo members belong here.",
+            created_by=producer.id,
+            created_at=now,
+        )
+        db.add(circle)
+        db.flush()
+
+        db.add_all(
+            [
+                CircleMember(circle_id=circle.id, user_id=producer.id, role="owner", joined_at=now),
+                CircleMember(circle_id=circle.id, user_id=submitter.id, role="member", joined_at=now),
+                CircleMember(circle_id=circle.id, user_id=mastering_engineer.id, role="mastering_engineer", joined_at=now),
+            ]
+        )
+
         album = Album(
             title="BACK KITCHEN Vol.1",
             description="Demo workflow album for reviewing doujin submissions.",
             cover_color="#8b5cf6",
+            circle_id=circle.id,
             producer_id=producer.id,
             mastering_engineer_id=mastering_engineer.id,
             created_at=now,
@@ -284,6 +316,7 @@ async def lifespan(app: FastAPI):
     _backfill_workflow_data()
     upload_path = settings.get_upload_path()
     (upload_path / "comment_images").mkdir(parents=True, exist_ok=True)
+    (upload_path / "covers").mkdir(parents=True, exist_ok=True)
     if settings.SEED_DEMO_DATA:
         _seed_demo_data()
     yield
@@ -295,18 +328,20 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 app.include_router(auth.router)
 app.include_router(users.router)
+app.include_router(circles.router)
 app.include_router(albums.router)
 app.include_router(tracks.router)
 app.include_router(issues.router)
 app.include_router(checklists.router)
 app.include_router(invitations.router)
 app.include_router(notifications.router)
+app.include_router(discussions.router)
 
 try:
     upload_path = settings.get_upload_path()

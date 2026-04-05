@@ -14,7 +14,7 @@ from app.schemas.schemas import (
     UserRead,
 )
 from app.security import get_current_user
-from app.workflow import ensure_album_visibility, get_album_member_ids
+from app.workflow import ensure_album_producer, ensure_album_visibility, get_album_member_ids
 
 router = APIRouter(tags=["invitations"])
 
@@ -42,14 +42,7 @@ def create_invitation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> InvitationRead:
-    album = db.get(Album, album_id)
-    if album is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the album producer can invite members.",
-        )
+    album = ensure_album_producer(album_id, current_user, db)
 
     invited_user = db.get(User, payload.user_id)
     if invited_user is None:
@@ -93,14 +86,7 @@ def list_album_invitations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[InvitationRead]:
-    album = db.get(Album, album_id)
-    if album is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the album producer can view invitations.",
-        )
+    ensure_album_producer(album_id, current_user, db)
 
     invitations = list(
         db.scalars(
@@ -189,12 +175,7 @@ def cancel_invitation(
     invitation = db.get(Invitation, invitation_id)
     if invitation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invitation not found.")
-    album = db.get(Album, invitation.album_id)
-    if album is None or album.producer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the album producer can cancel invitations.",
-        )
+    ensure_album_producer(invitation.album_id, current_user, db)
 
     db.delete(invitation)
     db.commit()
