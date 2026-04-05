@@ -20,8 +20,9 @@ from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig
 from app.security import get_current_user
+from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
-from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids
+from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
@@ -91,9 +92,10 @@ def list_albums(
     current_user: User = Depends(get_current_user),
 ) -> list[AlbumRead]:
     albums = list(db.scalars(select(Album).order_by(Album.id)).all())
+    members_by_album = get_all_album_member_ids(db)
     visible: list[AlbumRead] = []
     for album in albums:
-        member_ids = get_album_member_ids(db, album.id)
+        member_ids = members_by_album.get(album.id, set())
         if current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids:
             visible.append(_album_to_read(album, db))
     return visible
@@ -215,14 +217,8 @@ async def upload_album_cover(
     cover_dir = settings.get_upload_path() / "covers"
     cover_dir.mkdir(parents=True, exist_ok=True)
 
-    content = await file.read()
-    if len(content) > MAX_IMAGE_UPLOAD_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Image too large. Maximum size is {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)} MB.",
-        )
-    with open(cover_dir / filename, "wb") as f:
-        f.write(content)
+    dest = cover_dir / filename
+    await stream_upload(file, dest, MAX_IMAGE_UPLOAD_SIZE)
 
     # Remove old cover file
     if album.cover_image:
@@ -267,6 +263,12 @@ def get_album_stats(
         .limit(10)
     ).all())
 
+    # Pre-fetch actors for recent events
+    actor_ids = {e.actor_user_id for e in recent_events if e.actor_user_id}
+    actors_by_id: dict[int, User] = {}
+    if actor_ids:
+        actors_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(actor_ids))).all()}
+
     overdue_count = 0
     if album.phase_deadlines:
         deadlines = json.loads(album.phase_deadlines)
@@ -293,7 +295,7 @@ def get_album_stats(
         total_tracks=len(tracks),
         by_status=by_status,
         open_issues=open_issues,
-        recent_events=[build_event_read(e, db) for e in recent_events],
+        recent_events=[build_event_read(e, db, users_cache=actors_by_id) for e in recent_events],
         deadline=album.deadline,
         overdue_track_count=overdue_count,
     )

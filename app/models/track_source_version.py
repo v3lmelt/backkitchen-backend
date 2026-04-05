@@ -18,7 +18,7 @@ class TrackSourceVersion(Base):
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
     duration: Mapped[float | None] = mapped_column(Float, nullable=True)
     uploaded_by_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("users.id"), nullable=True
+        Integer, ForeignKey("users.id"), nullable=True, index=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False

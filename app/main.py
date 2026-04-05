@@ -42,16 +42,34 @@ from app.workflow import log_track_event
 
 
 class ConnectionManager:
+    MAX_CONNECTIONS_PER_TRACK = 50
+    MAX_TOTAL_CONNECTIONS = 200
+
     def __init__(self) -> None:
         self.active_connections: dict[int, list[WebSocket]] = defaultdict(list)
+        self._total_count = 0
 
-    async def connect(self, track_id: int, websocket: WebSocket) -> None:
+    async def connect(self, track_id: int, websocket: WebSocket) -> bool:
+        """Accept and register a WebSocket. Returns False if limits exceeded."""
+        if self._total_count >= self.MAX_TOTAL_CONNECTIONS:
+            await websocket.accept()
+            await websocket.close(code=1013, reason="Server connection limit reached")
+            return False
+        if len(self.active_connections[track_id]) >= self.MAX_CONNECTIONS_PER_TRACK:
+            await websocket.accept()
+            await websocket.close(code=1013, reason="Track connection limit reached")
+            return False
         await websocket.accept()
         self.active_connections[track_id].append(websocket)
+        self._total_count += 1
+        return True
 
     def disconnect(self, track_id: int, websocket: WebSocket) -> None:
-        self.active_connections[track_id].remove(websocket)
-        if not self.active_connections[track_id]:
+        conns = self.active_connections.get(track_id, [])
+        if websocket in conns:
+            conns.remove(websocket)
+            self._total_count -= 1
+        if not conns and track_id in self.active_connections:
             del self.active_connections[track_id]
 
     async def broadcast(self, track_id: int, message: dict) -> None:
@@ -138,74 +156,93 @@ def _run_sqlite_compat_migrations() -> None:
 
 
 def _backfill_workflow_data() -> None:
+    from sqlalchemy import or_
+
     db = SessionLocal()
     try:
-        users = list(db.scalars(select(User).order_by(User.id)).all())
-        if not users:
-            return
+        # Only backfill albums missing producer_id
+        albums_needing_backfill = list(db.scalars(
+            select(Album).where(Album.producer_id == None)  # noqa: E711
+        ).all())
+        if albums_needing_backfill:
+            first_producer = db.scalars(
+                select(User).where(User.role == "producer").order_by(User.id).limit(1)
+            ).first()
+            fallback_user = db.scalars(select(User).order_by(User.id).limit(1)).first()
+            if not fallback_user:
+                return
+            for album in albums_needing_backfill:
+                album.producer_id = (first_producer or fallback_user).id
+                if album.mastering_engineer_id is None:
+                    other = db.scalars(
+                        select(User).where(User.id != album.producer_id).order_by(User.id).limit(1)
+                    ).first()
+                    album.mastering_engineer_id = (other or fallback_user).id
+                if not album.members:
+                    all_users = list(db.scalars(select(User).order_by(User.id)).all())
+                    for user in all_users:
+                        db.add(AlbumMember(album_id=album.id, user_id=user.id))
 
-        albums = list(db.scalars(select(Album).order_by(Album.id)).all())
-        for album in albums:
-            if album.producer_id is None:
-                producer = next((user for user in users if user.role == "producer"), users[0])
-                album.producer_id = producer.id
-            if album.mastering_engineer_id is None:
-                mastering_engineer = next(
-                    (user for user in users if user.id != album.producer_id),
-                    users[0],
-                )
-                album.mastering_engineer_id = mastering_engineer.id
-
-            if not album.members:
-                for user in users:
-                    db.add(AlbumMember(album_id=album.id, user_id=user.id))
-
-        tracks = list(db.scalars(select(Track).order_by(Track.id)).all())
-        for track in tracks:
-            album = db.get(Album, track.album_id)
-            if album is None:
-                continue
-
-            if track.submitter_id is None:
+        # Only backfill tracks missing submitter_id
+        tracks_needing_backfill = list(db.scalars(
+            select(Track).where(Track.submitter_id == None)  # noqa: E711
+        ).all())
+        if tracks_needing_backfill:
+            all_users = list(db.scalars(select(User).order_by(User.id)).all())
+            for track in tracks_needing_backfill:
+                album = db.get(Album, track.album_id)
+                if album is None:
+                    continue
                 matching_user = next(
-                    (
-                        user
-                        for user in users
-                        if user.display_name.lower() == track.artist.lower()
-                        or user.username.lower() == track.artist.lower()
-                    ),
+                    (u for u in all_users if u.display_name.lower() == track.artist.lower() or u.username.lower() == track.artist.lower()),
                     None,
                 )
-                fallback_user = next(
-                    (user for user in users if user.id != album.producer_id),
-                    users[0],
-                )
-                track.submitter_id = (matching_user or fallback_user).id
+                fallback = next((u for u in all_users if u.id != album.producer_id), all_users[0] if all_users else None)
+                track.submitter_id = (matching_user or fallback).id if (matching_user or fallback) else None
 
-            if track.peer_reviewer_id is None:
-                issue_author = next((issue.author_id for issue in track.issues if issue.author_id != track.submitter_id), None)
-                checklist_reviewer = next((item.reviewer_id for item in track.checklist_items if item.reviewer_id != track.submitter_id), None)
-                track.peer_reviewer_id = issue_author or checklist_reviewer
+        # Backfill peer_reviewer_id for tracks missing it
+        tracks_no_reviewer = list(db.scalars(
+            select(Track).where(Track.peer_reviewer_id == None, Track.submitter_id != None)  # noqa: E711
+        ).all())
+        for track in tracks_no_reviewer:
+            issue_author = next((issue.author_id for issue in track.issues if issue.author_id != track.submitter_id), None)
+            checklist_reviewer = next((item.reviewer_id for item in track.checklist_items if item.reviewer_id != track.submitter_id), None)
+            track.peer_reviewer_id = issue_author or checklist_reviewer
 
-            for issue in track.issues:
-                if not issue.workflow_cycle:
-                    issue.workflow_cycle = track.workflow_cycle
+        # Backfill workflow_cycle on issues/checklist items where missing
+        issues_needing = list(db.scalars(
+            select(Issue).where(or_(Issue.workflow_cycle == None, Issue.workflow_cycle == 0))  # noqa: E711
+        ).all())
+        for issue in issues_needing:
+            track = db.get(Track, issue.track_id)
+            if track:
+                issue.workflow_cycle = track.workflow_cycle
 
-            for item in track.checklist_items:
-                if not item.workflow_cycle:
-                    item.workflow_cycle = track.workflow_cycle
+        checklist_items_needing = list(db.scalars(
+            select(ChecklistItem).where(or_(ChecklistItem.workflow_cycle == None, ChecklistItem.workflow_cycle == 0))  # noqa: E711
+        ).all())
+        for item in checklist_items_needing:
+            track = db.get(Track, item.track_id)
+            if track:
+                item.workflow_cycle = track.workflow_cycle
 
-            if track.file_path and not track.source_versions:
-                db.add(
-                    TrackSourceVersion(
-                        track_id=track.id,
-                        workflow_cycle=track.workflow_cycle,
-                        version_number=track.version,
-                        file_path=track.file_path,
-                        duration=track.duration,
-                        uploaded_by_id=track.submitter_id,
-                    )
-                )
+        # Backfill source_versions for tracks that have file_path but no versions
+        from sqlalchemy import exists
+        has_versions = exists(
+            select(TrackSourceVersion.id).where(TrackSourceVersion.track_id == Track.id)
+        )
+        tracks_no_versions = list(db.scalars(
+            select(Track).where(Track.file_path != None, ~has_versions)  # noqa: E711
+        ).all())
+        for track in tracks_no_versions:
+            db.add(TrackSourceVersion(
+                track_id=track.id,
+                workflow_cycle=track.workflow_cycle,
+                version_number=track.version,
+                file_path=track.file_path,
+                duration=track.duration,
+                uploaded_by_id=track.submitter_id,
+            ))
 
         db.commit()
     except Exception:
@@ -408,7 +445,9 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
     finally:
         db.close()
 
-    await manager.connect(track_id, websocket)
+    connected = await manager.connect(track_id, websocket)
+    if not connected:
+        return
     try:
         while True:
             data = await websocket.receive_text()

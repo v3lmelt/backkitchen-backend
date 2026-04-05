@@ -23,6 +23,7 @@ from app.schemas.schemas import (
     UserRead,
 )
 from app.security import get_current_user
+from app.services.upload import stream_upload
 
 router = APIRouter(prefix="/api/circles", tags=["circles"])
 
@@ -194,13 +195,7 @@ async def upload_logo(
         raise HTTPException(status_code=400, detail=f"Unsupported image extension: {ext}")
     filename = f"{uuid.uuid4()}{ext}"
     dest = upload_dir / filename
-    data = await file.read()
-    if len(data) > MAX_IMAGE_UPLOAD_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Image too large. Maximum size is {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)} MB.",
-        )
-    dest.write_bytes(data)
+    await stream_upload(file, dest, MAX_IMAGE_UPLOAD_SIZE)
 
     circle.logo_url = f"/uploads/{filename}"
     db.commit()

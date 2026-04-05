@@ -40,7 +40,7 @@ class Issue(Base):
     track_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("tracks.id"), nullable=False, index=True
     )
-    author_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    author_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     phase: Mapped[IssuePhase] = mapped_column(
         Enum(IssuePhase, values_callable=lambda items: [item.value for item in items]),
         nullable=False,

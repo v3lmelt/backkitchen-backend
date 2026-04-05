@@ -19,6 +19,7 @@ from app.models.user import User
 from app.notifications import notify
 from app.schemas.schemas import CommentRead, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead, IssueUpdate
 from app.security import get_current_user
+from app.services.upload import stream_upload
 from app.workflow import (
     build_comment_read,
     build_issue_detail,
@@ -200,7 +201,10 @@ def list_issues(
     ensure_track_visibility(track, current_user, db)
 
     issues = list(db.scalars(select(Issue).where(Issue.track_id == track_id).order_by(Issue.created_at)).all())
-    return [build_issue_read(issue, db) for issue in issues]
+    # Pre-fetch all issue authors
+    author_ids = {i.author_id for i in issues}
+    users_cache = {u.id: u for u in db.scalars(select(User).where(User.id.in_(author_ids))).all()} if author_ids else {}
+    return [build_issue_read(issue, db, users_cache=users_cache) for issue in issues]
 
 
 @router.get("/api/issues/{issue_id}", response_model=IssueDetail)
@@ -329,13 +333,7 @@ async def add_comment(
             filename = f"{uuid.uuid4()}{ext}"
             file_path = f"comment_images/{filename}"
             dest = comment_images_dir / filename
-            data = await img_file.read()
-            if len(data) > MAX_IMAGE_UPLOAD_SIZE:
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"Image too large. Maximum size is {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)} MB.",
-                )
-            dest.write_bytes(data)
+            await stream_upload(img_file, dest, MAX_IMAGE_UPLOAD_SIZE)
             db.add(CommentImage(comment_id=comment.id, file_path=file_path))
 
     if audios:
@@ -348,13 +346,7 @@ async def add_comment(
             filename = f"{uuid.uuid4()}{ext}"
             file_path = f"comment_audios/{filename}"
             dest = comment_audios_dir / filename
-            data = await audio_file.read()
-            if len(data) > MAX_AUDIO_UPLOAD_SIZE:
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"Audio file too large. Maximum size is {MAX_AUDIO_UPLOAD_SIZE // (1024 * 1024)} MB.",
-                )
-            dest.write_bytes(data)
+            await stream_upload(audio_file, dest, MAX_AUDIO_UPLOAD_SIZE)
             duration = extract_audio_metadata(dest).duration
             original_filename = audio_file.filename or filename
             db.add(CommentAudio(
