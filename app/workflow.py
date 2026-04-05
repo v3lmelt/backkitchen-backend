@@ -176,8 +176,19 @@ def build_track_read(track: Track, user: User, album: Album) -> TrackRead:
     )
 
 
-def build_issue_read(issue: Issue, db: Session) -> IssueRead:
+def build_issue_read(
+    issue: Issue,
+    db: Session,
+    source_version_numbers: dict[int, int] | None = None,
+) -> IssueRead:
     author = db.get(User, issue.author_id)
+    source_version_number = None
+    if issue.source_version_id:
+        if source_version_numbers is not None:
+            source_version_number = source_version_numbers.get(issue.source_version_id)
+        else:
+            source_version = db.get(TrackSourceVersion, issue.source_version_id)
+            source_version_number = source_version.version_number if source_version else None
     return IssueRead(
         id=issue.id,
         track_id=issue.track_id,
@@ -185,6 +196,7 @@ def build_issue_read(issue: Issue, db: Session) -> IssueRead:
         phase=issue.phase,
         workflow_cycle=issue.workflow_cycle,
         source_version_id=issue.source_version_id,
+        source_version_number=source_version_number,
         master_delivery_id=issue.master_delivery_id,
         title=issue.title,
         description=issue.description,
@@ -261,8 +273,9 @@ def build_event_read(event: WorkflowEvent, db: Session) -> WorkflowEventRead:
 
 def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResponse:
     album = ensure_track_visibility(track, user, db)
+    source_version_numbers = {version.id: version.version_number for version in track.source_versions}
     issues = [
-        build_issue_read(issue, db)
+        build_issue_read(issue, db, source_version_numbers)
         for issue in sorted(track.issues, key=lambda row: (row.created_at, row.id))
     ]
     current_source = current_source_version(track)

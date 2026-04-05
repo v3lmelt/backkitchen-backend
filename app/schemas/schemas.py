@@ -248,6 +248,7 @@ class IssueRead(IssueBase):
     phase: IssuePhase
     workflow_cycle: int
     source_version_id: int | None = None
+    source_version_number: int | None = None
     master_delivery_id: int | None = None
     status: IssueStatus
     created_at: datetime
