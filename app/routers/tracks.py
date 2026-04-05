@@ -498,11 +498,19 @@ def approve_final_review(
     if delivery is None:
         raise HTTPException(status_code=409, detail="No master delivery available.")
 
-    if current_user.id == album.producer_id:
-        delivery.producer_approved_at = delivery.producer_approved_at or datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+    is_producer = current_user.id == album.producer_id
+    is_submitter = current_user.id == track.submitter_id
+
+    if is_producer and is_submitter:
+        delivery.producer_approved_at = delivery.producer_approved_at or now
+        delivery.submitter_approved_at = delivery.submitter_approved_at or now
+        event_type = "final_review_approved_by_producer"
+    elif is_producer:
+        delivery.producer_approved_at = delivery.producer_approved_at or now
         event_type = "final_review_approved_by_producer"
     else:
-        delivery.submitter_approved_at = delivery.submitter_approved_at or datetime.now(timezone.utc)
+        delivery.submitter_approved_at = delivery.submitter_approved_at or now
         event_type = "final_review_approved_by_submitter"
 
     previous_status = track.status
