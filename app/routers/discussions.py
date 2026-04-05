@@ -2,7 +2,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -72,6 +72,7 @@ def list_discussions(
 )
 async def create_discussion(
     track_id: int,
+    background_tasks: BackgroundTasks,
     content: str = Form(...),
     images: Optional[list[UploadFile]] = File(default=None),
     db: Session = Depends(get_db),
@@ -121,6 +122,8 @@ async def create_discussion(
         "新讨论",
         f"「{track.title}」有新的讨论",
         related_track_id=track.id,
+        background_tasks=background_tasks,
+        album_id=track.album_id,
     )
 
     db.commit()

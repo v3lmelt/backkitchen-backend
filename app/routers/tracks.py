@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, func as sqlfunc, select
 from sqlalchemy.orm import Session
@@ -249,6 +249,7 @@ def upload_source_version(
 def intake_decision(
     track_id: int,
     payload: IntakeDecisionRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -274,7 +275,8 @@ def intake_decision(
             payload={"peer_reviewer_id": selected},
         )
         notify(db, [track.submitter_id], "track_status_changed", "曲目进入审核",
-               f"「{track.title}」已进入同行审核阶段", related_track_id=track.id)
+               f"「{track.title}」已进入同行审核阶段", related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
     else:
         track.status = TrackStatus.REJECTED
         track.peer_reviewer_id = None
@@ -291,7 +293,8 @@ def intake_decision(
             payload={"rejection_mode": track.rejection_mode.value},
         )
         notify(db, [track.submitter_id], "track_status_changed", "曲目被退回",
-               f"「{track.title}」已被退回", related_track_id=track.id)
+               f"「{track.title}」已被退回", related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
 
     db.commit()
     db.refresh(track)
@@ -302,6 +305,7 @@ def intake_decision(
 def finish_peer_review(
     track_id: int,
     payload: PeerReviewDecisionRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -341,12 +345,15 @@ def finish_peer_review(
     )
     if payload.decision == "needs_revision":
         notify(db, [track.submitter_id], "track_status_changed", "需要修改",
-               f"「{track.title}」需要修改", related_track_id=track.id)
+               f"「{track.title}」需要修改", related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
         notify(db, [track.peer_reviewer_id], "track_status_changed", "已发送修改请求",
-               f"「{track.title}」的修改请求已发送给作者", related_track_id=track.id)
+               f"「{track.title}」的修改请求已发送给作者", related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
     else:
         notify(db, [album.producer_id], "track_status_changed", "同行审核通过",
-               f"「{track.title}」同行审核已通过", related_track_id=track.id)
+               f"「{track.title}」同行审核已通过", related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -356,6 +363,7 @@ def finish_peer_review(
 def producer_gate(
     track_id: int,
     payload: ProducerGateDecisionRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -383,10 +391,12 @@ def producer_gate(
     )
     if payload.decision == "send_to_mastering":
         notify(db, [album.mastering_engineer_id], "track_status_changed", "曲目进入混音阶段",
-               f"「{track.title}」已进入混音阶段", related_track_id=track.id)
+               f"「{track.title}」已进入混音阶段", related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
     else:
         notify(db, [track.submitter_id, track.peer_reviewer_id], "track_status_changed",
-               "制作人要求重新审核", f"「{track.title}」制作人要求重新进行同行审核", related_track_id=track.id)
+               "制作人要求重新审核", f"「{track.title}」制作人要求重新进行同行审核", related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -395,6 +405,7 @@ def producer_gate(
 @router.post("/{track_id}/mastering/request-revision", response_model=TrackRead)
 def request_mastering_revision(
     track_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -416,7 +427,8 @@ def request_mastering_revision(
         to_status=track.status,
     )
     notify(db, [track.submitter_id], "track_status_changed", "混音师请求源文件修改",
-           f"「{track.title}」混音师请求修改源文件", related_track_id=track.id)
+           f"「{track.title}」混音师请求修改源文件", related_track_id=track.id,
+           background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -425,6 +437,7 @@ def request_mastering_revision(
 @router.post("/{track_id}/master-deliveries", response_model=TrackRead)
 def upload_master_delivery(
     track_id: int,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -461,7 +474,8 @@ def upload_master_delivery(
         payload={"delivery_number": delivery_number},
     )
     notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "主控文件已上传",
-           f"「{track.title}」主控文件已上传，等待审核", related_track_id=track.id)
+           f"「{track.title}」主控文件已上传，等待审核", related_track_id=track.id,
+           background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -470,6 +484,7 @@ def upload_master_delivery(
 @router.post("/{track_id}/final-review/approve", response_model=TrackRead)
 def approve_final_review(
     track_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -504,7 +519,8 @@ def approve_final_review(
     )
     if track.status == TrackStatus.COMPLETED:
         notify(db, [track.submitter_id, album.mastering_engineer_id], "track_status_changed",
-               "曲目已完成！", f"「{track.title}」已完成所有审核流程！", related_track_id=track.id)
+               "曲目已完成！", f"「{track.title}」已完成所有审核流程！", related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -513,6 +529,7 @@ def approve_final_review(
 @router.post("/{track_id}/final-review/return", response_model=TrackRead)
 def return_to_mastering(
     track_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -554,7 +571,8 @@ def return_to_mastering(
         payload={"delivery_id": delivery.id, "issue_count": len(open_final_review_issues)},
     )
     notify(db, [album.mastering_engineer_id], "track_status_changed", "曲目退回混音阶段",
-           f"「{track.title}」已退回混音阶段", related_track_id=track.id)
+           f"「{track.title}」已退回混音阶段", related_track_id=track.id,
+           background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)

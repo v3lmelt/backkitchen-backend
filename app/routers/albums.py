@@ -17,9 +17,10 @@ from app.models.issue import Issue, IssueStatus
 from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
-from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead
+from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig
 from app.security import get_current_user
-from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_visibility, get_album_member_ids
+from app.services.webhook import build_webhook_payload, post_webhook
+from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
@@ -106,14 +107,7 @@ def update_album_team(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
-    album = db.get(Album, album_id)
-    if album is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the album producer can manage the team.",
-        )
+    album = ensure_album_producer(album_id, current_user, db)
 
     if payload.mastering_engineer_id is not None:
         mastering_engineer = db.get(User, payload.mastering_engineer_id)
@@ -155,14 +149,7 @@ def update_deadlines(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
-    album = db.get(Album, album_id)
-    if album is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the producer can update deadlines.",
-        )
+    album = ensure_album_producer(album_id, current_user, db)
     album.deadline = payload.deadline
     album.phase_deadlines = json.dumps(payload.phase_deadlines) if payload.phase_deadlines else None
     db.commit()
@@ -258,12 +245,7 @@ def reorder_tracks(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[TrackRead]:
-    album = db.get(Album, album_id)
-    if album is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the producer can reorder tracks.")
-    ensure_album_visibility(album, current_user, db)
+    album = ensure_album_producer(album_id, current_user, db)
 
     tracks = list(db.scalars(select(Track).where(Track.album_id == album_id)).all())
     track_map = {t.id: t for t in tracks}
@@ -281,20 +263,57 @@ def reorder_tracks(
     return [build_track_read(t, current_user, album) for t in ordered]
 
 
+@router.get("/{album_id}/webhook", response_model=WebhookConfig)
+def get_webhook_config(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> WebhookConfig:
+    album = ensure_album_producer(album_id, current_user, db)
+    if album.webhook_config:
+        config = json.loads(album.webhook_config)
+        return WebhookConfig(**config)
+    return WebhookConfig()
+
+
+@router.patch("/{album_id}/webhook", response_model=WebhookConfig)
+def update_webhook_config(
+    album_id: int,
+    payload: WebhookConfig,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> WebhookConfig:
+    album = ensure_album_producer(album_id, current_user, db)
+    album.webhook_config = json.dumps(payload.model_dump())
+    db.commit()
+    db.refresh(album)
+    return WebhookConfig(**payload.model_dump())
+
+
+@router.post("/{album_id}/webhook/test")
+async def test_webhook(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, bool]:
+    album = ensure_album_producer(album_id, current_user, db)
+    if not album.webhook_config:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No webhook configured.")
+    config = json.loads(album.webhook_config)
+    if not config.get("url"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No webhook URL configured.")
+    payload = build_webhook_payload("test", "Webhook Test", f"Test from album: {album.title}", album_id=album.id)
+    success = await post_webhook(config["url"], payload)
+    return {"success": success}
+
+
 @router.get("/{album_id}/export")
 def export_album(
     album_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    album = db.get(Album, album_id)
-    if album is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the producer can export the album.",
-        )
+    album = ensure_album_producer(album_id, current_user, db)
 
     completed_tracks = list(
         db.scalars(

@@ -378,6 +378,12 @@ class DiscussionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class WebhookConfig(BaseModel):
+    url: str = ""
+    enabled: bool = False
+    events: list[str] = []
+
+
 class IssueBatchUpdate(BaseModel):
     issue_ids: list[int]
     status: IssueStatus

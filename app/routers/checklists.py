@@ -17,7 +17,7 @@ from app.schemas.schemas import (
     ChecklistTemplateUpdate,
 )
 from app.security import get_current_user
-from app.workflow import build_checklist_read, current_source_version, ensure_album_visibility, ensure_track_visibility
+from app.workflow import build_checklist_read, current_source_version, ensure_album_producer, ensure_album_visibility, ensure_track_visibility
 
 router = APIRouter(tags=["checklists"])
 
@@ -158,14 +158,7 @@ def update_checklist_template(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChecklistTemplateRead:
-    album = db.get(Album, album_id)
-    if album is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the producer can update the checklist template.",
-        )
+    album = ensure_album_producer(album_id, current_user, db)
     if not payload.items:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -183,13 +176,6 @@ def reset_checklist_template(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    album = db.get(Album, album_id)
-    if album is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the producer can reset the checklist template.",
-        )
+    album = ensure_album_producer(album_id, current_user, db)
     album.checklist_template = None
     db.commit()

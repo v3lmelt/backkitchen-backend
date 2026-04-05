@@ -2,7 +2,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -121,6 +121,7 @@ def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, us
 def create_issue(
     track_id: int,
     payload: IssueCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> IssueRead:
@@ -180,7 +181,8 @@ def create_issue(
     if current_user.id != track.submitter_id:
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
-               related_track_id=track.id, related_issue_id=issue.id)
+               related_track_id=track.id, related_issue_id=issue.id,
+               background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(issue)
     return build_issue_read(issue, db)
@@ -221,6 +223,7 @@ def get_issue(
 def update_issue(
     issue_id: int,
     payload: IssueUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> IssueRead:
@@ -244,9 +247,11 @@ def update_issue(
         db.add(Comment(issue_id=issue.id, author_id=current_user.id, content=payload.status_note, is_status_note=True))
 
     if old_status != new_status and current_user.id != issue.author_id:
+        track = db.get(Track, issue.track_id)
         notify(db, [issue.author_id], "issue_status_changed", "问题状态已更新",
                f"「{issue.title}」被标记为 {new_status.value}",
-               related_issue_id=issue.id)
+               related_issue_id=issue.id,
+               background_tasks=background_tasks, album_id=track.album_id if track else None)
 
     log_track_event(
         db,
@@ -267,6 +272,7 @@ def update_issue(
 )
 async def add_comment(
     issue_id: int,
+    background_tasks: BackgroundTasks,
     content: Optional[str] = Form(default=None),
     images: list[UploadFile] = File(default=[]),
     audios: list[UploadFile] = File(default=[]),
@@ -356,7 +362,8 @@ async def add_comment(
     notify_ids = [uid for uid in dict.fromkeys(participant_ids) if uid != current_user.id]
     if notify_ids:
         notify(db, notify_ids, "new_comment", "新评论",
-               f"「{issue.title}」有新评论", related_issue_id=issue.id)
+               f"「{issue.title}」有新评论", related_issue_id=issue.id,
+               background_tasks=background_tasks, album_id=track.album_id)
 
     db.commit()
     db.refresh(comment)
