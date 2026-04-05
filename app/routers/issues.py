@@ -320,6 +320,8 @@ async def add_comment(
     db.flush()
 
     if images:
+        from app.config import MAX_IMAGE_UPLOAD_SIZE
+
         comment_images_dir = settings.get_upload_path() / "comment_images"
         comment_images_dir.mkdir(parents=True, exist_ok=True)
         for img_file in images:
@@ -328,10 +330,17 @@ async def add_comment(
             file_path = f"comment_images/{filename}"
             dest = comment_images_dir / filename
             data = await img_file.read()
+            if len(data) > MAX_IMAGE_UPLOAD_SIZE:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Image too large. Maximum size is {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)} MB.",
+                )
             dest.write_bytes(data)
             db.add(CommentImage(comment_id=comment.id, file_path=file_path))
 
     if audios:
+        from app.config import MAX_AUDIO_UPLOAD_SIZE
+
         comment_audios_dir = settings.get_upload_path() / "comment_audios"
         comment_audios_dir.mkdir(parents=True, exist_ok=True)
         for audio_file in audios:
@@ -340,6 +349,11 @@ async def add_comment(
             file_path = f"comment_audios/{filename}"
             dest = comment_audios_dir / filename
             data = await audio_file.read()
+            if len(data) > MAX_AUDIO_UPLOAD_SIZE:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Audio file too large. Maximum size is {MAX_AUDIO_UPLOAD_SIZE // (1024 * 1024)} MB.",
+                )
             dest.write_bytes(data)
             duration = extract_audio_metadata(dest).duration
             original_filename = audio_file.filename or filename

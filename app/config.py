@@ -1,3 +1,4 @@
+import os
 import warnings
 from pathlib import Path
 
@@ -5,6 +6,10 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 _INSECURE_DEFAULT_KEY = "dev-secret-key-change-in-production"
+
+# Upload size limits (bytes)
+MAX_AUDIO_UPLOAD_SIZE = 200 * 1024 * 1024  # 200 MB
+MAX_IMAGE_UPLOAD_SIZE = 10 * 1024 * 1024   # 10 MB
 
 
 class Settings(BaseSettings):
@@ -18,13 +23,23 @@ class Settings(BaseSettings):
     SECRET_KEY: str = _INSECURE_DEFAULT_KEY
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 1 week
-    SEED_DEMO_DATA: bool = True
+    SEED_DEMO_DATA: bool = False
+    RESEND_API_KEY: str = ""
+    RESEND_FROM_EMAIL: str = "noreply@backkitchen.app"
+    FRONTEND_URL: str = "http://localhost:5173"
+    INITIAL_ADMIN_EMAIL: str = ""
 
-    model_config = {"env_prefix": "AUDIO_MGMT_"}
+    model_config = {"env_prefix": "AUDIO_MGMT_", "env_file": ".env", "env_file_encoding": "utf-8"}
 
     @model_validator(mode="after")
     def _warn_insecure_secret(self) -> "Settings":
         if self.SECRET_KEY == _INSECURE_DEFAULT_KEY:
+            env = os.environ.get("AUDIO_MGMT_ENV", "development")
+            if env == "production":
+                raise ValueError(
+                    "SECRET_KEY must be set to a secure random value in production. "
+                    "Set AUDIO_MGMT_SECRET_KEY environment variable."
+                )
             warnings.warn(
                 "SECRET_KEY is using the insecure default value. "
                 "Set AUDIO_MGMT_SECRET_KEY in production.",

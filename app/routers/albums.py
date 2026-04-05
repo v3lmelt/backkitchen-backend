@@ -195,19 +195,32 @@ async def upload_album_cover(
 ) -> AlbumRead:
     album = ensure_album_producer(album_id, current_user, db)
 
+    from app.config import MAX_IMAGE_UPLOAD_SIZE
+
     allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
     if file.content_type not in allowed_types:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only JPEG, PNG, WebP, and GIF images are allowed.",
         )
 
-    ext = Path(file.filename).suffix if file.filename else ".jpg"
+    ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
+    if ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported image extension: {ext}",
+        )
     filename = f"{album_id}_{uuid.uuid4().hex}{ext}"
     cover_dir = settings.get_upload_path() / "covers"
     cover_dir.mkdir(parents=True, exist_ok=True)
 
     content = await file.read()
+    if len(content) > MAX_IMAGE_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Image too large. Maximum size is {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)} MB.",
+        )
     with open(cover_dir / filename, "wb") as f:
         f.write(content)
 

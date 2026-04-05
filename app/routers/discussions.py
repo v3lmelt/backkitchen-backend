@@ -92,15 +92,31 @@ async def create_discussion(
     db.flush()
 
     if images:
+        from app.config import MAX_IMAGE_UPLOAD_SIZE
+
+        allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
         upload_dir = settings.get_upload_path() / "discussion_images"
         upload_dir.mkdir(parents=True, exist_ok=True)
         for img_file in images:
-            if img_file.content_type and not img_file.content_type.startswith("image/"):
-                continue
-            ext = Path(img_file.filename or "image.png").suffix
+            if not img_file.content_type or not img_file.content_type.startswith("image/"):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"File must be an image, got: {img_file.content_type}",
+                )
+            ext = (Path(img_file.filename or "image.png").suffix or ".png").lower()
+            if ext not in allowed_extensions:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Unsupported image extension: {ext}",
+                )
+            data = await img_file.read()
+            if len(data) > MAX_IMAGE_UPLOAD_SIZE:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Image too large. Maximum size is {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)} MB.",
+                )
             filename = f"{uuid.uuid4().hex}{ext}"
             file_path = upload_dir / filename
-            data = await img_file.read()
             file_path.write_bytes(data)
             db.add(
                 TrackDiscussionImage(
