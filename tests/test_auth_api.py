@@ -13,10 +13,8 @@ def test_register_returns_token_and_user(client):
     )
     assert response.status_code == 201
     body = response.json()
-    assert body["access_token"]
-    assert body["user"]["username"] == "newuser"
-    assert body["user"]["email"] == "new@example.com"
-    assert body["user"]["role"] == "member"
+    assert body["email"] == "new@example.com"
+    assert "message" in body
 
 
 def test_register_rejects_duplicate_email(client):
@@ -50,7 +48,7 @@ def test_register_rejects_duplicate_username(client):
 
 
 def test_login_success(client, factory):
-    user = factory.user(email="login@example.com")
+    user = factory.user(email="login@example.com", email_verified=True)
     user.password = hash_password("testpass123")
     factory.session.commit()
 
@@ -130,7 +128,7 @@ def test_update_me_email_conflict(client, factory, auth_headers):
 
 
 def test_change_password(client, factory, auth_headers):
-    user = factory.user()
+    user = factory.user(email_verified=True)
     user.password = hash_password("oldpass1234")
     factory.session.commit()
 
@@ -146,6 +144,18 @@ def test_change_password(client, factory, auth_headers):
         json={"email": user.email, "password": "newpass1234"},
     )
     assert login_response.status_code == 200
+
+
+def test_login_rejects_unverified_email(client, factory):
+    user = factory.user(email="pending@example.com", email_verified=False)
+    user.password = hash_password("testpass123")
+    factory.session.commit()
+
+    response = client.post(
+        "/api/auth/login",
+        json={"email": "pending@example.com", "password": "testpass123"},
+    )
+    assert response.status_code == 403
 
 
 def test_change_password_wrong_current(client, factory, auth_headers):
