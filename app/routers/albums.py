@@ -443,7 +443,7 @@ def export_album(
                 continue
             file_path = Path(delivery.file_path)
             if not file_path.is_absolute():
-                file_path = upload_dir / file_path
+                file_path = upload_dir / file_path.name
             if not file_path.exists():
                 continue
             ext = file_path.suffix
