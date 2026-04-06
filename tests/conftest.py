@@ -77,6 +77,7 @@ def client(
         "extract_audio_metadata",
         lambda _path: SimpleNamespace(duration=123.4, bitrate=None, sample_rate=None),
     )
+    monkeypatch.setattr(auth, "send_verification_email", lambda *_args, **_kwargs: None)
 
     def override_get_db() -> Iterator[Session]:
         session = session_factory()
@@ -126,16 +127,19 @@ class Factory:
         display_name: str | None = None,
         email: str | None = None,
         is_admin: bool = False,
+        email_verified: bool = True,
     ) -> User:
+        effective_role = "member" if role == "mastering_engineer" else role
         key = username or self._next(role)
         user = User(
             username=key,
             display_name=display_name or key.title(),
             email=email or f"{key}@example.com",
-            role=role,
+            role=effective_role,
             avatar_color="#123456",
             password="pw",
             is_admin=is_admin,
+            email_verified=email_verified,
         )
         self.session.add(user)
         self.session.commit()

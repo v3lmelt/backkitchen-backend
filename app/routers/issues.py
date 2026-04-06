@@ -13,7 +13,7 @@ from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
 from app.services.audio import extract_audio_metadata
-from app.models.issue import Issue, IssuePhase
+from app.models.issue import Issue, IssuePhase, IssueStatus
 from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.notifications import notify
@@ -94,24 +94,49 @@ def _ensure_issue_permission(track: Track, album: Album, user: User, phase: Issu
         return
 
 
+def _phase_reviewer_id(issue: Issue, track: Track, album: Album) -> int | None:
+    """Return the reviewer user-id for the issue's phase."""
+    if issue.phase == IssuePhase.PEER:
+        return track.peer_reviewer_id
+    if issue.phase in (IssuePhase.PRODUCER, IssuePhase.FINAL_REVIEW):
+        return album.producer_id
+    if issue.phase == IssuePhase.MASTERING:
+        return album.mastering_engineer_id
+    return None
+
+
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User) -> None:
-    if issue.phase == IssuePhase.PEER and user.id not in {track.submitter_id, track.peer_reviewer_id}:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this peer review issue.")
-    if issue.phase == IssuePhase.PRODUCER and user.id not in {
-        track.submitter_id,
-        album.producer_id,
-    }:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this producer review issue.")
-    if issue.phase == IssuePhase.MASTERING and user.id not in {
-        track.submitter_id,
-        album.mastering_engineer_id,
-    }:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this mastering issue.")
-    if issue.phase == IssuePhase.FINAL_REVIEW and user.id not in {
-        track.submitter_id,
-        album.producer_id,
-    }:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot update this final review issue.")
+    reviewer_id = _phase_reviewer_id(issue, track, album)
+    allowed = {track.submitter_id, reviewer_id} - {None}
+    if user.id not in allowed:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to update this issue.")
+
+
+def _validate_status_transition(issue: Issue, new_status: IssueStatus, track: Track, album: Album, user: User) -> None:
+    """Enforce role-based status transition rules.
+
+    Submitter may:  open → resolved, open → disagreed
+    Reviewer may:   open → resolved, resolved → open, disagreed → open
+    """
+    old = issue.status
+    if old == new_status:
+        return
+
+    is_submitter = user.id == track.submitter_id
+    reviewer_id = _phase_reviewer_id(issue, track, album)
+    is_reviewer = user.id == reviewer_id
+
+    # Submitter: open → resolved | disagreed
+    if is_submitter and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.DISAGREED):
+        return
+    # Reviewer: open → resolved
+    if is_reviewer and old == IssueStatus.OPEN and new_status == IssueStatus.RESOLVED:
+        return
+    # Reviewer: reopen from resolved or disagreed
+    if is_reviewer and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
+        return
+
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot perform this status transition.")
 
 
 @router.post(
@@ -240,6 +265,9 @@ def update_issue(
     album = _album_for_track(track, db)
     ensure_track_visibility(track, current_user, db)
     _ensure_issue_update_permission(issue, track, album, current_user)
+
+    if payload.status is not None:
+        _validate_status_transition(issue, payload.status, track, album, current_user)
 
     old_status = issue.status
     update_data = payload.model_dump(exclude_unset=True, exclude={"status_note"})
@@ -395,6 +423,7 @@ def batch_update_issues(
 
     for issue in issues:
         _ensure_issue_update_permission(issue, track, album, current_user)
+        _validate_status_transition(issue, payload.status, track, album, current_user)
         old_status = issue.status
         issue.status = payload.status
         if payload.status_note and old_status != payload.status:

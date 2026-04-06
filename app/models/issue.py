@@ -21,7 +21,6 @@ class IssueSeverity(str, enum.Enum):
 
 class IssueStatus(str, enum.Enum):
     OPEN = "open"
-    WILL_FIX = "will_fix"
     DISAGREED = "disagreed"
     RESOLVED = "resolved"
 

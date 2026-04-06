@@ -1,5 +1,8 @@
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -41,5 +44,5 @@ def extract_audio_metadata(file_path: str | Path) -> AudioMetadata:
             sample_rate=sample_rate,
         )
     except Exception:
-        # Graceful fallback: return empty metadata if anything goes wrong
+        logger.warning("Failed to extract audio metadata from %s", file_path, exc_info=True)
         return AudioMetadata()
