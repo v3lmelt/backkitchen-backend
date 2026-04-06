@@ -1,7 +1,10 @@
 import json
+import logging
 
 from fastapi import BackgroundTasks
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.models.album import Album
 from app.models.notification import Notification
@@ -59,6 +62,7 @@ def _try_dispatch_webhook(
     try:
         config = json.loads(album.webhook_config)
     except (json.JSONDecodeError, TypeError):
+        logger.error("Malformed webhook_config for album %s, skipping dispatch", album_id)
         return
     if not config.get("enabled") or not config.get("url"):
         return
