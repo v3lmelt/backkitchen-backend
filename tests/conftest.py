@@ -26,7 +26,7 @@ from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.invitation import Invitation
 from app.models.notification import Notification
-from app.routers import admin, albums, auth, checklists, invitations, issues, notifications, tracks, users
+from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users
 from app.security import create_access_token
 
 
@@ -96,6 +96,8 @@ def client(
     app.include_router(invitations.router)
     app.include_router(notifications.router)
     app.include_router(admin.router)
+    app.include_router(circles.router)
+    app.include_router(discussions.router)
     app.dependency_overrides[get_db] = override_get_db
     app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
 
