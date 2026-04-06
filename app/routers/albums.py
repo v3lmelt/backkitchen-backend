@@ -14,6 +14,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
+from app.models.circle import CircleMember
 from app.models.issue import Issue, IssueStatus
 from app.models.track import Track, TrackStatus
 from app.models.user import User
@@ -123,6 +124,7 @@ def update_album_team(
 ) -> AlbumRead:
     album = ensure_album_producer(album_id, current_user, db)
 
+    # --- validate mastering engineer exists ---
     if payload.mastering_engineer_id is not None:
         mastering_engineer = db.get(User, payload.mastering_engineer_id)
         if mastering_engineer is None:
@@ -130,18 +132,38 @@ def update_album_team(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Mastering engineer not found.",
             )
-        album.mastering_engineer_id = mastering_engineer.id
-    else:
-        album.mastering_engineer_id = None
 
+    # --- validate members ---
     desired_member_ids = set(payload.member_ids)
     desired_member_ids.add(current_user.id)
-    for user_id in desired_member_ids:
-        if db.get(User, user_id) is None:
+
+    if album.circle_id is not None:
+        circle_member_ids = set(
+            db.scalars(
+                select(CircleMember.user_id).where(CircleMember.circle_id == album.circle_id)
+            ).all()
+        )
+        invalid_ids = desired_member_ids - circle_member_ids
+        if invalid_ids:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User {user_id} not found.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Users {sorted(invalid_ids)} are not members of this album's circle.",
             )
+        if payload.mastering_engineer_id is not None and payload.mastering_engineer_id not in circle_member_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Mastering engineer is not a member of this album's circle.",
+            )
+    else:
+        for user_id in desired_member_ids:
+            if db.get(User, user_id) is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"User {user_id} not found.",
+                )
+
+    # --- apply changes (all validation passed) ---
+    album.mastering_engineer_id = payload.mastering_engineer_id
 
     existing_members = {member.user_id: member for member in album.members}
     for user_id, member in list(existing_members.items()):
