@@ -125,12 +125,12 @@ def test_update_issue_enforces_phase_permissions(client, factory, auth_headers):
     success = client.patch(
         f"/api/issues/{issue.id}",
         headers=auth_headers(submitter),
-        json={"status": "will_fix"},
+        json={"status": "resolved"},
     )
 
     assert failure.status_code == 403
     assert success.status_code == 200
-    assert success.json()["status"] == IssueStatus.WILL_FIX.value
+    assert success.json()["status"] == IssueStatus.RESOLVED.value
 
 
 def test_add_comment_rejects_invalid_image_type(client, factory, auth_headers):
@@ -261,13 +261,13 @@ def test_batch_update_issues(client, db_session, factory, auth_headers):
         headers=auth_headers(submitter),
         json={
             "issue_ids": [issue1.id, issue2.id],
-            "status": "will_fix",
-            "status_note": "Will fix all",
+            "status": "resolved",
+            "status_note": "All fixed",
         },
     )
     assert response.status_code == 200
     assert len(response.json()) == 2
-    assert all(i["status"] == IssueStatus.WILL_FIX.value for i in response.json())
+    assert all(i["status"] == IssueStatus.RESOLVED.value for i in response.json())
 
 
 def test_batch_update_issues_forbidden_for_outsider(client, factory, auth_headers):
@@ -289,7 +289,7 @@ def test_batch_update_issues_forbidden_for_outsider(client, factory, auth_header
     response = client.patch(
         f"/api/tracks/{track.id}/issues/batch",
         headers=auth_headers(outsider),
-        json={"issue_ids": [issue.id], "status": "will_fix"},
+        json={"issue_ids": [issue.id], "status": "resolved"},
     )
     assert response.status_code == 403
 
