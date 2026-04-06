@@ -10,7 +10,7 @@ from app.models.track import RejectionMode, TrackStatus
 class UserBase(BaseModel):
     username: str = Field(..., min_length=1, max_length=50)
     display_name: str = Field(..., min_length=1, max_length=100)
-    role: str = Field(default="member", pattern=r"^(member|producer|mastering_engineer)$")
+    role: str = Field(default="member", pattern=r"^(member|producer)$")
     avatar_color: str = Field(default="#6366f1", pattern=r"^#[0-9a-fA-F]{6}$")
 
 
@@ -37,7 +37,7 @@ class UserRead(UserBase):
 
 
 class AdminUserUpdate(BaseModel):
-    role: str | None = Field(default=None, pattern=r"^(member|producer|mastering_engineer)$")
+    role: str | None = Field(default=None, pattern=r"^(member|producer)$")
     is_admin: bool | None = None
     email_verified: bool | None = None
 

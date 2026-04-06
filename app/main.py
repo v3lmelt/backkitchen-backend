@@ -152,7 +152,7 @@ def _run_sqlite_compat_migrations() -> None:
             conn.execute(text("UPDATE issues SET severity = 'minor' WHERE lower(severity) = 'minor' OR severity = 'MINOR'"))
             conn.execute(text("UPDATE issues SET severity = 'suggestion' WHERE lower(severity) = 'suggestion' OR severity = 'SUGGESTION'"))
             conn.execute(text("UPDATE issues SET status = 'open' WHERE lower(status) = 'open' OR status = 'OPEN'"))
-            conn.execute(text("UPDATE issues SET status = 'will_fix' WHERE lower(status) = 'will_fix' OR status = 'WILL_FIX'"))
+            conn.execute(text("UPDATE issues SET status = 'open' WHERE lower(status) = 'will_fix' OR status = 'WILL_FIX'"))
             conn.execute(text("UPDATE issues SET status = 'disagreed' WHERE lower(status) = 'disagreed' OR status = 'DISAGREED'"))
             conn.execute(text("UPDATE issues SET status = 'resolved' WHERE lower(status) = 'resolved' OR status = 'RESOLVED'"))
 
@@ -284,7 +284,7 @@ def _seed_demo_data() -> None:
         mastering_engineer = User(
             username="echo",
             display_name="Echo",
-            role="mastering_engineer",
+            role="member",
             avatar_color="#10b981",
             email="echo@example.com",
             password=hash_password("password123"),
@@ -410,7 +410,10 @@ try:
     upload_path = settings.get_upload_path()
     app.mount("/uploads", StaticFiles(directory=str(upload_path)), name="uploads")
 except Exception:
-    pass
+    logging.getLogger(__name__).warning(
+        "Failed to mount /uploads static files — uploaded audio will be inaccessible",
+        exc_info=True,
+    )
 
 
 @app.get("/api/health")
