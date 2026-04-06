@@ -4,6 +4,8 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -353,11 +355,17 @@ def _seed_demo_data() -> None:
         db.close()
 
 
+def _run_alembic_upgrade() -> None:
+    """Run alembic upgrade head to apply pending migrations."""
+    import os
+    alembic_cfg = AlembicConfig(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "..", "alembic"))
+    alembic_command.upgrade(alembic_cfg, "head")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    _run_sqlite_compat_migrations()
-    Base.metadata.create_all(bind=engine)
+    _run_alembic_upgrade()
     _backfill_workflow_data()
     upload_path = settings.get_upload_path()
     (upload_path / "comment_images").mkdir(parents=True, exist_ok=True)
