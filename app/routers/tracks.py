@@ -523,6 +523,8 @@ def list_tracks(
     for track in tracks:
         if track.submitter_id != current_user.id and track.album_id not in visible_album_ids and track.peer_reviewer_id != current_user.id:
             continue
+        if track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.FINAL:
+            continue
         album = albums_by_id.get(track.album_id)
         if album is None:
             continue
