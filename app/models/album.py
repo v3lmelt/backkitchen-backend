@@ -29,6 +29,7 @@ class Album(Base):
     deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     phase_deadlines: Mapped[str | None] = mapped_column(Text, nullable=True)
     webhook_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    workflow_config: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )

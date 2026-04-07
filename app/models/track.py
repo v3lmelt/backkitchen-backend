@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -44,10 +44,10 @@ class Track(Base):
     duration: Mapped[float | None] = mapped_column(Float, nullable=True)
     bpm: Mapped[int | None] = mapped_column(Integer, nullable=True)
     track_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    status: Mapped[TrackStatus] = mapped_column(
-        Enum(TrackStatus, values_callable=lambda items: [item.value for item in items]),
+    status: Mapped[str] = mapped_column(
+        String(50),
         nullable=False,
-        default=TrackStatus.SUBMITTED,
+        default=TrackStatus.SUBMITTED.value,
     )
     rejection_mode: Mapped[RejectionMode | None] = mapped_column(
         Enum(RejectionMode, values_callable=lambda items: [item.value for item in items]),

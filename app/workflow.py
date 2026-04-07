@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models.album import Album
 from app.models.album_member import AlbumMember
@@ -13,6 +13,7 @@ from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
 from app.models.issue import Issue, IssueStatus
+from app.models.discussion import TrackDiscussion
 from app.models.master_delivery import MasterDelivery
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
@@ -42,10 +43,17 @@ def get_album_member_ids(db: Session, album_id: int) -> set[int]:
     return {row.user_id for row in rows}
 
 
-def get_all_album_member_ids(db: Session) -> dict[int, set[int]]:
-    """Batch-fetch all album→member mappings in a single query."""
+def get_all_album_member_ids(db: Session, album_id: int | None = None) -> dict[int, set[int]]:
+    """Batch-fetch album→member mappings in a single query.
+
+    When ``album_id`` is provided only that album's members are loaded,
+    avoiding a full-table scan when the caller only needs one album.
+    """
+    stmt = select(AlbumMember)
+    if album_id is not None:
+        stmt = stmt.where(AlbumMember.album_id == album_id)
     result: dict[int, set[int]] = {}
-    for m in db.scalars(select(AlbumMember)).all():
+    for m in db.scalars(stmt).all():
         result.setdefault(m.album_id, set()).add(m.user_id)
     return result
 
@@ -102,7 +110,16 @@ def current_master_delivery(track: Track) -> MasterDelivery | None:
     return max(deliveries, key=lambda item: item.delivery_number)
 
 
-def track_allowed_actions(track: Track, user: User, album: Album) -> list[str]:
+def track_allowed_actions(
+    track: Track, user: User, album: Album, *, _wf_config: dict | None = None,
+) -> list[str]:
+    if album.workflow_config:
+        from app.workflow_engine import get_allowed_action_names, parse_workflow_config
+
+        config = _wf_config or parse_workflow_config(album)
+        return get_allowed_action_names(config, track, user, album)
+
+    # Legacy hardcoded logic for albums without custom workflow
     actions: list[str] = []
     is_submitter = track.submitter_id == user.id
     is_peer_reviewer = track.peer_reviewer_id == user.id
@@ -155,6 +172,37 @@ def build_track_read(track: Track, user: User, album: Album) -> TrackRead:
     current_source = current_source_version(track)
     current_master = current_master_delivery(track)
     open_issue_count = sum(1 for i in track.issues if i.status == IssueStatus.OPEN)
+
+    workflow_step = None
+    workflow_transitions = None
+    wf_config = None
+    if album.workflow_config:
+        from app.workflow_engine import (
+            get_allowed_transitions,
+            get_current_step,
+            parse_workflow_config,
+        )
+        from app.schemas.schemas import WorkflowStepDefSchema
+
+        wf_config = parse_workflow_config(album)
+        step = get_current_step(wf_config, track)
+        if step:
+            workflow_step = WorkflowStepDefSchema(
+                id=step.id,
+                label=step.label,
+                type=step.type,
+                assignee_role=step.assignee_role,
+                order=step.order,
+                transitions=step.transitions,
+                return_to=step.return_to,
+                revision_step=step.revision_step,
+            )
+        transitions = get_allowed_transitions(wf_config, track, user, album)
+        if transitions:
+            workflow_transitions = [
+                {"decision": t.decision, "label": t.label} for t in transitions
+            ]
+
     return TrackRead(
         id=track.id,
         title=track.title,
@@ -180,7 +228,9 @@ def build_track_read(track: Track, user: User, album: Album) -> TrackRead:
         peer_reviewer=_user_read(track.peer_reviewer),
         current_source_version=_source_version_read(current_source),
         current_master_delivery=_master_delivery_read(current_master),
-        allowed_actions=track_allowed_actions(track, user, album),
+        allowed_actions=track_allowed_actions(track, user, album, _wf_config=wf_config),
+        workflow_step=workflow_step,
+        workflow_transitions=workflow_transitions,
     )
 
 
@@ -190,8 +240,8 @@ def build_issue_read(
     source_version_numbers: dict[int, int] | None = None,
     users_cache: dict[int, User] | None = None,
 ) -> IssueRead:
-    if users_cache and issue.author_id in users_cache:
-        author = users_cache[issue.author_id]
+    if users_cache is not None:
+        author = users_cache.get(issue.author_id) or db.get(User, issue.author_id)
     else:
         author = db.get(User, issue.author_id)
     source_version_number = None
@@ -301,6 +351,23 @@ def build_event_read(event: WorkflowEvent, db: Session, users_cache: dict[int, U
 def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResponse:
     album = ensure_track_visibility(track, user, db)
 
+    # Re-fetch the track with all relationships eagerly loaded to avoid N+1
+    track = db.scalar(
+        select(Track)
+        .where(Track.id == track.id)
+        .options(
+            selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.images),
+            selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.audios),
+            selectinload(Track.workflow_events),
+            selectinload(Track.discussions).selectinload(TrackDiscussion.images),
+            selectinload(Track.source_versions),
+            selectinload(Track.master_deliveries),
+            selectinload(Track.checklist_items),
+            selectinload(Track.submitter),
+            selectinload(Track.peer_reviewer),
+        )
+    )
+
     # Pre-fetch all user IDs we'll need to avoid N+1
     user_ids: set[int] = set()
     for issue in track.issues:
@@ -310,6 +377,8 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
     for event in track.workflow_events:
         if event.actor_user_id:
             user_ids.add(event.actor_user_id)
+    for d in track.discussions:
+        user_ids.add(d.author_id)
     user_ids.discard(None)
 
     users_by_id: dict[int, User] = {}
@@ -336,7 +405,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             author_id=d.author_id,
             content=d.content,
             created_at=d.created_at,
-            author=_user_read(d.author),
+            author=_user_read(users_by_id.get(d.author_id) or d.author),
             images=[
                 DiscussionImageRead(
                     id=img.id,
@@ -349,6 +418,13 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         )
         for d in track.discussions
     ]
+    # Include workflow config for custom-workflow albums
+    wf_config_schema = None
+    if album.workflow_config:
+        from app.workflow_engine import parse_workflow_config
+        from app.schemas.schemas import WorkflowConfigSchema
+        wf_config_schema = WorkflowConfigSchema(**parse_workflow_config(album))
+
     return TrackDetailResponse(
         track=build_track_read(track, user, album),
         issues=issues,
@@ -356,6 +432,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         events=events,
         source_versions=[TrackSourceVersionRead.model_validate(v) for v in track.source_versions],
         discussions=discussions,
+        workflow_config=wf_config_schema,
     )
 
 
@@ -365,8 +442,8 @@ def log_track_event(
     actor: User | None,
     event_type: str,
     *,
-    from_status: TrackStatus | None = None,
-    to_status: TrackStatus | None = None,
+    from_status: str | None = None,
+    to_status: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> WorkflowEvent:
     def _serialize(value: Any) -> Any:
@@ -381,8 +458,8 @@ def log_track_event(
         album_id=track.album_id,
         actor_user_id=actor.id if actor else None,
         event_type=event_type,
-        from_status=from_status.value if from_status else None,
-        to_status=to_status.value if to_status else None,
+        from_status=from_status.value if hasattr(from_status, "value") else from_status,
+        to_status=to_status.value if hasattr(to_status, "value") else to_status,
         payload=json.dumps(payload, default=_serialize) if payload else None,
     )
     db.add(event)
