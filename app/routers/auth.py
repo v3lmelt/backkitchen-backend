@@ -205,15 +205,14 @@ async def upload_avatar(
     dest = avatar_dir / filename
     await stream_upload(file, dest, MAX_IMAGE_UPLOAD_SIZE)
 
-    # Remove old avatar file
-    if current_user.avatar_image:
-        old_path = settings.get_upload_path() / current_user.avatar_image
-        if old_path.exists():
-            old_path.unlink(missing_ok=True)
-
+    # Update DB first, then clean up old file (safe ordering)
+    old_avatar = current_user.avatar_image
     current_user.avatar_image = f"avatars/{filename}"
     db.commit()
     db.refresh(current_user)
+    if old_avatar:
+        old_path = settings.get_upload_path() / old_avatar
+        old_path.unlink(missing_ok=True)
     return UserRead.model_validate(current_user)
 
 
