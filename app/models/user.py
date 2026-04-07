@@ -14,6 +14,7 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(100), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="member")
     avatar_color: Mapped[str] = mapped_column(String(7), nullable=False, default="#6366f1")
+    avatar_image: Mapped[str | None] = mapped_column(String(500), nullable=True, default=None)
     email: Mapped[str | None] = mapped_column(String(254), unique=True, nullable=True, index=True)
     password: Mapped[str | None] = mapped_column(String(255), nullable=True)
     email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
