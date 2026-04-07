@@ -5,7 +5,7 @@ import json
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -143,3 +143,17 @@ def get_current_user_optional(
     when no Bearer header is present.  Used by endpoints that also accept a
     ``?token=`` query-param fallback (e.g. audio streaming)."""
     return _resolve_bearer_user(credentials, db)
+
+
+def get_user_from_token_param(
+    token: str | None = Query(default=None, alias="token"),
+    db: Session = Depends(get_db),
+) -> User | None:
+    """Resolve a user from a ``?token=`` query parameter (for ``<audio>`` src URLs)."""
+    if token is None:
+        return None
+    payload = _decode_token(token)
+    user = db.get(User, int(payload["sub"]))
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found.")
+    return user
