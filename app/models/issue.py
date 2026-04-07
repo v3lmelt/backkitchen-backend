@@ -40,10 +40,10 @@ class Issue(Base):
         Integer, ForeignKey("tracks.id"), nullable=False, index=True
     )
     author_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    phase: Mapped[IssuePhase] = mapped_column(
-        Enum(IssuePhase, values_callable=lambda items: [item.value for item in items]),
+    phase: Mapped[str] = mapped_column(
+        String(50),
         nullable=False,
-        default=IssuePhase.PEER,
+        default=IssuePhase.PEER.value,
     )
     workflow_cycle: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     source_version_id: Mapped[int | None] = mapped_column(
@@ -68,6 +68,7 @@ class Issue(Base):
         Enum(IssueStatus, values_callable=lambda items: [item.value for item in items]),
         nullable=False,
         default=IssueStatus.OPEN,
+        index=True,
     )
     time_start: Mapped[float] = mapped_column(Float, nullable=False)
     time_end: Mapped[float | None] = mapped_column(Float, nullable=True)

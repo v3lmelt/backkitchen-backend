@@ -1,10 +1,11 @@
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.issue import IssuePhase, IssueSeverity, IssueStatus, IssueType
 from app.models.track import RejectionMode, TrackStatus
+from app.workflow_defaults import SPECIAL_TARGETS
 
 
 class UserBase(BaseModel):
@@ -88,6 +89,7 @@ class AlbumCreate(AlbumBase):
     circle_id: int | None = None
     circle_name: str | None = Field(default=None, max_length=200)
     genres: list[str] | None = None
+    workflow_config: "WorkflowConfigSchema | None" = None
 
 
 class AlbumMetadataUpdate(BaseModel):
@@ -148,6 +150,7 @@ class AlbumRead(AlbumBase):
     mastering_engineer_id: int | None = None
     deadline: datetime | None = None
     phase_deadlines: dict[str, str] | None = None
+    workflow_config: "WorkflowConfigSchema | None" = None
     created_at: datetime
     updated_at: datetime
     track_count: int = 0
@@ -269,7 +272,7 @@ class TrackRead(TrackBase):
     track_number: int | None = None
     file_path: str | None = None
     duration: float | None = None
-    status: TrackStatus
+    status: str
     rejection_mode: RejectionMode | None = None
     version: int
     workflow_cycle: int
@@ -286,6 +289,8 @@ class TrackRead(TrackBase):
     current_source_version: TrackSourceVersionRead | None = None
     current_master_delivery: MasterDeliveryRead | None = None
     allowed_actions: list[str] = []
+    workflow_step: "WorkflowStepDefSchema | None" = None
+    workflow_transitions: list[dict[str, str]] | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -316,7 +321,7 @@ class IssueBase(BaseModel):
 
 
 class IssueCreate(IssueBase):
-    phase: IssuePhase
+    phase: str
 
 
 class IssueUpdate(BaseModel):
@@ -331,7 +336,7 @@ class IssueRead(IssueBase):
     id: int
     track_id: int
     author_id: int
-    phase: IssuePhase
+    phase: str
     workflow_cycle: int
     source_version_id: int | None = None
     source_version_number: int | None = None
@@ -437,6 +442,7 @@ class TrackDetailResponse(BaseModel):
     events: list[WorkflowEventRead]
     source_versions: list[TrackSourceVersionRead] = []
     discussions: list["DiscussionRead"] = []
+    workflow_config: "WorkflowConfigSchema | None" = None
 
 
 class NotificationRead(BaseModel):
@@ -493,6 +499,86 @@ class IssueBatchUpdate(BaseModel):
     issue_ids: list[int]
     status: IssueStatus
     status_note: str | None = None
+
+
+# ── Workflow config schemas ──────────────────────────────────────────────────
+
+
+class WorkflowTransitionRequest(BaseModel):
+    decision: str = Field(..., min_length=1, max_length=50)
+
+
+class WorkflowStepDefSchema(BaseModel):
+    id: str = Field(..., pattern=r"^[a-z][a-z0-9_]{1,49}$")
+    label: str = Field(..., min_length=1, max_length=100)
+    type: Literal["gate", "review", "revision", "delivery"]
+    assignee_role: str
+    order: int = Field(..., ge=0)
+    transitions: dict[str, str] = {}
+    return_to: str | None = None
+    revision_step: str | None = None
+
+
+class WorkflowConfigSchema(BaseModel):
+    version: int = 1
+    steps: list[WorkflowStepDefSchema] = Field(..., min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_workflow(self) -> "WorkflowConfigSchema":
+
+        step_ids = {s.id for s in self.steps}
+        seen_ids: set[str] = set()
+
+        for step in self.steps:
+            # Unique IDs
+            if step.id in seen_ids:
+                raise ValueError(f"Duplicate step id: '{step.id}'")
+            seen_ids.add(step.id)
+
+            # Validate transition targets
+            for decision, target in step.transitions.items():
+                if target not in step_ids and target not in SPECIAL_TARGETS:
+                    raise ValueError(
+                        f"Step '{step.id}' transition '{decision}' targets "
+                        f"unknown step '{target}'"
+                    )
+
+            # Revision steps must have return_to
+            if step.type == "revision":
+                if not step.return_to:
+                    raise ValueError(
+                        f"Revision step '{step.id}' must have 'return_to'"
+                    )
+                if step.return_to not in step_ids:
+                    raise ValueError(
+                        f"Revision step '{step.id}' return_to targets "
+                        f"unknown step '{step.return_to}'"
+                    )
+
+            # Review/delivery steps with revision_step must reference a valid revision step
+            if step.revision_step:
+                if step.revision_step not in step_ids:
+                    raise ValueError(
+                        f"Step '{step.id}' revision_step targets "
+                        f"unknown step '{step.revision_step}'"
+                    )
+                target_step = next(s for s in self.steps if s.id == step.revision_step)
+                if target_step.type != "revision":
+                    raise ValueError(
+                        f"Step '{step.id}' revision_step '{step.revision_step}' "
+                        f"must be of type 'revision'"
+                    )
+
+        # At least one path to __completed
+        has_completed = any(
+            "__completed" in step.transitions.values() for step in self.steps
+        )
+        if not has_completed:
+            raise ValueError(
+                "Workflow must have at least one transition to '__completed'"
+            )
+
+        return self
 
 
 # ── R2 presigned upload schemas ──────────────────────────────────────────────

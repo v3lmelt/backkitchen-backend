@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func as sqlfunc, select
+from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -19,7 +19,7 @@ from app.models.issue import Issue, IssueStatus
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
-from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig
+from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WorkflowConfigSchema
 from app.security import get_current_user
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
@@ -40,6 +40,17 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
     ]
     phase_deadlines = json.loads(album.phase_deadlines) if album.phase_deadlines else None
     genres = json.loads(album.genres) if album.genres else None
+    workflow_config = (
+        WorkflowConfigSchema(**json.loads(album.workflow_config))
+        if album.workflow_config
+        else None
+    )
+    track_count = db.scalar(
+        select(func.count()).select_from(Track).where(
+            Track.album_id == album.id,
+            ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
+        )
+    ) or 0
     return AlbumRead(
         id=album.id,
         title=album.title,
@@ -55,12 +66,10 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         mastering_engineer_id=album.mastering_engineer_id,
         deadline=album.deadline,
         phase_deadlines=phase_deadlines,
+        workflow_config=workflow_config,
         created_at=album.created_at,
         updated_at=album.updated_at,
-        track_count=sum(
-            1 for t in album.tracks
-            if not (t.status == TrackStatus.REJECTED and t.rejection_mode == RejectionMode.FINAL)
-        ),
+        track_count=track_count,
         producer=UserRead.model_validate(album.producer) if album.producer else None,
         mastering_engineer=(
             UserRead.model_validate(album.mastering_engineer)
@@ -79,9 +88,12 @@ def create_album(
 ) -> AlbumRead:
     album_data = payload.model_dump()
     genres = album_data.pop("genres", None)
+    wf_config = album_data.pop("workflow_config", None)
     album = Album(**album_data, producer_id=current_user.id)
     if genres:
         album.genres = json.dumps(genres, ensure_ascii=False)
+    if wf_config is not None:
+        album.workflow_config = json.dumps(wf_config, ensure_ascii=False)
     db.add(album)
     db.flush()
     db.add(AlbumMember(album_id=album.id, user_id=current_user.id))
@@ -268,17 +280,27 @@ def get_album_stats(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
 
-    tracks = list(db.scalars(
-        select(Track).where(
+    # Aggregate track counts by status in a single query
+    status_rows = db.execute(
+        select(Track.status, sqlfunc.count(Track.id))
+        .where(
             Track.album_id == album_id,
             ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
         )
-    ).all())
+        .group_by(Track.status)
+    ).all()
+    by_status: dict[str, int] = {row[0]: row[1] for row in status_rows}
+    total_tracks = sum(by_status.values())
 
-    by_status: dict[str, int] = {}
-    for track in tracks:
-        key = track.status.value
-        by_status[key] = by_status.get(key, 0) + 1
+    # Load tracks only for deadline overdue calculation (only if phase_deadlines is set)
+    tracks: list[Track] = []
+    if album.phase_deadlines:
+        tracks = list(db.scalars(
+            select(Track).where(
+                Track.album_id == album_id,
+                ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
+            )
+        ).all())
 
     open_issues = db.scalar(
         select(sqlfunc.count(Issue.id))
@@ -310,7 +332,7 @@ def get_album_stats(
         }
         for track in tracks:
             for phase_key, statuses in phase_status_map.items():
-                if track.status.value in statuses and phase_key in deadlines:
+                if track.status in statuses and phase_key in deadlines:
                     try:
                         dl = datetime.fromisoformat(deadlines[phase_key])
                         if dl.tzinfo is None:
@@ -322,7 +344,7 @@ def get_album_stats(
                         pass
 
     return AlbumStats(
-        total_tracks=len(tracks),
+        total_tracks=total_tracks,
         by_status=by_status,
         open_issues=open_issues,
         recent_events=[build_event_read(e, db, users_cache=actors_by_id) for e in recent_events],
@@ -447,16 +469,21 @@ def export_album(
     buffer = io.BytesIO()
     manifest_entries: list[dict] = []
 
+    # Resolve and batch-check all file paths before opening the zip writer,
+    # so the existence checks are grouped rather than interleaved with I/O.
+    track_file_entries: list[tuple[Track, Path]] = []
+    for track in completed_tracks:
+        delivery = current_master_delivery(track)
+        if delivery is None:
+            continue
+        file_path = Path(delivery.file_path)
+        if not file_path.is_absolute():
+            file_path = upload_dir / file_path.name
+        if file_path.exists():
+            track_file_entries.append((track, file_path))
+
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for track in completed_tracks:
-            delivery = current_master_delivery(track)
-            if delivery is None:
-                continue
-            file_path = Path(delivery.file_path)
-            if not file_path.is_absolute():
-                file_path = upload_dir / file_path.name
-            if not file_path.exists():
-                continue
+        for track, file_path in track_file_entries:
             ext = file_path.suffix
             num = track.track_number or 0
             safe_title = track.title.replace("/", "_").replace("\\", "_")

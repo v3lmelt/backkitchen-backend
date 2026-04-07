@@ -31,6 +31,12 @@ from app.schemas.schemas import (
     TrackListItem,
     TrackRead,
     PeerReviewDecisionRequest,
+    WorkflowTransitionRequest,
+)
+from app.workflow_engine import (
+    execute_transition as engine_execute_transition,
+    execute_revision_upload as engine_revision_upload,
+    execute_delivery_upload as engine_delivery_upload,
 )
 from app.notifications import notify
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
@@ -381,7 +387,9 @@ def confirm_source_version_upload(
     if track.submitter_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the submitter can upload a new source version.")
 
-    if track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.RESUBMITTABLE:
+    if album.workflow_config:
+        next_status = engine_revision_upload(album, track)
+    elif track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.RESUBMITTABLE:
         next_status = TrackStatus.SUBMITTED
         track.workflow_cycle += 1
         track.peer_reviewer_id = None
@@ -499,36 +507,53 @@ def confirm_master_delivery_upload(
 
 @router.get("", response_model=list[TrackListItem])
 def list_tracks(
-    status_filter: TrackStatus | None = Query(default=None, alias="status"),
+    status_filter: str | None = Query(default=None, alias="status"),
     album_id: int | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[TrackListItem]:
-    albums = list(db.scalars(select(Album)).all())
-    members_by_album = get_all_album_member_ids(db)
-    visible_album_ids = {
-        album.id
-        for album in albums
-        if current_user.id
-        in ({album.producer_id, album.mastering_engineer_id} | members_by_album.get(album.id, set()))
-    }
-    stmt = select(Track).order_by(Track.id)
+    if album_id is not None:
+        # Single-album path: only load that album and its members
+        album = db.get(Album, album_id)
+        if album is None:
+            return []
+        members_by_album = get_all_album_member_ids(db, album_id=album_id)
+        albums_by_id = {album.id: album}
+        visible_album_ids = {
+            album.id
+            for album in albums_by_id.values()
+            if current_user.id
+            in ({album.producer_id, album.mastering_engineer_id} | members_by_album.get(album.id, set()))
+        }
+    else:
+        albums = list(db.scalars(select(Album)).all())
+        members_by_album = get_all_album_member_ids(db)
+        visible_album_ids = {
+            alb.id
+            for alb in albums
+            if current_user.id
+            in ({alb.producer_id, alb.mastering_engineer_id} | members_by_album.get(alb.id, set()))
+        }
+        albums_by_id = {alb.id: alb for alb in albums}
+
+    stmt = select(Track).order_by(Track.id).limit(limit).offset(offset)
     if status_filter is not None:
         stmt = stmt.where(Track.status == status_filter)
     if album_id is not None:
         stmt = stmt.where(Track.album_id == album_id)
     tracks = list(db.scalars(stmt).all())
     results: list[TrackListItem] = []
-    albums_by_id = {album.id: album for album in albums}
     for track in tracks:
         if track.submitter_id != current_user.id and track.album_id not in visible_album_ids and track.peer_reviewer_id != current_user.id:
             continue
         if track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.FINAL:
             continue
-        album = albums_by_id.get(track.album_id)
-        if album is None:
+        alb = albums_by_id.get(track.album_id)
+        if alb is None:
             continue
-        results.append(_track_list_item(track, current_user, album))
+        results.append(_track_list_item(track, current_user, alb))
     return results
 
 
@@ -542,6 +567,30 @@ def get_track(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     return build_track_detail(track, current_user, db)
+
+
+@router.post("/{track_id}/workflow/transition", response_model=TrackRead)
+def workflow_transition(
+    track_id: int,
+    payload: WorkflowTransitionRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    """Generic workflow transition for albums with custom workflow config."""
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if not album.workflow_config:
+        raise HTTPException(
+            status_code=400,
+            detail="This album uses the default workflow. Use the specific action endpoints.",
+        )
+    engine_execute_transition(db, album, track, current_user, payload.decision, background_tasks)
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album)
 
 
 @router.post("/{track_id}/source-versions", response_model=TrackRead)
@@ -558,7 +607,10 @@ def upload_source_version(
     if track.submitter_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the submitter can upload a new source version.")
 
-    if track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.RESUBMITTABLE:
+    if album.workflow_config:
+        # Custom workflow: use engine to resolve next status
+        next_status = engine_revision_upload(album, track)
+    elif track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.RESUBMITTABLE:
         next_status = TrackStatus.SUBMITTED
         track.workflow_cycle += 1
         track.peer_reviewer_id = None
