@@ -12,6 +12,7 @@ class UserBase(BaseModel):
     display_name: str = Field(..., min_length=1, max_length=100)
     role: str = Field(default="member", pattern=r"^(member|producer)$")
     avatar_color: str = Field(default="#6366f1", pattern=r"^#[0-9a-fA-F]{6}$")
+    avatar_image: str | None = None
 
 
 class UserCreate(UserBase):

@@ -1,8 +1,10 @@
 import logging
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -166,6 +168,67 @@ def update_me(
         current_user.email = payload.email
         changed = True
     if changed:
+        db.commit()
+        db.refresh(current_user)
+    return UserRead.model_validate(current_user)
+
+
+@router.post("/me/avatar", response_model=UserRead)
+async def upload_avatar(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UserRead:
+    from app.config import MAX_IMAGE_UPLOAD_SIZE, settings
+    from app.services.upload import stream_upload
+
+    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+    if file.content_type and file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only JPEG, PNG, WebP, and GIF images are allowed.",
+        )
+
+    ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
+    if ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported image extension: {ext}",
+        )
+
+    filename = f"{current_user.id}_{uuid.uuid4().hex}{ext}"
+    avatar_dir = settings.get_upload_path() / "avatars"
+    avatar_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = avatar_dir / filename
+    await stream_upload(file, dest, MAX_IMAGE_UPLOAD_SIZE)
+
+    # Remove old avatar file
+    if current_user.avatar_image:
+        old_path = settings.get_upload_path() / current_user.avatar_image
+        if old_path.exists():
+            old_path.unlink(missing_ok=True)
+
+    current_user.avatar_image = f"avatars/{filename}"
+    db.commit()
+    db.refresh(current_user)
+    return UserRead.model_validate(current_user)
+
+
+@router.delete("/me/avatar", response_model=UserRead)
+def delete_avatar(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UserRead:
+    from app.config import settings
+
+    if current_user.avatar_image:
+        old_path = settings.get_upload_path() / current_user.avatar_image
+        if old_path.exists():
+            old_path.unlink(missing_ok=True)
+        current_user.avatar_image = None
         db.commit()
         db.refresh(current_user)
     return UserRead.model_validate(current_user)
