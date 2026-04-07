@@ -4,7 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
 from app.database import get_db
@@ -61,6 +61,7 @@ def list_discussions(
             select(TrackDiscussion)
             .where(TrackDiscussion.track_id == track_id)
             .order_by(TrackDiscussion.created_at.asc())
+            .options(selectinload(TrackDiscussion.images), selectinload(TrackDiscussion.author))
         ).all()
     )
     return [_build_discussion_read(d) for d in discussions]
