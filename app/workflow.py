@@ -242,7 +242,11 @@ def build_comment_read(comment: Comment, db: Session, users_cache: dict[int, Use
         CommentAudioRead(
             id=audio.id,
             comment_id=audio.comment_id,
-            audio_url=f"/uploads/{audio.file_path}",
+            audio_url=(
+                f"/api/comment-audios/{audio.id}/file"
+                if audio.storage_backend == "r2"
+                else f"/uploads/{audio.file_path}"
+            ),
             original_filename=audio.original_filename,
             duration=audio.duration,
             created_at=audio.created_at,

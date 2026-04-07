@@ -1,11 +1,11 @@
 import hashlib
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy import func, func as sqlfunc, select
 from sqlalchemy.orm import Session
 
@@ -20,15 +20,20 @@ from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.schemas.schemas import (
+    ConfirmTrackUploadParams,
+    ConfirmUploadParams,
     IntakeDecisionRequest,
+    PresignedUploadResponse,
     ProducerGateDecisionRequest,
+    RequestTrackUploadParams,
+    RequestUploadParams,
     TrackDetailResponse,
     TrackListItem,
     TrackRead,
     PeerReviewDecisionRequest,
 )
 from app.notifications import notify
-from app.security import _decode_token, get_current_user, get_current_user_optional
+from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.audio import extract_audio_metadata
 from app.services.upload import stream_upload_sync
 from app.workflow import (
@@ -53,18 +58,6 @@ _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
 _AUDIO_CACHE_MAX_AGE = 86400
 
 
-def _get_user_from_token_param(
-    token: str | None = Query(default=None, alias="token"),
-    db: Session = Depends(get_db),
-) -> User | None:
-    """Resolve a user from a ``?token=`` query parameter (for <audio> src URLs)."""
-    if token is None:
-        return None
-    payload = _decode_token(token)
-    user = db.get(User, int(payload["sub"]))
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found.")
-    return user
 
 _UNSAFE_CHARS = re.compile(r'[^\w\s\-]', re.UNICODE)
 _COLLAPSE = re.compile(r'[\s_]+')
@@ -153,6 +146,16 @@ def _serve_path(path_str: str, filename_prefix: str) -> FileResponse:
     )
 
 
+def _serve_audio(file_path: str, storage_backend: str, filename_prefix: str) -> FileResponse | RedirectResponse:
+    """Serve an audio file from local disk or redirect to R2 presigned URL."""
+    if storage_backend == "r2":
+        from app.services.r2 import generate_download_url
+
+        url = generate_download_url(file_path)
+        return RedirectResponse(url, status_code=307)
+    return _serve_path(file_path, filename_prefix)
+
+
 @router.post("", response_model=TrackRead, status_code=status.HTTP_201_CREATED)
 def create_track(
     title: str = Form(...),
@@ -189,6 +192,294 @@ def create_track(
     db.flush()
     db.add(_source_version_create(track, current_user, file_path, duration))
     log_track_event(db, track, current_user, "track_submitted", to_status=TrackStatus.SUBMITTED)
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album)
+
+
+# ── R2 presigned upload endpoints ────────────────────────────────────────────
+
+def _validate_audio_extension(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_AUDIO_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unsupported audio format: {ext}. Allowed: {', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}",
+        )
+    return ext
+
+
+def _validate_audio_size(file_size: int) -> None:
+    from app.config import MAX_AUDIO_UPLOAD_SIZE
+
+    if file_size > MAX_AUDIO_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large. Maximum size is {MAX_AUDIO_UPLOAD_SIZE // (1024 * 1024)} MB.",
+        )
+
+
+def _ensure_r2_enabled() -> None:
+    if not settings.R2_ENABLED:
+        raise HTTPException(status_code=501, detail="R2 storage is not enabled.")
+
+
+def _presign_upload(object_key: str, content_type: str) -> PresignedUploadResponse:
+    from app.services.r2 import generate_upload_url
+
+    upload_url = generate_upload_url(object_key, content_type)
+    return PresignedUploadResponse(
+        upload_url=upload_url,
+        object_key=object_key,
+        upload_id=uuid.uuid4().hex,
+        expires_in=settings.R2_PRESIGNED_UPLOAD_EXPIRY,
+    )
+
+
+def _extract_r2_metadata(object_key: str) -> tuple[float | None, int | None, int | None]:
+    """Download R2 object to temp file, extract audio metadata, clean up."""
+    from app.services.r2 import download_to_temp
+
+    tmp_path = download_to_temp(object_key)
+    try:
+        meta = extract_audio_metadata(tmp_path)
+        return meta.duration, meta.bitrate, meta.sample_rate
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _verify_r2_object(object_key: str) -> None:
+    from app.services.r2 import object_exists
+
+    if not object_exists(object_key):
+        raise HTTPException(status_code=400, detail="Upload not found in R2. The file may not have been uploaded yet.")
+
+
+@router.post("/request-upload", response_model=PresignedUploadResponse)
+def request_track_upload(
+    params: RequestTrackUploadParams,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PresignedUploadResponse:
+    _ensure_r2_enabled()
+    _validate_audio_extension(params.filename)
+    _validate_audio_size(params.file_size)
+
+    album = db.get(Album, params.album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    ensure_album_visibility(album, current_user, db)
+
+    from app.services.r2 import make_object_key
+
+    # Use a temp ID of 0 — the real track_id is assigned on confirm
+    object_key = make_object_key("tracks/new/source", current_user.id, params.filename)
+    return _presign_upload(object_key, params.content_type)
+
+
+@router.post("/confirm-upload", response_model=TrackRead)
+def confirm_track_upload(
+    params: ConfirmTrackUploadParams,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    _ensure_r2_enabled()
+
+    album = db.get(Album, params.album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    ensure_album_visibility(album, current_user, db)
+
+    duration, _bitrate, _sample_rate = _extract_r2_metadata(params.object_key)
+    if duration is None and params.duration is not None:
+        duration = params.duration
+
+    max_num = db.scalar(
+        select(sqlfunc.max(Track.track_number)).where(Track.album_id == params.album_id)
+    ) or 0
+    track = Track(
+        title=params.title,
+        artist=params.artist,
+        album_id=params.album_id,
+        submitter_id=current_user.id,
+        bpm=params.bpm,
+        track_number=max_num + 1,
+        file_path=params.object_key,
+        storage_backend="r2",
+        duration=duration,
+        status=TrackStatus.SUBMITTED,
+        version=1,
+        workflow_cycle=1,
+    )
+    db.add(track)
+    db.flush()
+    sv = TrackSourceVersion(
+        track_id=track.id,
+        workflow_cycle=track.workflow_cycle,
+        version_number=track.version,
+        file_path=params.object_key,
+        storage_backend="r2",
+        duration=duration,
+        uploaded_by_id=current_user.id,
+    )
+    db.add(sv)
+    log_track_event(db, track, current_user, "track_submitted", to_status=TrackStatus.SUBMITTED)
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album)
+
+
+@router.post("/{track_id}/source-versions/request-upload", response_model=PresignedUploadResponse)
+def request_source_version_upload(
+    track_id: int,
+    params: RequestUploadParams,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PresignedUploadResponse:
+    _ensure_r2_enabled()
+    _validate_audio_extension(params.filename)
+    _validate_audio_size(params.file_size)
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+    if track.submitter_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the submitter can upload a new source version.")
+
+    from app.services.r2 import make_object_key
+
+    object_key = make_object_key(f"tracks/{track_id}/source", track.version + 1, params.filename)
+    return _presign_upload(object_key, params.content_type)
+
+
+@router.post("/{track_id}/source-versions/confirm-upload", response_model=TrackRead)
+def confirm_source_version_upload(
+    track_id: int,
+    params: ConfirmUploadParams,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    _ensure_r2_enabled()
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if track.submitter_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the submitter can upload a new source version.")
+
+    if track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.RESUBMITTABLE:
+        next_status = TrackStatus.SUBMITTED
+        track.workflow_cycle += 1
+        track.peer_reviewer_id = None
+        track.rejection_mode = None
+    elif track.status == TrackStatus.PEER_REVISION:
+        next_status = TrackStatus.PEER_REVIEW
+    elif track.status == TrackStatus.MASTERING_REVISION:
+        next_status = TrackStatus.MASTERING
+    else:
+        raise HTTPException(status_code=409, detail="This track is not waiting for a new source version.")
+
+    duration, _bitrate, _sample_rate = _extract_r2_metadata(params.object_key)
+    if params.duration is not None and duration is None:
+        duration = params.duration
+
+    previous_status = track.status
+    track.version += 1
+    track.file_path = params.object_key
+    track.storage_backend = "r2"
+    track.duration = duration
+    track.status = next_status
+    sv = TrackSourceVersion(
+        track_id=track.id,
+        workflow_cycle=track.workflow_cycle,
+        version_number=track.version,
+        file_path=params.object_key,
+        storage_backend="r2",
+        duration=duration,
+        uploaded_by_id=current_user.id,
+    )
+    db.add(sv)
+    log_track_event(
+        db, track, current_user, "source_version_uploaded",
+        from_status=previous_status, to_status=next_status,
+        payload={"version": track.version, "workflow_cycle": track.workflow_cycle},
+    )
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album)
+
+
+@router.post("/{track_id}/master-deliveries/request-upload", response_model=PresignedUploadResponse)
+def request_master_delivery_upload(
+    track_id: int,
+    params: RequestUploadParams,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PresignedUploadResponse:
+    _ensure_r2_enabled()
+    _validate_audio_extension(params.filename)
+    _validate_audio_size(params.file_size)
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
+        raise HTTPException(status_code=403, detail="Only the mastering engineer can upload a master delivery.")
+
+    from app.services.r2 import make_object_key
+
+    delivery_number = 1
+    delivery = current_master_delivery(track)
+    if delivery and delivery.workflow_cycle == track.workflow_cycle:
+        delivery_number = delivery.delivery_number + 1
+    object_key = make_object_key(f"tracks/{track_id}/master", delivery_number, params.filename)
+    return _presign_upload(object_key, params.content_type)
+
+
+@router.post("/{track_id}/master-deliveries/confirm-upload", response_model=TrackRead)
+def confirm_master_delivery_upload(
+    track_id: int,
+    params: ConfirmUploadParams,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    _ensure_r2_enabled()
+    _verify_r2_object(params.object_key)
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
+        raise HTTPException(status_code=403, detail="Only the mastering engineer can upload a master delivery.")
+
+    delivery_number = 1
+    current_del = current_master_delivery(track)
+    if current_del and current_del.workflow_cycle == track.workflow_cycle:
+        delivery_number = current_del.delivery_number + 1
+    delivery = MasterDelivery(
+        track_id=track.id,
+        workflow_cycle=track.workflow_cycle,
+        delivery_number=delivery_number,
+        file_path=params.object_key,
+        storage_backend="r2",
+        uploaded_by_id=current_user.id,
+    )
+    previous_status = track.status
+    track.status = TrackStatus.FINAL_REVIEW
+    db.add(delivery)
+    log_track_event(
+        db, track, current_user, "master_delivery_uploaded",
+        from_status=previous_status, to_status=track.status,
+        payload={"delivery_number": delivery_number},
+    )
+    notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "主控文件已上传",
+           f"「{track.title}」主控文件已上传，等待审核", related_track_id=track.id,
+           background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -571,6 +862,11 @@ def approve_final_review(
         notify(db, [track.submitter_id, album.mastering_engineer_id], "track_status_changed",
                "曲目已完成！", f"「{track.title}」已完成所有审核流程！", related_track_id=track.id,
                background_tasks=background_tasks, album_id=track.album_id)
+        # Schedule old source versions for cleanup
+        expiry = now + timedelta(days=settings.OLD_VERSION_RETENTION_DAYS)
+        for sv in track.source_versions:
+            if sv.version_number != track.version:
+                sv.expires_at = expiry
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album)
@@ -628,6 +924,73 @@ def return_to_mastering(
     return build_track_read(track, current_user, album)
 
 
+def _collect_track_files(track: Track) -> tuple[list[Path], list[str]]:
+    """Collect all file references associated with a track and its children.
+
+    Returns ``(local_paths, r2_keys)`` so callers can clean up both backends.
+    """
+    upload_base = settings.get_upload_path()
+    local_paths: list[Path] = []
+    r2_keys: list[str] = []
+
+    def _add(file_path: str | None, backend: str) -> None:
+        if not file_path:
+            return
+        if backend == "r2":
+            r2_keys.append(file_path)
+        else:
+            local_paths.append(Path(file_path))
+
+    # Current track audio
+    _add(track.file_path, track.storage_backend)
+
+    # All source version audio files
+    for sv in track.source_versions:
+        _add(sv.file_path, sv.storage_backend)
+
+    # All master delivery audio files
+    for md in track.master_deliveries:
+        _add(md.file_path, md.storage_backend)
+
+    # Issue comment images (always local) and audios (local or r2)
+    for issue in track.issues:
+        for comment in issue.comments:
+            for img in comment.images:
+                if img.file_path:
+                    local_paths.append(upload_base / img.file_path)
+            for audio in comment.audios:
+                if not audio.file_path:
+                    continue
+                if audio.storage_backend == "r2":
+                    r2_keys.append(audio.file_path)
+                else:
+                    local_paths.append(upload_base / audio.file_path)
+
+    # Discussion images (always local)
+    for disc in track.discussions:
+        for img in disc.images:
+            if img.file_path:
+                local_paths.append(upload_base / img.file_path)
+
+    return local_paths, r2_keys
+
+
+def _cleanup_files(local_paths: list[Path], r2_keys: list[str]) -> None:
+    """Delete files from local disk and R2."""
+    for p in local_paths:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if r2_keys:
+        try:
+            from app.services.r2 import delete_objects
+            delete_objects(r2_keys)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning("Failed to delete R2 objects", exc_info=True)
+
+
 @router.delete("/{track_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_track(
     track_id: int,
@@ -640,12 +1003,11 @@ def delete_track(
     album = ensure_track_visibility(track, current_user, db)
     if current_user.id not in {track.submitter_id, album.producer_id}:
         raise HTTPException(status_code=403, detail="Only the submitter or producer can delete this track.")
-    if track.file_path:
-        file_path = Path(track.file_path)
-        if file_path.exists():
-            file_path.unlink()
+    # Collect all file paths before cascade-deleting DB records
+    local_paths, r2_keys = _collect_track_files(track)
     db.delete(track)
     db.commit()
+    _cleanup_files(local_paths, r2_keys)
 
 
 def _resolve_audio_user(
@@ -664,7 +1026,7 @@ def serve_audio(
     track_id: int,
     db: Session = Depends(get_db),
     bearer_user: User | None = Depends(get_current_user_optional),
-    token_user: User | None = Depends(_get_user_from_token_param),
+    token_user: User | None = Depends(get_user_from_token_param),
 ) -> FileResponse:
     current_user = _resolve_audio_user(bearer_user, token_user)
     track = db.get(Track, track_id)
@@ -673,7 +1035,7 @@ def serve_audio(
     ensure_track_visibility(track, current_user, db)
     if not track.file_path:
         raise HTTPException(status_code=404, detail="No source audio is available for this track.")
-    return _serve_path(track.file_path, track.title)
+    return _serve_audio(track.file_path, track.storage_backend, track.title)
 
 
 @router.get("/{track_id}/source-versions/{version_id}/audio")
@@ -682,7 +1044,7 @@ def get_source_version_audio(
     version_id: int,
     db: Session = Depends(get_db),
     bearer_user: User | None = Depends(get_current_user_optional),
-    token_user: User | None = Depends(_get_user_from_token_param),
+    token_user: User | None = Depends(get_user_from_token_param),
 ) -> FileResponse:
     current_user = _resolve_audio_user(bearer_user, token_user)
     track = db.get(Track, track_id)
@@ -694,7 +1056,7 @@ def get_source_version_audio(
     if version is None or version.track_id != track_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found.")
 
-    return _serve_path(version.file_path, f"{track.title}-v{version.version_number}")
+    return _serve_audio(version.file_path, version.storage_backend, f"{track.title}-v{version.version_number}")
 
 
 @router.get("/{track_id}/master-audio")
@@ -702,7 +1064,7 @@ def serve_master_audio(
     track_id: int,
     db: Session = Depends(get_db),
     bearer_user: User | None = Depends(get_current_user_optional),
-    token_user: User | None = Depends(_get_user_from_token_param),
+    token_user: User | None = Depends(get_user_from_token_param),
 ) -> FileResponse:
     current_user = _resolve_audio_user(bearer_user, token_user)
     track = db.get(Track, track_id)
@@ -712,4 +1074,4 @@ def serve_master_audio(
     delivery = current_master_delivery(track)
     if delivery is None:
         raise HTTPException(status_code=404, detail="No master delivery is available for this track.")
-    return _serve_path(delivery.file_path, f"{track.title}-master")
+    return _serve_audio(delivery.file_path, delivery.storage_backend, f"{track.title}-master")
