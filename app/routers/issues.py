@@ -533,6 +533,7 @@ def batch_update_issues(
 @router.get("/api/comment-audios/{audio_id}/file")
 def serve_comment_audio(
     audio_id: int,
+    resolve: str | None = Query(default=None),
     db: Session = Depends(get_db),
     bearer_user: User | None = Depends(get_current_user_optional),
     token_user: User | None = Depends(get_user_from_token_param),
@@ -556,7 +557,12 @@ def serve_comment_audio(
         from app.services.r2 import generate_download_url
 
         url = generate_download_url(audio.file_path)
+        if resolve == "json":
+            return {"url": url}
         return RedirectResponse(url, status_code=307)
+
+    if resolve == "json":
+        return {"url": None}
 
     # Local file
     file_path = settings.get_upload_path() / audio.file_path

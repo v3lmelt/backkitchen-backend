@@ -146,13 +146,25 @@ def _serve_path(path_str: str, filename_prefix: str) -> FileResponse:
     )
 
 
-def _serve_audio(file_path: str, storage_backend: str, filename_prefix: str) -> FileResponse | RedirectResponse:
-    """Serve an audio file from local disk or redirect to R2 presigned URL."""
+def _serve_audio(
+    file_path: str, storage_backend: str, filename_prefix: str, resolve: str | None = None,
+) -> FileResponse | RedirectResponse | dict:
+    """Serve an audio file from local disk or redirect to R2 presigned URL.
+
+    When ``resolve='json'`` and storage is R2, return a JSON dict with the
+    presigned URL instead of a 307 redirect.  This lets the frontend obtain
+    the direct R2 URL without hitting cross-origin redirect issues (e.g.
+    wavesurfer.js ``fetch`` cannot follow a cross-origin 307).
+    """
     if storage_backend == "r2":
         from app.services.r2 import generate_download_url
 
         url = generate_download_url(file_path)
+        if resolve == "json":
+            return {"url": url}
         return RedirectResponse(url, status_code=307)
+    if resolve == "json":
+        return {"url": None}
     return _serve_path(file_path, filename_prefix)
 
 
@@ -1024,10 +1036,11 @@ def _resolve_audio_user(
 @router.get("/{track_id}/audio")
 def serve_audio(
     track_id: int,
+    resolve: str | None = Query(default=None),
     db: Session = Depends(get_db),
     bearer_user: User | None = Depends(get_current_user_optional),
     token_user: User | None = Depends(get_user_from_token_param),
-) -> FileResponse:
+):
     current_user = _resolve_audio_user(bearer_user, token_user)
     track = db.get(Track, track_id)
     if track is None:
@@ -1035,17 +1048,18 @@ def serve_audio(
     ensure_track_visibility(track, current_user, db)
     if not track.file_path:
         raise HTTPException(status_code=404, detail="No source audio is available for this track.")
-    return _serve_audio(track.file_path, track.storage_backend, track.title)
+    return _serve_audio(track.file_path, track.storage_backend, track.title, resolve)
 
 
 @router.get("/{track_id}/source-versions/{version_id}/audio")
 def get_source_version_audio(
     track_id: int,
     version_id: int,
+    resolve: str | None = Query(default=None),
     db: Session = Depends(get_db),
     bearer_user: User | None = Depends(get_current_user_optional),
     token_user: User | None = Depends(get_user_from_token_param),
-) -> FileResponse:
+):
     current_user = _resolve_audio_user(bearer_user, token_user)
     track = db.get(Track, track_id)
     if track is None:
@@ -1056,16 +1070,17 @@ def get_source_version_audio(
     if version is None or version.track_id != track_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found.")
 
-    return _serve_audio(version.file_path, version.storage_backend, f"{track.title}-v{version.version_number}")
+    return _serve_audio(version.file_path, version.storage_backend, f"{track.title}-v{version.version_number}", resolve)
 
 
 @router.get("/{track_id}/master-audio")
 def serve_master_audio(
     track_id: int,
+    resolve: str | None = Query(default=None),
     db: Session = Depends(get_db),
     bearer_user: User | None = Depends(get_current_user_optional),
     token_user: User | None = Depends(get_user_from_token_param),
-) -> FileResponse:
+):
     current_user = _resolve_audio_user(bearer_user, token_user)
     track = db.get(Track, track_id)
     if track is None:
@@ -1074,4 +1089,4 @@ def serve_master_audio(
     delivery = current_master_delivery(track)
     if delivery is None:
         raise HTTPException(status_code=404, detail="No master delivery is available for this track.")
-    return _serve_audio(delivery.file_path, delivery.storage_backend, f"{track.title}-master")
+    return _serve_audio(delivery.file_path, delivery.storage_backend, f"{track.title}-master", resolve)
