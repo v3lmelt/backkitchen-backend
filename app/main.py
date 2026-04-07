@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
@@ -363,6 +365,60 @@ def _run_alembic_upgrade() -> None:
     alembic_command.upgrade(alembic_cfg, "head")
 
 
+_CLEANUP_INTERVAL = 3600  # seconds (1 hour)
+_cleanup_logger = logging.getLogger("cleanup")
+
+
+def _run_expired_source_cleanup() -> int:
+    """Delete audio files for expired TrackSourceVersion records. Returns count."""
+    from app.models.track_source_version import TrackSourceVersion
+
+    db = SessionLocal()
+    cleaned = 0
+    try:
+        now = datetime.now(timezone.utc)
+        expired = list(db.scalars(
+            select(TrackSourceVersion).where(
+                TrackSourceVersion.expires_at.isnot(None),
+                TrackSourceVersion.expires_at < now,
+                TrackSourceVersion.file_path.isnot(None),
+            )
+        ).all())
+
+        for sv in expired:
+            try:
+                if sv.storage_backend == "r2":
+                    from app.services.r2 import delete_object
+                    delete_object(sv.file_path)
+                else:
+                    p = Path(sv.file_path)
+                    if not p.is_absolute():
+                        p = settings.get_upload_path() / p
+                    p.unlink(missing_ok=True)
+                sv.file_path = None
+                cleaned += 1
+            except Exception:
+                _cleanup_logger.warning("Failed to clean up %s", sv.file_path, exc_info=True)
+
+        if cleaned:
+            db.commit()
+    finally:
+        db.close()
+    return cleaned
+
+
+async def _periodic_cleanup() -> None:
+    """Background loop that cleans up expired source versions every hour."""
+    while True:
+        await asyncio.sleep(_CLEANUP_INTERVAL)
+        try:
+            count = _run_expired_source_cleanup()
+            if count:
+                _cleanup_logger.info("Cleaned up %d expired source version files", count)
+        except Exception:
+            _cleanup_logger.warning("Periodic cleanup failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _run_alembic_upgrade()
@@ -381,7 +437,15 @@ async def lifespan(app: FastAPI):
                 db.commit()
         finally:
             db.close()
-    yield
+    cleanup_task = asyncio.create_task(_periodic_cleanup())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title=settings.APP_NAME, version="2.0.0", lifespan=lifespan)
@@ -419,6 +483,11 @@ except Exception:
 @app.get("/api/health")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/config")
+def app_config():
+    return {"r2_enabled": settings.R2_ENABLED}
 
 
 @app.websocket("/ws/tracks/{track_id}")
