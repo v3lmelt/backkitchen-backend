@@ -639,6 +639,11 @@ def intake_decision(
             to_status=track.status,
             payload={"rejection_mode": track.rejection_mode.value},
         )
+        # Schedule file cleanup for final rejections (1 day retention)
+        if track.rejection_mode == RejectionMode.FINAL:
+            expiry = datetime.now(timezone.utc) + timedelta(days=1)
+            for sv in track.source_versions:
+                sv.expires_at = expiry
         notify(db, [track.submitter_id], "track_status_changed", "曲目被退回",
                f"「{track.title}」已被退回", related_track_id=track.id,
                background_tasks=background_tasks, album_id=track.album_id)
