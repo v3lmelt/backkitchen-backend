@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -18,10 +18,12 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
 
 @router.get("/users", response_model=list[UserRead])
 def list_users(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
 ) -> list[User]:
-    return list(db.scalars(select(User).order_by(User.id)).all())
+    return list(db.scalars(select(User).order_by(User.id).limit(limit).offset(offset)).all())
 
 
 @router.patch("/users/{user_id}", response_model=UserRead)
