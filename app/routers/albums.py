@@ -16,7 +16,7 @@ from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.circle import CircleMember
 from app.models.issue import Issue, IssueStatus
-from app.models.track import Track, TrackStatus
+from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig
@@ -57,7 +57,10 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         phase_deadlines=phase_deadlines,
         created_at=album.created_at,
         updated_at=album.updated_at,
-        track_count=len(album.tracks),
+        track_count=sum(
+            1 for t in album.tracks
+            if not (t.status == TrackStatus.REJECTED and t.rejection_mode == RejectionMode.FINAL)
+        ),
         producer=UserRead.model_validate(album.producer) if album.producer else None,
         mastering_engineer=(
             UserRead.model_validate(album.mastering_engineer)
@@ -265,7 +268,12 @@ def get_album_stats(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
 
-    tracks = list(db.scalars(select(Track).where(Track.album_id == album_id)).all())
+    tracks = list(db.scalars(
+        select(Track).where(
+            Track.album_id == album_id,
+            ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
+        )
+    ).all())
 
     by_status: dict[str, int] = {}
     for track in tracks:
@@ -335,7 +343,10 @@ def list_album_tracks(
     ensure_album_visibility(album, current_user, db)
 
     tracks = list(db.scalars(
-        select(Track).where(Track.album_id == album_id)
+        select(Track).where(
+            Track.album_id == album_id,
+            ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
+        )
         .order_by(Track.track_number.asc().nulls_last(), Track.id)
     ).all())
     return [build_track_read(track, current_user, album) for track in tracks]
