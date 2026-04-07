@@ -2,7 +2,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -17,8 +18,11 @@ from app.models.issue import Issue, IssuePhase, IssueStatus
 from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.notifications import notify
-from app.schemas.schemas import CommentRead, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead, IssueUpdate
-from app.security import get_current_user
+from app.schemas.schemas import (
+    CommentRead, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead, IssueUpdate,
+    PresignedCommentAudioResponse, PresignedUploadResponse, RequestCommentAudioUploadParams,
+)
+from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.upload import stream_upload
 from app.workflow import (
     build_comment_read,
@@ -308,11 +312,23 @@ async def add_comment(
     content: Optional[str] = Form(default=None),
     images: list[UploadFile] = File(default=[]),
     audios: list[UploadFile] = File(default=[]),
+    audio_object_keys: Optional[str] = Form(default=None),
+    audio_original_filenames: Optional[str] = Form(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> CommentRead:
     # Normalise: pydantic v2 + python-multipart may deliver empty fields as None
     effective_content = (content or '').strip()
+
+    # Parse R2 audio keys (comma-separated) if provided
+    r2_audio_keys: list[str] = []
+    r2_audio_names: list[str] = []
+    if audio_object_keys:
+        r2_audio_keys = [k.strip() for k in audio_object_keys.split("\n") if k.strip()]
+        r2_audio_names = [n.strip() for n in (audio_original_filenames or "").split("\n")]
+        # Pad names to match keys
+        while len(r2_audio_names) < len(r2_audio_keys):
+            r2_audio_names.append(Path(r2_audio_keys[len(r2_audio_names)]).name)
 
     issue = db.get(Issue, issue_id)
     if issue is None:
@@ -322,7 +338,7 @@ async def add_comment(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
 
-    if not effective_content and not images and not audios:
+    if not effective_content and not images and not audios and not r2_audio_keys:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A comment must have text content, at least one image, or at least one audio file.",
@@ -384,6 +400,28 @@ async def add_comment(
                 duration=duration,
             ))
 
+    # R2 audio attachments
+    if r2_audio_keys:
+        from botocore.exceptions import ClientError
+        from app.services.r2 import download_to_temp
+
+        for key, orig_name in zip(r2_audio_keys, r2_audio_names):
+            try:
+                tmp = download_to_temp(key)
+            except ClientError:
+                raise HTTPException(status_code=400, detail=f"R2 object not found: {key}")
+            try:
+                duration = extract_audio_metadata(tmp).duration
+            finally:
+                tmp.unlink(missing_ok=True)
+            db.add(CommentAudio(
+                comment_id=comment.id,
+                file_path=key,
+                storage_backend="r2",
+                original_filename=orig_name,
+                duration=duration,
+            ))
+
     log_track_event(
         db,
         track,
@@ -402,6 +440,55 @@ async def add_comment(
     db.commit()
     db.refresh(comment)
     return build_comment_read(comment, db)
+
+
+# ── R2 presigned upload for comment audio ────────────────────────────────────
+
+@router.post("/api/issues/{issue_id}/comments/request-audio-upload")
+def request_comment_audio_upload(
+    issue_id: int,
+    params: RequestCommentAudioUploadParams,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PresignedCommentAudioResponse:
+    from app.config import MAX_AUDIO_UPLOAD_SIZE
+
+    if not settings.R2_ENABLED:
+        raise HTTPException(status_code=501, detail="R2 storage is not enabled.")
+
+    issue = db.get(Issue, issue_id)
+    if issue is None:
+        raise HTTPException(status_code=404, detail="Issue not found.")
+    track = db.get(Track, issue.track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+
+    if len(params.files) > MAX_AUDIOS_PER_COMMENT:
+        raise HTTPException(status_code=422, detail=f"A comment may contain at most {MAX_AUDIOS_PER_COMMENT} audio files.")
+
+    from app.services.r2 import generate_upload_url, make_object_key
+
+    from app.routers.tracks import ALLOWED_AUDIO_EXTENSIONS
+
+    uploads = []
+    for f in params.files:
+        ext = Path(f.filename).suffix.lower()
+        if ext not in ALLOWED_AUDIO_EXTENSIONS:
+            raise HTTPException(status_code=422, detail=f"Unsupported audio format: {ext}")
+        if f.file_size > MAX_AUDIO_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_AUDIO_UPLOAD_SIZE // (1024 * 1024)} MB.")
+
+        object_key = make_object_key(f"comments/{issue_id}", 0, f.filename)
+        upload_url = generate_upload_url(object_key, f.content_type)
+        uploads.append(PresignedUploadResponse(
+            upload_url=upload_url,
+            object_key=object_key,
+            upload_id=uuid.uuid4().hex,
+            expires_in=settings.R2_PRESIGNED_UPLOAD_EXPIRY,
+        ))
+
+    return PresignedCommentAudioResponse(uploads=uploads)
 
 
 @router.patch("/api/tracks/{track_id}/issues/batch", response_model=list[IssueRead])
@@ -438,3 +525,46 @@ def batch_update_issues(
     for issue in issues:
         db.refresh(issue)
     return [build_issue_read(issue, db) for issue in issues]
+
+
+# ── comment audio file serving ───────────────────────────────────────────────
+
+
+@router.get("/api/comment-audios/{audio_id}/file")
+def serve_comment_audio(
+    audio_id: int,
+    db: Session = Depends(get_db),
+    bearer_user: User | None = Depends(get_current_user_optional),
+    token_user: User | None = Depends(get_user_from_token_param),
+):
+    user = bearer_user or token_user
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    audio = db.get(CommentAudio, audio_id)
+    if audio is None:
+        raise HTTPException(status_code=404, detail="Comment audio not found.")
+
+    comment = db.get(Comment, audio.comment_id)
+    issue = db.get(Issue, comment.issue_id) if comment else None
+    track = db.get(Track, issue.track_id) if issue else None
+    if not track:
+        raise HTTPException(status_code=404, detail="Associated track not found.")
+    ensure_track_visibility(track, user, db)
+
+    if audio.storage_backend == "r2":
+        from app.services.r2 import generate_download_url
+
+        url = generate_download_url(audio.file_path)
+        return RedirectResponse(url, status_code=307)
+
+    # Local file
+    file_path = settings.get_upload_path() / audio.file_path
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Audio file missing from disk.")
+    mime_map = {
+        ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+        ".ogg": "audio/ogg", ".aac": "audio/aac", ".m4a": "audio/mp4",
+    }
+    media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
+    return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)

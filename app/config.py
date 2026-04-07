@@ -29,6 +29,18 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:5173"
     INITIAL_ADMIN_EMAIL: str = ""
 
+    # Cloudflare R2 (S3-compatible) storage
+    R2_ENABLED: bool = False
+    R2_ACCOUNT_ID: str = ""
+    R2_ACCESS_KEY_ID: str = ""
+    R2_SECRET_ACCESS_KEY: str = ""
+    R2_BUCKET_NAME: str = ""
+    R2_PRESIGNED_UPLOAD_EXPIRY: int = 3600    # seconds
+    R2_PRESIGNED_DOWNLOAD_EXPIRY: int = 3600  # seconds
+
+    # Auto-cleanup: days to keep old source versions after track completion
+    OLD_VERSION_RETENTION_DAYS: int = 7
+
     model_config = {"env_prefix": "AUDIO_MGMT_", "env_file": ".env", "env_file_encoding": "utf-8"}
 
     @model_validator(mode="after")

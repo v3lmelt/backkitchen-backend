@@ -189,15 +189,26 @@ async def upload_logo(
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
-    upload_dir = settings.get_upload_path()
     ext = (Path(file.filename or "logo.jpg").suffix or ".jpg").lower()
     if ext not in allowed_extensions:
         raise HTTPException(status_code=400, detail=f"Unsupported image extension: {ext}")
     filename = f"{uuid.uuid4()}{ext}"
-    dest = upload_dir / filename
+    logo_dir = settings.get_upload_path() / "logos"
+    logo_dir.mkdir(parents=True, exist_ok=True)
+    dest = logo_dir / filename
     await stream_upload(file, dest, MAX_IMAGE_UPLOAD_SIZE)
 
-    circle.logo_url = f"/uploads/{filename}"
+    # Remove old logo file
+    if circle.logo_url:
+        old_rel = circle.logo_url.lstrip("/")
+        # Handle both legacy "/uploads/x" and new "logos/x" formats
+        if old_rel.startswith("uploads/"):
+            old_rel = old_rel[len("uploads/"):]
+        old_path = settings.get_upload_path() / old_rel
+        if old_path.exists():
+            old_path.unlink(missing_ok=True)
+
+    circle.logo_url = f"logos/{filename}"
     db.commit()
     db.refresh(circle)
     return _circle_to_read(circle)

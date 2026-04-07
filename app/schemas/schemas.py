@@ -492,3 +492,50 @@ class IssueBatchUpdate(BaseModel):
     issue_ids: list[int]
     status: IssueStatus
     status_note: str | None = None
+
+
+# ── R2 presigned upload schemas ──────────────────────────────────────────────
+
+class RequestUploadParams(BaseModel):
+    filename: str
+    content_type: str
+    file_size: int
+
+
+class RequestTrackUploadParams(RequestUploadParams):
+    album_id: int
+    title: str
+    artist: str
+    bpm: int | None = None
+
+
+class PresignedUploadResponse(BaseModel):
+    upload_url: str
+    object_key: str
+    upload_id: str
+    expires_in: int
+
+
+class ConfirmUploadParams(BaseModel):
+    upload_id: str
+    object_key: str
+    duration: float | None = None
+
+
+class ConfirmTrackUploadParams(ConfirmUploadParams):
+    album_id: int
+    title: str
+    artist: str
+    bpm: int | None = None
+
+
+class RequestCommentAudioUploadParams(BaseModel):
+    files: list[RequestUploadParams]
+
+
+class PresignedCommentAudioResponse(BaseModel):
+    uploads: list[PresignedUploadResponse]
+
+
+class AppConfigResponse(BaseModel):
+    r2_enabled: bool
