@@ -369,8 +369,25 @@ _CLEANUP_INTERVAL = 3600  # seconds (1 hour)
 _cleanup_logger = logging.getLogger("cleanup")
 
 
+def _delete_file(file_path: str, storage_backend: str) -> None:
+    """Delete a single audio file from local disk or R2."""
+    if storage_backend == "r2":
+        from app.services.r2 import delete_object
+        delete_object(file_path)
+    else:
+        p = Path(file_path)
+        if not p.is_absolute():
+            p = settings.get_upload_path() / p
+        p.unlink(missing_ok=True)
+
+
 def _run_expired_source_cleanup() -> int:
-    """Delete audio files for expired TrackSourceVersion records. Returns count."""
+    """Delete audio files for expired TrackSourceVersion records.
+
+    Also cleans up the parent track's file_path for finally-rejected tracks
+    once all their source versions have been cleaned.  Returns count.
+    """
+    from app.models.track import RejectionMode, Track, TrackStatus
     from app.models.track_source_version import TrackSourceVersion
 
     db = SessionLocal()
@@ -385,20 +402,35 @@ def _run_expired_source_cleanup() -> int:
             )
         ).all())
 
+        # Track IDs whose source versions we cleaned — check parent track too
+        affected_track_ids: set[int] = set()
+
         for sv in expired:
             try:
-                if sv.storage_backend == "r2":
-                    from app.services.r2 import delete_object
-                    delete_object(sv.file_path)
-                else:
-                    p = Path(sv.file_path)
-                    if not p.is_absolute():
-                        p = settings.get_upload_path() / p
-                    p.unlink(missing_ok=True)
+                _delete_file(sv.file_path, sv.storage_backend)
                 sv.file_path = None
                 cleaned += 1
+                affected_track_ids.add(sv.track_id)
             except Exception:
                 _cleanup_logger.warning("Failed to clean up %s", sv.file_path, exc_info=True)
+
+        # Clean up track.file_path for finally-rejected tracks
+        if affected_track_ids:
+            tracks = list(db.scalars(
+                select(Track).where(
+                    Track.id.in_(affected_track_ids),
+                    Track.status == TrackStatus.REJECTED,
+                    Track.rejection_mode == RejectionMode.FINAL,
+                    Track.file_path.isnot(None),
+                )
+            ).all())
+            for track in tracks:
+                try:
+                    _delete_file(track.file_path, track.storage_backend)
+                    track.file_path = None
+                    cleaned += 1
+                except Exception:
+                    _cleanup_logger.warning("Failed to clean up track %d file", track.id, exc_info=True)
 
         if cleaned:
             db.commit()
