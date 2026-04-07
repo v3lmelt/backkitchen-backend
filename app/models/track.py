@@ -40,6 +40,7 @@ class Track(Base):
         Integer, ForeignKey("users.id"), nullable=True, index=True
     )
     file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    storage_backend: Mapped[str] = mapped_column(String(10), nullable=False, default="local")
     duration: Mapped[float | None] = mapped_column(Float, nullable=True)
     bpm: Mapped[int | None] = mapped_column(Integer, nullable=True)
     track_number: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -16,6 +16,7 @@ class MasterDelivery(Base):
     workflow_cycle: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     delivery_number: Mapped[int] = mapped_column(Integer, nullable=False)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(10), nullable=False, default="local")
     uploaded_by_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("users.id"), nullable=True, index=True
     )

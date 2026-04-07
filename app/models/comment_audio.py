@@ -12,6 +12,7 @@ class CommentAudio(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     comment_id: Mapped[int] = mapped_column(Integer, ForeignKey("comments.id"), nullable=False, index=True)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(10), nullable=False, default="local")
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     duration: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
