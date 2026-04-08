@@ -52,6 +52,7 @@ from app.workflow import (
     ensure_track_visibility,
     get_all_album_member_ids,
     get_album_member_ids,
+    is_album_completed,
     log_track_event,
 )
 
@@ -540,21 +541,38 @@ def list_tracks(
         }
         albums_by_id = {alb.id: alb for alb in albums}
 
-    stmt = select(Track).where(Track.archived_at.is_(None)).order_by(Track.id).limit(limit).offset(offset)
+    stmt = (
+        select(Track)
+        .where(Track.archived_at.is_(None), Track.status != TrackStatus.REJECTED)
+        .order_by(Track.id)
+        .limit(limit)
+        .offset(offset)
+    )
     if status_filter is not None:
         stmt = stmt.where(Track.status == status_filter)
     if album_id is not None:
         stmt = stmt.where(Track.album_id == album_id)
     tracks = list(db.scalars(stmt).all())
+
+    _completed_cache: dict[int, bool] = {}
+
     results: list[TrackListItem] = []
     for track in tracks:
-        if track.submitter_id != current_user.id and track.album_id not in visible_album_ids and track.peer_reviewer_id != current_user.id:
-            continue
-        if track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.FINAL:
-            continue
         alb = albums_by_id.get(track.album_id)
         if alb is None:
             continue
+        if track.album_id not in visible_album_ids:
+            if track.submitter_id != current_user.id and track.peer_reviewer_id != current_user.id:
+                continue
+        else:
+            # Member-level visibility: privileged roles see all, others only own/reviewer
+            is_privileged = current_user.id in (alb.producer_id, alb.mastering_engineer_id)
+            is_own = track.submitter_id == current_user.id or track.peer_reviewer_id == current_user.id
+            if not is_privileged and not is_own:
+                if track.album_id not in _completed_cache:
+                    _completed_cache[track.album_id] = is_album_completed(db, track.album_id)
+                if not _completed_cache[track.album_id]:
+                    continue
         results.append(_track_list_item(track, current_user, alb))
     return results
 
