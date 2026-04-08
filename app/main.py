@@ -42,7 +42,7 @@ from app.models import (  # noqa: F401
 from app.routers import admin as admin_router
 from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users, workflow_templates
 from app.security import _decode_token, hash_password
-from app.workflow import log_track_event
+from app.workflow import is_album_completed, log_track_event
 
 
 class ConnectionManager:
@@ -611,10 +611,15 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
                 select(AlbumMember.user_id).where(AlbumMember.album_id == album.id)
             ).all()
         )
-        has_access = user.id in (
-            {album.producer_id, album.mastering_engineer_id, track.submitter_id, track.peer_reviewer_id}
-            | member_ids
-        )
+        is_privileged = user.id in (album.producer_id, album.mastering_engineer_id)
+        is_track_stakeholder = user.id in (track.submitter_id, track.peer_reviewer_id)
+        is_member = user.id in member_ids
+        if is_privileged or is_track_stakeholder:
+            has_access = True
+        elif is_member:
+            has_access = is_album_completed(db, album.id)
+        else:
+            has_access = False
         if not has_access:
             await websocket.close(code=4003)
             return

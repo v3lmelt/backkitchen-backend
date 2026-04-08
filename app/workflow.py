@@ -3,7 +3,7 @@ import random
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.album import Album
@@ -84,13 +84,44 @@ def ensure_album_visibility(album: Album, user: User, db: Session) -> None:
         )
 
 
+def is_album_completed(db: Session, album_id: int) -> bool:
+    """True when every active (non-archived, non-rejected) track is completed."""
+    total, completed = db.execute(
+        select(
+            func.count(Track.id),
+            func.count(case((Track.status == TrackStatus.COMPLETED, Track.id))),
+        ).where(
+            Track.album_id == album_id,
+            Track.archived_at.is_(None),
+            Track.status != TrackStatus.REJECTED,
+        )
+    ).one()
+    return total > 0 and total == completed
+
+
 def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
     album = db.get(Album, track.album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if track.submitter_id == user.id or track.peer_reviewer_id == user.id:
+    # Producer and mastering engineer always have access
+    if user.id in (album.producer_id, album.mastering_engineer_id):
         return album
-    ensure_album_visibility(album, user, db)
+    # Submitter and peer reviewer of this specific track always have access
+    if user.id == track.submitter_id or user.id == track.peer_reviewer_id:
+        return album
+    # Must be an album member
+    member_ids = get_album_member_ids(db, album.id)
+    if user.id not in member_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this album.",
+        )
+    # Regular members can see all tracks only after album is completed
+    if not is_album_completed(db, album.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this track.",
+        )
     return album
 
 

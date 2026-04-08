@@ -16,14 +16,14 @@ from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.circle import CircleMember
 from app.models.issue import Issue, IssueStatus
-from app.models.track import RejectionMode, Track, TrackStatus
+from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WorkflowConfigSchema
 from app.security import get_current_user
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
-from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids
+from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
@@ -48,7 +48,8 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
     track_count = db.scalar(
         select(func.count()).select_from(Track).where(
             Track.album_id == album.id,
-            ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
+            Track.archived_at.is_(None),
+            Track.status != TrackStatus.REJECTED,
         )
     ) or 0
     template_name = None
@@ -295,7 +296,7 @@ def get_album_stats(
         .where(
             Track.album_id == album_id,
             Track.archived_at.is_(None),
-            ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
+            Track.status != TrackStatus.REJECTED,
         )
         .group_by(Track.status)
     ).all()
@@ -309,7 +310,7 @@ def get_album_stats(
             select(Track).where(
                 Track.album_id == album_id,
                 Track.archived_at.is_(None),
-                ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
+                Track.status != TrackStatus.REJECTED,
             )
         ).all())
 
@@ -375,12 +376,19 @@ def list_album_tracks(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
 
-    tracks = list(db.scalars(
-        select(Track).where(
-            Track.album_id == album_id,
-            Track.archived_at.is_(None),
-            ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
+    filters = [
+        Track.album_id == album_id,
+        Track.archived_at.is_(None),
+        Track.status != TrackStatus.REJECTED,
+    ]
+    is_privileged = current_user.id in (album.producer_id, album.mastering_engineer_id)
+    if not is_privileged and not is_album_completed(db, album_id):
+        filters.append(
+            (Track.submitter_id == current_user.id) | (Track.peer_reviewer_id == current_user.id)
         )
+
+    tracks = list(db.scalars(
+        select(Track).where(*filters)
         .order_by(Track.track_number.asc().nulls_last(), Track.id)
     ).all())
     return [build_track_read(track, current_user, album) for track in tracks]
