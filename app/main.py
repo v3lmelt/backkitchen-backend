@@ -3,7 +3,7 @@ import json
 import logging
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from alembic import command as alembic_command
@@ -446,8 +446,50 @@ def _run_expired_source_cleanup() -> int:
     return cleaned
 
 
+_ARCHIVE_CLEANUP_BATCH = 50
+
+
+def _run_archived_track_cleanup() -> int:
+    """Hard-delete tracks whose archived_at exceeded the retention period.
+
+    Deletes all associated DB records (cascade) and audio files on disk/R2.
+    Each track is committed individually so a failure doesn't poison the session.
+    Returns the number of tracks deleted.
+    """
+    from app.models.track import ARCHIVE_RETENTION_DAYS, Track
+    from app.services.cleanup import cleanup_files, collect_track_files
+
+    db = SessionLocal()
+    deleted = 0
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=ARCHIVE_RETENTION_DAYS)
+        expired_ids = list(db.scalars(
+            select(Track.id).where(
+                Track.archived_at.isnot(None),
+                Track.archived_at < cutoff,
+            ).limit(_ARCHIVE_CLEANUP_BATCH)
+        ).all())
+
+        for track_id in expired_ids:
+            try:
+                track = db.get(Track, track_id)
+                if track is None:
+                    continue
+                local_paths, r2_keys = collect_track_files(track)
+                db.delete(track)
+                db.commit()
+                cleanup_files(local_paths, r2_keys)
+                deleted += 1
+            except Exception:
+                db.rollback()
+                _cleanup_logger.warning("Failed to hard-delete archived track %d", track_id, exc_info=True)
+    finally:
+        db.close()
+    return deleted
+
+
 async def _periodic_cleanup() -> None:
-    """Background loop that cleans up expired source versions every hour."""
+    """Background loop that cleans up expired source versions and archived tracks every hour."""
     while True:
         await asyncio.sleep(_CLEANUP_INTERVAL)
         try:
@@ -455,7 +497,13 @@ async def _periodic_cleanup() -> None:
             if count:
                 _cleanup_logger.info("Cleaned up %d expired source version files", count)
         except Exception:
-            _cleanup_logger.warning("Periodic cleanup failed", exc_info=True)
+            _cleanup_logger.warning("Periodic source cleanup failed", exc_info=True)
+        try:
+            count = _run_archived_track_cleanup()
+            if count:
+                _cleanup_logger.info("Hard-deleted %d expired archived tracks", count)
+        except Exception:
+            _cleanup_logger.warning("Periodic archive cleanup failed", exc_info=True)
 
 
 @asynccontextmanager
