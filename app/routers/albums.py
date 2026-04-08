@@ -51,6 +51,10 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
             ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
         )
     ) or 0
+    template_name = None
+    if album.workflow_template_id and album.workflow_template:
+        template_name = album.workflow_template.name
+
     return AlbumRead(
         id=album.id,
         title=album.title,
@@ -67,6 +71,8 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         deadline=album.deadline,
         phase_deadlines=phase_deadlines,
         workflow_config=workflow_config,
+        workflow_template_id=album.workflow_template_id,
+        workflow_template_name=template_name,
         created_at=album.created_at,
         updated_at=album.updated_at,
         track_count=track_count,
@@ -89,11 +95,14 @@ def create_album(
     album_data = payload.model_dump()
     genres = album_data.pop("genres", None)
     wf_config = album_data.pop("workflow_config", None)
+    wf_template_id = album_data.pop("workflow_template_id", None)
     album = Album(**album_data, producer_id=current_user.id)
     if genres:
         album.genres = json.dumps(genres, ensure_ascii=False)
     if wf_config is not None:
         album.workflow_config = json.dumps(wf_config, ensure_ascii=False)
+    if wf_template_id is not None:
+        album.workflow_template_id = wf_template_id
     db.add(album)
     db.flush()
     db.add(AlbumMember(album_id=album.id, user_id=current_user.id))

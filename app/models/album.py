@@ -30,6 +30,10 @@ class Album(Base):
     phase_deadlines: Mapped[str | None] = mapped_column(Text, nullable=True)
     webhook_config: Mapped[str | None] = mapped_column(Text, nullable=True)
     workflow_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    workflow_template_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("workflow_templates.id", name="fk_album_workflow_template"),
+        nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
@@ -54,6 +58,9 @@ class Album(Base):
     )
     circle: Mapped["Circle | None"] = relationship(  # noqa: F821
         "Circle", foreign_keys=[circle_id]
+    )
+    workflow_template: Mapped["WorkflowTemplate | None"] = relationship(  # noqa: F821
+        "WorkflowTemplate", foreign_keys=[workflow_template_id]
     )
 
     def __repr__(self) -> str:
