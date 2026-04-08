@@ -2,6 +2,7 @@
 
 import logging
 import tempfile
+import time
 import uuid
 from functools import lru_cache
 from pathlib import Path
@@ -42,17 +43,38 @@ def generate_upload_url(object_key: str, content_type: str) -> str:
     )
 
 
+_download_url_cache: dict[str, tuple[str, float]] = {}
+_DOWNLOAD_URL_CACHE_MARGIN = 300  # re-generate 5 min before expiry
+
+
 def generate_download_url(object_key: str, expires_in: int | None = None) -> str:
-    """Generate a presigned GET URL for downloading/streaming from R2."""
+    """Generate a presigned GET URL for downloading/streaming from R2.
+
+    Presigned URLs are cached per object key so that the same URL is returned
+    within the validity window.  This allows browser HTTP caching to work
+    because the URL (and therefore the cache key) remains stable.
+    """
+    ttl = expires_in or settings.R2_PRESIGNED_DOWNLOAD_EXPIRY
+    now = time.monotonic()
+
+    cached = _download_url_cache.get(object_key)
+    if cached is not None:
+        url, deadline = cached
+        if now < deadline:
+            return url
+
     client = get_r2_client()
-    return client.generate_presigned_url(
+    url = client.generate_presigned_url(
         "get_object",
         Params={
             "Bucket": settings.R2_BUCKET_NAME,
             "Key": object_key,
+            "ResponseCacheControl": f"private, max-age={ttl}, immutable",
         },
-        ExpiresIn=expires_in or settings.R2_PRESIGNED_DOWNLOAD_EXPIRY,
+        ExpiresIn=ttl,
     )
+    _download_url_cache[object_key] = (url, now + ttl - _DOWNLOAD_URL_CACHE_MARGIN)
+    return url
 
 
 def object_exists(object_key: str) -> bool:

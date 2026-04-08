@@ -40,7 +40,7 @@ from app.models import (  # noqa: F401
     User,
 )
 from app.routers import admin as admin_router
-from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users
+from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users, workflow_templates
 from app.security import _decode_token, hash_password
 from app.workflow import log_track_event
 
@@ -508,6 +508,7 @@ app.include_router(checklists.router)
 app.include_router(invitations.router)
 app.include_router(notifications.router)
 app.include_router(discussions.router)
+app.include_router(workflow_templates.router)
 
 try:
     upload_path = settings.get_upload_path()

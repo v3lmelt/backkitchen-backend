@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, func as sqlfunc, select
 from sqlalchemy.orm import Session
 
@@ -167,7 +167,9 @@ def _serve_audio(
 
         url = generate_download_url(file_path)
         if resolve == "json":
-            return {"url": url}
+            resp = JSONResponse({"url": url})
+            resp.headers["Cache-Control"] = f"private, max-age={_AUDIO_CACHE_MAX_AGE}"
+            return resp
         return RedirectResponse(url, status_code=307)
     if resolve == "json":
         return {"url": None}
