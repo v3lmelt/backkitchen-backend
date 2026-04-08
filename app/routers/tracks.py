@@ -540,7 +540,7 @@ def list_tracks(
         }
         albums_by_id = {alb.id: alb for alb in albums}
 
-    stmt = select(Track).order_by(Track.id).limit(limit).offset(offset)
+    stmt = select(Track).where(Track.archived_at.is_(None)).order_by(Track.id).limit(limit).offset(offset)
     if status_filter is not None:
         stmt = stmt.where(Track.status == status_filter)
     if album_id is not None:
@@ -997,71 +997,57 @@ def return_to_mastering(
     return build_track_read(track, current_user, album)
 
 
-def _collect_track_files(track: Track) -> tuple[list[Path], list[str]]:
-    """Collect all file references associated with a track and its children.
-
-    Returns ``(local_paths, r2_keys)`` so callers can clean up both backends.
-    """
-    upload_base = settings.get_upload_path()
-    local_paths: list[Path] = []
-    r2_keys: list[str] = []
-
-    def _add(file_path: str | None, backend: str) -> None:
-        if not file_path:
-            return
-        if backend == "r2":
-            r2_keys.append(file_path)
-        else:
-            local_paths.append(Path(file_path))
-
-    # Current track audio
-    _add(track.file_path, track.storage_backend)
-
-    # All source version audio files
-    for sv in track.source_versions:
-        _add(sv.file_path, sv.storage_backend)
-
-    # All master delivery audio files
-    for md in track.master_deliveries:
-        _add(md.file_path, md.storage_backend)
-
-    # Issue comment images (always local) and audios (local or r2)
-    for issue in track.issues:
-        for comment in issue.comments:
-            for img in comment.images:
-                if img.file_path:
-                    local_paths.append(upload_base / img.file_path)
-            for audio in comment.audios:
-                if not audio.file_path:
-                    continue
-                if audio.storage_backend == "r2":
-                    r2_keys.append(audio.file_path)
-                else:
-                    local_paths.append(upload_base / audio.file_path)
-
-    # Discussion images (always local)
-    for disc in track.discussions:
-        for img in disc.images:
-            if img.file_path:
-                local_paths.append(upload_base / img.file_path)
-
-    return local_paths, r2_keys
+from app.services.cleanup import cleanup_files, collect_track_files
 
 
-def _cleanup_files(local_paths: list[Path], r2_keys: list[str]) -> None:
-    """Delete files from local disk and R2."""
-    for p in local_paths:
-        try:
-            p.unlink(missing_ok=True)
-        except OSError:
-            pass
-    if r2_keys:
-        try:
-            from app.services.r2 import delete_objects
-            delete_objects(r2_keys)
-        except Exception:
-            import logging
-            logging.getLogger(__name__).warning("Failed to delete R2 objects", exc_info=True)
+@router.post("/{track_id}/archive", response_model=TrackRead)
+def archive_track(
+    track_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if current_user.id != album.producer_id:
+        raise HTTPException(status_code=403, detail="Only the album producer can archive tracks.")
+    if track.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Track is already archived.")
+    track.archived_at = datetime.now(timezone.utc)
+    log_track_event(db, track, current_user, "track_archived", payload={"previous_status": track.status})
+    notify(db, [track.submitter_id], "track_archived", "曲目已归档",
+           f"「{track.title}」已被制作人归档", related_track_id=track.id,
+           background_tasks=background_tasks, album_id=track.album_id)
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album)
+
+
+@router.post("/{track_id}/restore", response_model=TrackRead)
+def restore_track(
+    track_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if current_user.id != album.producer_id:
+        raise HTTPException(status_code=403, detail="Only the album producer can restore tracks.")
+    if track.archived_at is None:
+        raise HTTPException(status_code=409, detail="Track is not archived.")
+    track.archived_at = None
+    log_track_event(db, track, current_user, "track_restored")
+    notify(db, [track.submitter_id], "track_restored", "曲目已恢复",
+           f"「{track.title}」已被制作人恢复", related_track_id=track.id,
+           background_tasks=background_tasks, album_id=track.album_id)
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album)
 
 
 @router.delete("/{track_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1077,10 +1063,10 @@ def delete_track(
     if current_user.id not in {track.submitter_id, album.producer_id}:
         raise HTTPException(status_code=403, detail="Only the submitter or producer can delete this track.")
     # Collect all file paths before cascade-deleting DB records
-    local_paths, r2_keys = _collect_track_files(track)
+    local_paths, r2_keys = collect_track_files(track)
     db.delete(track)
     db.commit()
-    _cleanup_files(local_paths, r2_keys)
+    cleanup_files(local_paths, r2_keys)
 
 
 def _resolve_audio_user(

@@ -6,6 +6,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
+ARCHIVE_RETENTION_DAYS = 14
+
 
 class TrackStatus(str, enum.Enum):
     SUBMITTED = "submitted"
@@ -64,6 +66,7 @@ class Track(Base):
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None, index=True)
 
     album: Mapped["Album"] = relationship("Album", back_populates="tracks")  # noqa: F821
     submitter: Mapped["User | None"] = relationship(  # noqa: F821

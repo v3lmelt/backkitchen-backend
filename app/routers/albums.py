@@ -294,6 +294,7 @@ def get_album_stats(
         select(Track.status, sqlfunc.count(Track.id))
         .where(
             Track.album_id == album_id,
+            Track.archived_at.is_(None),
             ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
         )
         .group_by(Track.status)
@@ -307,6 +308,7 @@ def get_album_stats(
         tracks = list(db.scalars(
             select(Track).where(
                 Track.album_id == album_id,
+                Track.archived_at.is_(None),
                 ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
             )
         ).all())
@@ -376,9 +378,33 @@ def list_album_tracks(
     tracks = list(db.scalars(
         select(Track).where(
             Track.album_id == album_id,
+            Track.archived_at.is_(None),
             ~((Track.status == TrackStatus.REJECTED) & (Track.rejection_mode == RejectionMode.FINAL)),
         )
         .order_by(Track.track_number.asc().nulls_last(), Track.id)
+    ).all())
+    return [build_track_read(track, current_user, album) for track in tracks]
+
+
+@router.get("/{album_id}/archived-tracks", response_model=list[TrackRead])
+def list_archived_tracks(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[TrackRead]:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    ensure_album_visibility(album, current_user, db)
+    if current_user.id != album.producer_id:
+        raise HTTPException(status_code=403, detail="Only the album producer can view archived tracks.")
+
+    tracks = list(db.scalars(
+        select(Track).where(
+            Track.album_id == album_id,
+            Track.archived_at.isnot(None),
+        )
+        .order_by(Track.archived_at.desc())
     ).all())
     return [build_track_read(track, current_user, album) for track in tracks]
 

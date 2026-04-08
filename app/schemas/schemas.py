@@ -285,6 +285,7 @@ class TrackRead(TrackBase):
     mastering_engineer_id: int | None = None
     created_at: datetime
     updated_at: datetime
+    archived_at: datetime | None = None
     issue_count: int = 0
     open_issue_count: int = 0
     submitter: UserRead | None = None
