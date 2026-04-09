@@ -20,9 +20,22 @@ env/
 # Database
 *.db
 *.sqlite3
+*.db-shm
+*.db-wal
 
 # Uploaded audio files
 uploads/
+
+# Test / coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# Dev run logs / stray pip output
+dev-backend.log
+dev-backend.err.log
+=*
 
 # IDE
 .vscode/
