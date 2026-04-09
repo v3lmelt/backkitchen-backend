@@ -11,6 +11,7 @@ from app.models.invitation import Invitation
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.master_delivery import MasterDelivery
 from app.models.notification import Notification
+from app.models.password_reset import PasswordResetToken
 from app.models.reopen_request import ReopenRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
@@ -39,6 +40,7 @@ __all__ = [
     "MarkerType",
     "MasterDelivery",
     "Notification",
+    "PasswordResetToken",
     "ReopenRequest",
     "RejectionMode",
     "StageAssignment",

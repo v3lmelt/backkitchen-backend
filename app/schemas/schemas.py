@@ -54,6 +54,15 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=8)
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(..., min_length=3)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8)
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str

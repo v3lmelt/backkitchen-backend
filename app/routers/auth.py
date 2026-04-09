@@ -10,18 +10,21 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.email_verification import EmailVerificationToken
+from app.models.password_reset import PasswordResetToken
 from app.models.user import User
 from app.schemas.schemas import (
     AuthResponse,
     ChangePasswordRequest,
+    ForgotPasswordRequest,
     LoginRequest,
     RegisterRequest,
     RegisterResponse,
+    ResetPasswordRequest,
     UserRead,
     UserUpdateProfile,
 )
 from app.security import create_access_token, get_current_user, hash_password, verify_password
-from app.services.email import send_verification_email
+from app.services.email import send_password_reset_email, send_verification_email
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 _DUMMY_HASH = hash_password("__dummy_timing_guard__")
 
 _VERIFICATION_TOKEN_EXPIRE_MINUTES = 30
+_PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 60
 
 
 def _build_auth_response(user: User) -> AuthResponse:
@@ -144,6 +148,72 @@ def resend_verification(email: str, db: Session = Depends(get_db)) -> None:
         return
     token = _create_verification_token(email, db)
     send_verification_email(email, token)
+
+
+def _create_password_reset_token(email: str, db: Session) -> str:
+    # Invalidate any existing unused tokens for this email
+    existing = db.scalars(
+        select(PasswordResetToken).where(
+            PasswordResetToken.email == email,
+            PasswordResetToken.used.is_(False),
+        )
+    ).all()
+    for t in existing:
+        t.used = True
+
+    token = secrets.token_urlsafe(48)
+    record = PasswordResetToken(
+        token=token,
+        email=email,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=_PASSWORD_RESET_TOKEN_EXPIRE_MINUTES),
+    )
+    db.add(record)
+    db.commit()
+    return token
+
+
+@router.post("/forgot-password", status_code=status.HTTP_204_NO_CONTENT)
+def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)) -> None:
+    """Request a password reset email.
+
+    Always returns 204 regardless of whether the email exists, to avoid enumeration.
+    """
+    user = db.scalars(select(User).where(User.email == payload.email)).first()
+    if user is None or not user.email_verified:
+        return
+    token = _create_password_reset_token(payload.email, db)
+    send_password_reset_email(payload.email, token)
+
+
+@router.post("/reset-password", response_model=AuthResponse)
+def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)) -> AuthResponse:
+    record = db.scalars(
+        select(PasswordResetToken).where(PasswordResetToken.token == payload.token)
+    ).first()
+    if record is None or record.used:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset link.",
+        )
+    now = datetime.now(timezone.utc)
+    expires = record.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if now > expires:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Reset link has expired.",
+        )
+
+    user = db.scalars(select(User).where(User.email == record.email)).first()
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    user.password = hash_password(payload.new_password)
+    record.used = True
+    db.commit()
+    db.refresh(user)
+    return _build_auth_response(user)
 
 
 @router.get("/me", response_model=UserRead)
