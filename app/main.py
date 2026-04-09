@@ -438,8 +438,46 @@ def _run_archived_track_cleanup() -> int:
     return deleted
 
 
+def _run_archived_album_cleanup() -> int:
+    """Hard-delete albums whose archived_at exceeded the retention period.
+
+    Cascade-deletes all tracks, members, invitations, etc., and cleans up
+    files from disk/R2. Returns the number of albums deleted.
+    """
+    from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS
+    from app.services.cleanup import cleanup_files, collect_album_files
+
+    db = SessionLocal()
+    deleted = 0
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=ALBUM_ARCHIVE_RETENTION_DAYS)
+        expired_ids = list(db.scalars(
+            select(Album.id).where(
+                Album.archived_at.isnot(None),
+                Album.archived_at < cutoff,
+            ).limit(_ARCHIVE_CLEANUP_BATCH)
+        ).all())
+
+        for album_id in expired_ids:
+            try:
+                album = db.get(Album, album_id)
+                if album is None:
+                    continue
+                local_paths, r2_keys = collect_album_files(album)
+                db.delete(album)
+                db.commit()
+                cleanup_files(local_paths, r2_keys)
+                deleted += 1
+            except Exception:
+                db.rollback()
+                _cleanup_logger.warning("Failed to hard-delete archived album %d", album_id, exc_info=True)
+    finally:
+        db.close()
+    return deleted
+
+
 async def _periodic_cleanup() -> None:
-    """Background loop that cleans up expired source versions and archived tracks every hour."""
+    """Background loop that cleans up expired source versions and archived tracks/albums every hour."""
     while True:
         await asyncio.sleep(_CLEANUP_INTERVAL)
         try:
@@ -454,6 +492,12 @@ async def _periodic_cleanup() -> None:
                 _cleanup_logger.info("Hard-deleted %d expired archived tracks", count)
         except Exception:
             _cleanup_logger.warning("Periodic archive cleanup failed", exc_info=True)
+        try:
+            count = _run_archived_album_cleanup()
+            if count:
+                _cleanup_logger.info("Hard-deleted %d expired archived albums", count)
+        except Exception:
+            _cleanup_logger.warning("Periodic album archive cleanup failed", exc_info=True)
 
 
 @asynccontextmanager

@@ -107,6 +107,8 @@ class AlbumCreate(AlbumBase):
 
 
 class AlbumMetadataUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
     release_date: date | None = None
     catalog_number: str | None = Field(default=None, max_length=50)
     circle_name: str | None = Field(default=None, max_length=200)
@@ -169,6 +171,7 @@ class AlbumRead(AlbumBase):
     workflow_template_name: str | None = None
     created_at: datetime
     updated_at: datetime
+    archived_at: datetime | None = None
     track_count: int = 0
     producer: UserRead | None = None
     mastering_engineer: UserRead | None = None

@@ -2,9 +2,27 @@ import logging
 from pathlib import Path
 
 from app.config import settings
+from app.models.album import Album
 from app.models.track import Track
 
 logger = logging.getLogger(__name__)
+
+
+def collect_album_files(album: Album) -> tuple[list[Path], list[str]]:
+    """Collect all file references for an album (cover + all tracks' files)."""
+    upload_base = settings.get_upload_path()
+    local_paths: list[Path] = []
+    r2_keys: list[str] = []
+
+    if album.cover_image:
+        local_paths.append(upload_base / album.cover_image)
+
+    for track in album.tracks:
+        track_local, track_r2 = collect_track_files(track)
+        local_paths.extend(track_local)
+        r2_keys.extend(track_r2)
+
+    return local_paths, r2_keys
 
 
 def collect_track_files(track: Track) -> tuple[list[Path], list[str]]:

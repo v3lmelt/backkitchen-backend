@@ -5,6 +5,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
+ALBUM_ARCHIVE_RETENTION_DAYS = 14
+
 
 class Album(Base):
     __tablename__ = "albums"
@@ -42,6 +44,9 @@ class Album(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, default=None, index=True
     )
 
     tracks: Mapped[list["Track"]] = relationship(  # noqa: F821
