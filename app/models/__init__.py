@@ -8,9 +8,11 @@ from app.models.comment_audio import CommentAudio
 from app.models.discussion import TrackDiscussion, TrackDiscussionImage
 from app.models.comment_image import CommentImage
 from app.models.invitation import Invitation
-from app.models.issue import Issue, IssuePhase, IssueSeverity, IssueStatus, IssueType
+from app.models.issue import Issue, IssueMarker, IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.master_delivery import MasterDelivery
 from app.models.notification import Notification
+from app.models.reopen_request import ReopenRequest
+from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
@@ -33,10 +35,13 @@ __all__ = [
     "IssuePhase",
     "IssueSeverity",
     "IssueStatus",
-    "IssueType",
+    "IssueMarker",
+    "MarkerType",
     "MasterDelivery",
     "Notification",
+    "ReopenRequest",
     "RejectionMode",
+    "StageAssignment",
     "Track",
     "TrackDiscussion",
     "TrackDiscussionImage",

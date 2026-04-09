@@ -28,6 +28,7 @@ from app.schemas.schemas import (
     DiscussionImageRead,
     DiscussionRead,
     IssueDetail,
+    IssueMarkerRead,
     IssueRead,
     MasterDeliveryRead,
     TrackDetailResponse,
@@ -142,13 +143,14 @@ def current_master_delivery(track: Track) -> MasterDelivery | None:
 
 
 def track_allowed_actions(
-    track: Track, user: User, album: Album, *, _wf_config: dict | None = None,
+    track: Track, user: User, album: Album, *,
+    _wf_config: dict | None = None, db: Session | None = None,
 ) -> list[str]:
     if album.workflow_config:
         from app.workflow_engine import get_allowed_action_names, parse_workflow_config
 
         config = _wf_config or parse_workflow_config(album)
-        return get_allowed_action_names(config, track, user, album)
+        return get_allowed_action_names(config, track, user, album, db=db)
 
     # Legacy hardcoded logic for albums without custom workflow
     actions: list[str] = []
@@ -199,7 +201,7 @@ def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead
     return MasterDeliveryRead.model_validate(delivery)
 
 
-def build_track_read(track: Track, user: User, album: Album) -> TrackRead:
+def build_track_read(track: Track, user: User, album: Album, db: Session | None = None) -> TrackRead:
     current_source = current_source_version(track)
     current_master = current_master_delivery(track)
     open_issue_count = sum(1 for i in track.issues if i.status == IssueStatus.OPEN)
@@ -227,8 +229,14 @@ def build_track_read(track: Track, user: User, album: Album) -> TrackRead:
                 transitions=step.transitions,
                 return_to=step.return_to,
                 revision_step=step.revision_step,
+                allow_permanent_reject=step.allow_permanent_reject,
+                assignment_mode=step.assignment_mode,
+                reviewer_pool=step.reviewer_pool,
+                required_reviewer_count=step.required_reviewer_count,
+                assignee_user_id=step.assignee_user_id,
+                require_confirmation=step.require_confirmation,
             )
-        transitions = get_allowed_transitions(wf_config, track, user, album)
+        transitions = get_allowed_transitions(wf_config, track, user, album, db=db)
         if transitions:
             workflow_transitions = [
                 {"decision": t.decision, "label": t.label} for t in transitions
@@ -259,7 +267,7 @@ def build_track_read(track: Track, user: User, album: Album) -> TrackRead:
         peer_reviewer=_user_read(track.peer_reviewer),
         current_source_version=_source_version_read(current_source),
         current_master_delivery=_master_delivery_read(current_master),
-        allowed_actions=track_allowed_actions(track, user, album, _wf_config=wf_config),
+        allowed_actions=track_allowed_actions(track, user, album, _wf_config=wf_config, db=db),
         workflow_step=workflow_step,
         workflow_transitions=workflow_transitions,
     )
@@ -282,6 +290,7 @@ def build_issue_read(
         else:
             source_version = db.get(TrackSourceVersion, issue.source_version_id)
             source_version_number = source_version.version_number if source_version else None
+    markers = [IssueMarkerRead.model_validate(m) for m in issue.markers]
     return IssueRead(
         id=issue.id,
         track_id=issue.track_id,
@@ -293,11 +302,9 @@ def build_issue_read(
         master_delivery_id=issue.master_delivery_id,
         title=issue.title,
         description=issue.description,
-        issue_type=issue.issue_type,
         severity=issue.severity,
         status=issue.status,
-        time_start=issue.time_start,
-        time_end=issue.time_end,
+        markers=markers,
         created_at=issue.created_at,
         updated_at=issue.updated_at,
         comment_count=len(issue.comments),
@@ -387,6 +394,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         select(Track)
         .where(Track.id == track.id)
         .options(
+            selectinload(Track.issues).selectinload(Issue.markers),
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.images),
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.audios),
             selectinload(Track.workflow_events),

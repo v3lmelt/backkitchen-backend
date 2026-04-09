@@ -19,7 +19,7 @@ from app.database import Base, get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
-from app.models.issue import Issue, IssuePhase, IssueSeverity, IssueStatus, IssueType
+from app.models.issue import Issue, IssueMarker, IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.master_delivery import MasterDelivery
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
@@ -266,8 +266,15 @@ class Factory:
         source_version_id: int | None = None,
         master_delivery_id: int | None = None,
         workflow_cycle: int | None = None,
-        issue_type: IssueType = IssueType.POINT,
+        marker_type: MarkerType = MarkerType.POINT,
     ) -> Issue:
+        markers = [
+            IssueMarker(
+                marker_type=marker_type,
+                time_start=12.3,
+                time_end=18.0 if marker_type == MarkerType.RANGE else None,
+            )
+        ]
         issue = Issue(
             track_id=track.id,
             author_id=author.id,
@@ -277,11 +284,9 @@ class Factory:
             master_delivery_id=master_delivery_id,
             title=self._next("issue"),
             description="issue description",
-            issue_type=issue_type,
             severity=IssueSeverity.MAJOR,
             status=status,
-            time_start=12.3,
-            time_end=18.0 if issue_type == IssueType.RANGE else None,
+            markers=markers,
         )
         self.session.add(issue)
         self.session.commit()

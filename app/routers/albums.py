@@ -486,6 +486,44 @@ async def test_webhook(
     return {"success": success}
 
 
+@router.get("/{album_id}/workflow", response_model=WorkflowConfigSchema)
+def get_workflow_config(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> WorkflowConfigSchema:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    ensure_album_visibility(album, current_user, db)
+    if album.workflow_config:
+        return WorkflowConfigSchema(**json.loads(album.workflow_config))
+    from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
+    return WorkflowConfigSchema(**DEFAULT_WORKFLOW_CONFIG)
+
+
+@router.put("/{album_id}/workflow", response_model=dict)
+def update_workflow_config(
+    album_id: int,
+    payload: WorkflowConfigSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    from app.workflow_engine import migrate_tracks_on_workflow_change, parse_workflow_config
+
+    album = ensure_album_producer(album_id, current_user, db)
+
+    old_config = parse_workflow_config(album)
+    new_config = payload.model_dump()
+
+    album.workflow_config = json.dumps(new_config, ensure_ascii=False)
+    migrations = migrate_tracks_on_workflow_change(db, album, old_config, new_config)
+
+    db.commit()
+    db.refresh(album)
+    return {"ok": True, "migrations": migrations}
+
+
 @router.get("/{album_id}/export")
 def export_album(
     album_id: int,

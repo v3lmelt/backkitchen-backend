@@ -30,7 +30,6 @@ from app.models import (  # noqa: F401
     IssuePhase,
     IssueSeverity,
     IssueStatus,
-    IssueType,
     MasterDelivery,
     Notification,
     RejectionMode,
@@ -147,8 +146,6 @@ def _run_sqlite_compat_migrations() -> None:
             conn.execute(text("UPDATE tracks SET status = 'completed' WHERE lower(status) = 'approved' OR status = 'APPROVED'"))
 
         if "issues" in columns_by_table:
-            conn.execute(text("UPDATE issues SET issue_type = 'point' WHERE lower(issue_type) = 'point' OR issue_type = 'POINT'"))
-            conn.execute(text("UPDATE issues SET issue_type = 'range' WHERE lower(issue_type) = 'range' OR issue_type = 'RANGE'"))
             conn.execute(text("UPDATE issues SET severity = 'critical' WHERE lower(severity) = 'critical' OR severity = 'CRITICAL'"))
             conn.execute(text("UPDATE issues SET severity = 'major' WHERE lower(severity) = 'major' OR severity = 'MAJOR'"))
             conn.execute(text("UPDATE issues SET severity = 'minor' WHERE lower(severity) = 'minor' OR severity = 'MINOR'"))

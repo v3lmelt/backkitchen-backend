@@ -31,15 +31,17 @@ def test_create_peer_issue_binds_to_current_source_version(client, db_session, f
             "title": "Clicks at intro",
             "description": "Please clean this up.",
             "phase": "peer",
-            "issue_type": "point",
             "severity": "major",
-            "time_start": 1.2,
+            "markers": [{"marker_type": "point", "time_start": 1.2}],
         },
     )
 
     assert response.status_code == 201
     assert response.json()["phase"] == IssuePhase.PEER.value
     assert response.json()["source_version_id"] == latest_version.id
+    assert len(response.json()["markers"]) == 1
+    assert response.json()["markers"][0]["marker_type"] == "point"
+    assert response.json()["markers"][0]["time_start"] == 1.2
 
 
 def test_create_final_review_issue_binds_to_current_delivery(client, factory, auth_headers):
@@ -57,9 +59,8 @@ def test_create_final_review_issue_binds_to_current_delivery(client, factory, au
             "title": "Master too bright",
             "description": "The top end feels sharp.",
             "phase": "final_review",
-            "issue_type": "point",
             "severity": "major",
-            "time_start": 9.5,
+            "markers": [{"marker_type": "point", "time_start": 9.5}],
         },
     )
 
@@ -67,7 +68,71 @@ def test_create_final_review_issue_binds_to_current_delivery(client, factory, au
     assert response.json()["master_delivery_id"] == delivery.id
 
 
-def test_create_range_issue_requires_time_end(client, factory, auth_headers):
+def test_create_general_issue_no_markers(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.PEER_REVIEW,
+        peer_reviewer=reviewer,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        json={
+            "title": "Overall mix too bright",
+            "description": "The whole track feels harsh.",
+            "phase": "peer",
+            "severity": "major",
+            "markers": [],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["markers"] == []
+
+
+def test_create_multi_marker_issue(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.PEER_REVIEW,
+        peer_reviewer=reviewer,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        json={
+            "title": "Clicks in multiple places",
+            "description": "Clicks at intro and bridge.",
+            "phase": "peer",
+            "severity": "major",
+            "markers": [
+                {"marker_type": "point", "time_start": 1.2},
+                {"marker_type": "range", "time_start": 30.0, "time_end": 45.0},
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    assert len(response.json()["markers"]) == 2
+    assert response.json()["markers"][0]["marker_type"] == "point"
+    assert response.json()["markers"][1]["marker_type"] == "range"
+    assert response.json()["markers"][1]["time_end"] == 45.0
+
+
+def test_create_range_marker_requires_time_end(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user()
@@ -87,9 +152,8 @@ def test_create_range_issue_requires_time_end(client, factory, auth_headers):
             "title": "Long problem section",
             "description": "This needs fixing.",
             "phase": "peer",
-            "issue_type": "range",
             "severity": "minor",
-            "time_start": 4.0,
+            "markers": [{"marker_type": "range", "time_start": 4.0}],
         },
     )
 
@@ -232,6 +296,7 @@ def test_get_issue_detail(client, factory, auth_headers):
     body = response.json()
     assert body["id"] == issue.id
     assert "comments" in body
+    assert "markers" in body
 
 
 def test_get_issue_not_found(client, factory, auth_headers):
@@ -294,7 +359,7 @@ def test_batch_update_issues_forbidden_for_outsider(client, factory, auth_header
     assert response.status_code == 403
 
 
-def test_create_issue_time_end_must_exceed_time_start(client, factory, auth_headers):
+def test_create_marker_time_end_must_exceed_time_start(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user()
@@ -314,10 +379,8 @@ def test_create_issue_time_end_must_exceed_time_start(client, factory, auth_head
             "title": "Bad range",
             "description": "End before start.",
             "phase": "peer",
-            "issue_type": "range",
             "severity": "minor",
-            "time_start": 10.0,
-            "time_end": 5.0,
+            "markers": [{"marker_type": "range", "time_start": 10.0, "time_end": 5.0}],
         },
     )
     assert response.status_code == 422

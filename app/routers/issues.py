@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
 from app.database import get_db
@@ -14,7 +14,7 @@ from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
 from app.services.audio import extract_audio_metadata
-from app.models.issue import Issue, IssuePhase, IssueStatus
+from app.models.issue import Issue, IssueMarker, IssuePhase, IssueStatus, MarkerType
 from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.notifications import notify
@@ -161,16 +161,17 @@ def create_issue(
     album = ensure_track_visibility(track, current_user, db)
     _ensure_issue_permission(track, album, current_user, payload.phase)
 
-    if payload.issue_type.value == "range" and payload.time_end is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="time_end is required for RANGE issues.",
-        )
-    if payload.time_end is not None and payload.time_end <= payload.time_start:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="time_end must be greater than time_start.",
-        )
+    for m in payload.markers:
+        if m.marker_type == MarkerType.RANGE and m.time_end is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="time_end is required for range markers.",
+            )
+        if m.time_end is not None and m.time_end <= m.time_start:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="time_end must be greater than time_start.",
+            )
 
     source_version_id = None
     master_delivery_id = None
@@ -194,10 +195,15 @@ def create_issue(
         master_delivery_id=master_delivery_id,
         title=payload.title,
         description=payload.description,
-        issue_type=payload.issue_type,
         severity=payload.severity,
-        time_start=payload.time_start,
-        time_end=payload.time_end,
+        markers=[
+            IssueMarker(
+                marker_type=m.marker_type,
+                time_start=m.time_start,
+                time_end=m.time_end,
+            )
+            for m in payload.markers
+        ],
     )
     db.add(issue)
     db.flush()  # assign issue.id before logging
@@ -206,7 +212,7 @@ def create_issue(
         track,
         current_user,
         "issue_created",
-        payload={"phase": payload.phase.value, "title": payload.title, "issue_id": issue.id},
+        payload={"phase": payload.phase, "title": payload.title, "issue_id": issue.id},
     )
     if current_user.id != track.submitter_id:
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
@@ -229,7 +235,12 @@ def list_issues(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
 
-    issues = list(db.scalars(select(Issue).where(Issue.track_id == track_id).order_by(Issue.created_at)).all())
+    issues = list(db.scalars(
+        select(Issue)
+        .where(Issue.track_id == track_id)
+        .order_by(Issue.created_at)
+        .options(selectinload(Issue.markers))
+    ).all())
     # Pre-fetch all issue authors
     author_ids = {i.author_id for i in issues}
     users_cache = {u.id: u for u in db.scalars(select(User).where(User.id.in_(author_ids))).all()} if author_ids else {}
@@ -242,7 +253,11 @@ def get_issue(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> IssueDetail:
-    issue = db.get(Issue, issue_id)
+    issue = db.scalar(
+        select(Issue)
+        .where(Issue.id == issue_id)
+        .options(selectinload(Issue.markers))
+    )
     if issue is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
     track = db.get(Track, issue.track_id)
