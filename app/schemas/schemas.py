@@ -294,6 +294,7 @@ class TrackRead(TrackBase):
     duration: float | None = None
     status: str
     rejection_mode: RejectionMode | None = None
+    workflow_variant: str = "standard"
     version: int
     workflow_cycle: int
     submitter_id: int | None = None
@@ -321,7 +322,12 @@ class TrackListItem(TrackRead):
 
 
 class IntakeDecisionRequest(BaseModel):
-    decision: Literal["accept", "reject_final", "reject_resubmittable"]
+    decision: Literal[
+        "accept",
+        "accept_producer_direct",
+        "reject_final",
+        "reject_resubmittable",
+    ]
 
 
 class PeerReviewDecisionRequest(BaseModel):
@@ -548,6 +554,14 @@ class WorkflowStepDefSchema(BaseModel):
     id: str = Field(..., pattern=r"^[a-z][a-z0-9_]{1,49}$")
     label: str = Field(..., min_length=1, max_length=100)
     type: Literal["approval", "gate", "review", "revision", "delivery"]
+    ui_variant: Literal[
+        "generic",
+        "intake",
+        "peer_review",
+        "producer_gate",
+        "mastering",
+        "final_review",
+    ] | None = None
     assignee_role: str
     order: int = Field(..., ge=0)
     transitions: dict[str, str] = {}
@@ -578,14 +592,21 @@ class WorkflowConfigSchema(BaseModel):
 
     @model_validator(mode="after")
     def validate_workflow(self) -> "WorkflowConfigSchema":
-        step_ids = {s.id for s in self.steps}
+        step_by_id = {s.id: s for s in self.steps}
+        step_ids = set(step_by_id.keys())
         seen_ids: set[str] = set()
+        seen_orders: set[int] = set()
 
         for step in self.steps:
             # Unique IDs
             if step.id in seen_ids:
                 raise ValueError(f"Duplicate step id: '{step.id}'")
             seen_ids.add(step.id)
+
+            # Unique order index to keep step ordering deterministic
+            if step.order in seen_orders:
+                raise ValueError(f"Duplicate step order: '{step.order}'")
+            seen_orders.add(step.order)
 
             # Validate transition targets
             for decision, target in step.transitions.items():
@@ -594,6 +615,24 @@ class WorkflowConfigSchema(BaseModel):
                         f"Step '{step.id}' transition '{decision}' targets "
                         f"unknown step '{target}'"
                     )
+
+                # reject_to_* must always be a rollback to an earlier stage.
+                if decision.startswith("reject_to_"):
+                    if target not in step_ids:
+                        raise ValueError(
+                            f"Step '{step.id}' transition '{decision}' must target a workflow step, "
+                            f"not special target '{target}'"
+                        )
+                    target_step = step_by_id[target]
+                    if target_step.id == step.id:
+                        raise ValueError(
+                            f"Step '{step.id}' transition '{decision}' cannot target itself"
+                        )
+                    if target_step.order >= step.order:
+                        raise ValueError(
+                            f"Step '{step.id}' transition '{decision}' must target an earlier step. "
+                            f"Got order {target_step.order} >= {step.order}"
+                        )
 
             # Revision steps must have return_to
             if step.type == "revision":
@@ -651,6 +690,10 @@ class StageAssignmentRead(BaseModel):
 
 class AssignReviewerRequest(BaseModel):
     user_ids: list[int] = Field(..., min_length=1)
+
+
+class ReassignReviewerRequest(BaseModel):
+    user_id: int | None = None
 
 
 # ── Reopen request schemas ────────────────────────────────────────────────────

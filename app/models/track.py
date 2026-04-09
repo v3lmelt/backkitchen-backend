@@ -26,6 +26,11 @@ class RejectionMode(str, enum.Enum):
     RESUBMITTABLE = "resubmittable"
 
 
+class WorkflowVariant(str, enum.Enum):
+    STANDARD = "standard"
+    PRODUCER_DIRECT = "producer_direct"
+
+
 class Track(Base):
     __tablename__ = "tracks"
 
@@ -54,6 +59,12 @@ class Track(Base):
     rejection_mode: Mapped[RejectionMode | None] = mapped_column(
         Enum(RejectionMode, values_callable=lambda items: [item.value for item in items]),
         nullable=True,
+    )
+    workflow_variant: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=WorkflowVariant.STANDARD.value,
+        server_default=WorkflowVariant.STANDARD.value,
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     workflow_cycle: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

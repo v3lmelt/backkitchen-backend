@@ -33,6 +33,12 @@ from app.workflow import (
     ensure_track_visibility,
     log_track_event,
 )
+from app.workflow_engine import (
+    get_current_step,
+    infer_issue_phase_for_step,
+    parse_workflow_config,
+    user_matches_role_or_assignment,
+)
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 IMAGE_EXT_MAP = {
@@ -98,20 +104,96 @@ def _ensure_issue_permission(track: Track, album: Album, user: User, phase: Issu
         return
 
 
+def _is_custom_workflow_album(album: Album) -> bool:
+    return bool(album.workflow_config)
+
+
+def _match_custom_step_phase(track: Track, album: Album, phase: str):
+    """Return current custom workflow step if issue phase is valid.
+
+    ``phase`` must match either the canonical phase mapped from step metadata
+    or the step id itself.
+    """
+    config = parse_workflow_config(album)
+    step = get_current_step(config, track)
+    if step is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Track is in unknown workflow step.")
+
+    expected_phase = infer_issue_phase_for_step(step)
+    if phase not in {expected_phase, step.id}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Issue phase must match current workflow step ('{expected_phase}' or '{step.id}').",
+        )
+    return step
+
+
+def _ensure_custom_issue_permission(track: Track, album: Album, user: User, phase: str, db: Session) -> str:
+    step = _match_custom_step_phase(track, album, phase)
+
+    if not user_matches_role_or_assignment(user, album, track, step, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the assigned user can create issues for this step.",
+        )
+
+    return infer_issue_phase_for_step(step)
+
+
+def _resolve_step_assignee_id(step, track: Track, album: Album) -> int | None:
+    if step.assignee_user_id:
+        return step.assignee_user_id
+    if step.assignee_role == "producer":
+        return album.producer_id
+    if step.assignee_role == "mastering_engineer":
+        return album.mastering_engineer_id
+    if step.assignee_role == "submitter":
+        return track.submitter_id
+    if step.assignee_role == "peer_reviewer":
+        return track.peer_reviewer_id
+    if step.assignee_role.startswith("member:"):
+        try:
+            return int(step.assignee_role.split(":", 1)[1])
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def _effective_issue_phase(issue: Issue, track: Track, album: Album) -> str:
+    """Normalize legacy/custom issue phase for permission decisions."""
+    phase = issue.phase
+    if not _is_custom_workflow_album(album):
+        return phase
+
+    if phase in {IssuePhase.PEER.value, IssuePhase.PRODUCER.value, IssuePhase.MASTERING.value, IssuePhase.FINAL_REVIEW.value}:
+        config = parse_workflow_config(album)
+        step = get_current_step(config, track)
+        return infer_issue_phase_for_step(step) if step else phase
+    return phase
+
+
 def _phase_reviewer_id(issue: Issue, track: Track, album: Album) -> int | None:
     """Return the reviewer user-id for the issue's phase."""
-    if issue.phase == IssuePhase.PEER:
+    phase = _effective_issue_phase(issue, track, album)
+
+    if _is_custom_workflow_album(album):
+        config = parse_workflow_config(album)
+        step = get_current_step(config, track)
+        if step and infer_issue_phase_for_step(step) == phase:
+            return _resolve_step_assignee_id(step, track, album)
+
+    if phase == IssuePhase.PEER:
         return track.peer_reviewer_id
-    if issue.phase in (IssuePhase.PRODUCER, IssuePhase.FINAL_REVIEW):
+    if phase in (IssuePhase.PRODUCER, IssuePhase.FINAL_REVIEW):
         return album.producer_id
-    if issue.phase == IssuePhase.MASTERING:
+    if phase == IssuePhase.MASTERING:
         return album.mastering_engineer_id
     return None
 
 
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User) -> None:
     reviewer_id = _phase_reviewer_id(issue, track, album)
-    allowed = {track.submitter_id, reviewer_id} - {None}
+    allowed = {track.submitter_id, reviewer_id, issue.author_id} - {None}
     if user.id not in allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to update this issue.")
 
@@ -128,7 +210,7 @@ def _validate_status_transition(issue: Issue, new_status: IssueStatus, track: Tr
 
     is_submitter = user.id == track.submitter_id
     reviewer_id = _phase_reviewer_id(issue, track, album)
-    is_reviewer = user.id == reviewer_id
+    is_reviewer = user.id in {reviewer_id, issue.author_id}
 
     # Submitter: open → resolved | disagreed
     if is_submitter and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.DISAGREED):
@@ -159,7 +241,19 @@ def create_issue(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    _ensure_issue_permission(track, album, current_user, payload.phase)
+    effective_phase = payload.phase
+    if _is_custom_workflow_album(album):
+        effective_phase = _ensure_custom_issue_permission(track, album, current_user, payload.phase, db)
+    else:
+        # Legacy workflow only accepts canonical phases.
+        try:
+            legacy_phase = IssuePhase(payload.phase)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported issue phase '{payload.phase}'",
+            ) from exc
+        _ensure_issue_permission(track, album, current_user, legacy_phase)
 
     for m in payload.markers:
         if m.marker_type == MarkerType.RANGE and m.time_end is None:
@@ -175,12 +269,12 @@ def create_issue(
 
     source_version_id = None
     master_delivery_id = None
-    if payload.phase in {IssuePhase.PEER, IssuePhase.PRODUCER, IssuePhase.MASTERING}:
+    if effective_phase in {IssuePhase.PEER, IssuePhase.PRODUCER, IssuePhase.MASTERING}:
         source_version = current_source_version(track)
         if source_version is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No source version available.")
         source_version_id = source_version.id
-    if payload.phase == IssuePhase.FINAL_REVIEW:
+    if effective_phase == IssuePhase.FINAL_REVIEW:
         delivery = current_master_delivery(track)
         if delivery is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No master delivery available.")
@@ -189,7 +283,7 @@ def create_issue(
     issue = Issue(
         track_id=track_id,
         author_id=current_user.id,
-        phase=payload.phase,
+        phase=effective_phase,
         workflow_cycle=track.workflow_cycle,
         source_version_id=source_version_id,
         master_delivery_id=master_delivery_id,
@@ -212,7 +306,7 @@ def create_issue(
         track,
         current_user,
         "issue_created",
-        payload={"phase": payload.phase, "title": payload.title, "issue_id": issue.id},
+        payload={"phase": effective_phase, "title": payload.title, "issue_id": issue.id},
     )
     if current_user.id != track.submitter_id:
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",

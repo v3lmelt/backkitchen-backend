@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from sqlalchemy import func, func as sqlfunc, select
+from sqlalchemy import func, func as sqlfunc, select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -18,11 +18,12 @@ from app.models.issue import Issue, IssuePhase, IssueStatus
 from app.models.master_delivery import MasterDelivery
 from app.models.reopen_request import ReopenRequest
 from app.models.stage_assignment import StageAssignment
-from app.models.track import RejectionMode, Track, TrackStatus
+from app.models.track import RejectionMode, Track, TrackStatus, WorkflowVariant
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.schemas.schemas import (
     AssignReviewerRequest,
+    ReassignReviewerRequest,
     ConfirmTrackUploadParams,
     ConfirmUploadParams,
     DirectReopenRequest,
@@ -46,6 +47,9 @@ from app.workflow_engine import (
     execute_revision_upload as engine_revision_upload,
     execute_delivery_upload as engine_delivery_upload,
     get_initial_track_status,
+    get_current_step as engine_get_current_step,
+    parse_workflow_config as engine_parse_workflow_config,
+    resolve_assignee as engine_resolve_assignee,
 )
 from app.notifications import notify
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
@@ -167,6 +171,55 @@ def _handle_delivery_status(
 
 def _track_list_item(track: Track, user: User, album: Album) -> TrackListItem:
     return TrackListItem(**build_track_read(track, user, album).model_dump(), album_title=album.title)
+
+
+def _ensure_revision_upload_permission(track: Track, album: Album, current_user: User) -> None:
+    if album.workflow_config:
+        config = engine_parse_workflow_config(album)
+        step = engine_get_current_step(config, track)
+        if step is None or step.type != "revision":
+            raise HTTPException(status_code=409, detail="This track is not waiting for a new source version.")
+        assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
+        if assignee_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the assigned user can upload a new source version.")
+        return
+
+    if track.submitter_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the submitter can upload a new source version.")
+
+
+def _ensure_delivery_upload_permission(track: Track, album: Album, current_user: User) -> None:
+    if album.workflow_config:
+        config = engine_parse_workflow_config(album)
+        step = engine_get_current_step(config, track)
+        if step is None or step.type != "delivery":
+            raise HTTPException(status_code=409, detail="Track is not in a delivery stage.")
+        assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
+        if assignee_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the assigned user can upload a master delivery.")
+        if step.assignee_role == "mastering_engineer" and album.mastering_engineer_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the album mastering engineer can upload this delivery.")
+        return
+
+    if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
+        raise HTTPException(status_code=403, detail="Only the mastering engineer can upload a master delivery.")
+
+
+def _ensure_delivery_confirm_permission(track: Track, album: Album, current_user: User) -> None:
+    if album.workflow_config:
+        config = engine_parse_workflow_config(album)
+        step = engine_get_current_step(config, track)
+        if step is None or step.type != "delivery":
+            raise HTTPException(status_code=409, detail="Track is not in a delivery stage.")
+        assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
+        if assignee_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the assigned user can confirm delivery.")
+        if step.assignee_role == "mastering_engineer" and album.mastering_engineer_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the album mastering engineer can confirm delivery.")
+        return
+
+    if album.mastering_engineer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the mastering engineer can confirm delivery.")
 
 
 def _serve_path(path_str: str, filename_prefix: str, *, immutable: bool = False) -> FileResponse:
@@ -434,9 +487,8 @@ def request_source_version_upload(
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
-    ensure_track_visibility(track, current_user, db)
-    if track.submitter_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the submitter can upload a new source version.")
+    album = ensure_track_visibility(track, current_user, db)
+    _ensure_revision_upload_permission(track, album, current_user)
 
     from app.services.r2 import make_object_key
 
@@ -448,6 +500,7 @@ def request_source_version_upload(
 def confirm_source_version_upload(
     track_id: int,
     params: ConfirmUploadParams,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -457,8 +510,7 @@ def confirm_source_version_upload(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if track.submitter_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the submitter can upload a new source version.")
+    _ensure_revision_upload_permission(track, album, current_user)
 
     if album.workflow_config:
         next_status = engine_revision_upload(album, track)
@@ -467,8 +519,15 @@ def confirm_source_version_upload(
         track.workflow_cycle += 1
         track.peer_reviewer_id = None
         track.rejection_mode = None
+        track.workflow_variant = WorkflowVariant.STANDARD.value
     elif track.status == TrackStatus.PEER_REVISION:
-        next_status = TrackStatus.PEER_REVIEW
+        # Producer-direct path has no peer reviewer, so revisions go straight
+        # back to the producer gate instead of peer review.
+        next_status = (
+            TrackStatus.PRODUCER_MASTERING_GATE
+            if track.workflow_variant == WorkflowVariant.PRODUCER_DIRECT.value
+            else TrackStatus.PEER_REVIEW
+        )
     elif track.status == TrackStatus.MASTERING_REVISION:
         next_status = TrackStatus.MASTERING
     else:
@@ -501,6 +560,7 @@ def confirm_source_version_upload(
     )
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
@@ -519,8 +579,7 @@ def request_master_delivery_upload(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
-        raise HTTPException(status_code=403, detail="Only the mastering engineer can upload a master delivery.")
+    _ensure_delivery_upload_permission(track, album, current_user)
 
     from app.services.r2 import make_object_key
 
@@ -547,8 +606,7 @@ def confirm_master_delivery_upload(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
-        raise HTTPException(status_code=403, detail="Only the mastering engineer can upload a master delivery.")
+    _ensure_delivery_upload_permission(track, album, current_user)
 
     delivery_number = 1
     current_del = current_master_delivery(track)
@@ -590,8 +648,7 @@ def confirm_delivery(
         raise HTTPException(status_code=404, detail="Delivery not found.")
     if delivery.confirmed_at is not None:
         raise HTTPException(status_code=409, detail="Delivery already confirmed.")
-    if album.mastering_engineer_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the mastering engineer can confirm delivery.")
+    _ensure_delivery_confirm_permission(track, album, current_user)
 
     delivery.confirmed_at = datetime.now(timezone.utc)
 
@@ -609,6 +666,7 @@ def confirm_delivery(
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
@@ -714,6 +772,7 @@ def workflow_transition(
     engine_execute_transition(db, album, track, current_user, payload.decision, background_tasks)
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
@@ -743,6 +802,14 @@ def assign_reviewer(
 
     if track.submitter_id in payload.user_ids:
         raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
+
+    valid_member_ids = get_album_member_ids(db, album.id)
+    invalid_user_ids = [uid for uid in payload.user_ids if uid not in valid_member_ids]
+    if invalid_user_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Users {sorted(invalid_user_ids)} are not members of this album.",
+        )
 
     # Batch-fetch existing pending assignments to avoid N+1
     already_assigned = set(db.scalars(
@@ -797,6 +864,77 @@ def list_assignments(
     return [StageAssignmentRead.model_validate(a) for a in assignments]
 
 
+@router.post("/{track_id}/reassign-reviewer", response_model=TrackRead)
+def reassign_reviewer(
+    track_id: int,
+    payload: ReassignReviewerRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    """Producer reassigns the reviewer for the current review stage.
+
+    Cancels all pending stage assignments, resets peer_reviewer_id, then
+    either assigns the specified user (if payload.user_id is set) or
+    re-runs the normal assignment logic (auto pool or random fallback).
+    """
+    from app.workflow_engine import assign_peer_reviewer_for_step, get_current_step, parse_workflow_config
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if album.producer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the album producer can reassign reviewers.")
+
+    config = parse_workflow_config(album)
+    step = get_current_step(config, track)
+    if step is None or step.type != "review":
+        raise HTTPException(status_code=409, detail="Track is not in a review stage.")
+
+    if payload.user_id is not None and payload.user_id == track.submitter_id:
+        raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
+
+    if payload.user_id is not None:
+        valid_member_ids = get_album_member_ids(db, album.id)
+        if payload.user_id not in valid_member_ids:
+            raise HTTPException(status_code=400, detail="Selected reviewer is not a member of this album.")
+
+    # Cancel all pending assignments for this stage
+    db.execute(
+        update(StageAssignment)
+        .where(
+            StageAssignment.track_id == track_id,
+            StageAssignment.stage_id == step.id,
+            StageAssignment.status == "pending",
+        )
+        .values(status="cancelled")
+    )
+    track.peer_reviewer_id = None
+
+    if payload.user_id is not None:
+        track.peer_reviewer_id = payload.user_id
+        db.add(StageAssignment(
+            track_id=track_id,
+            stage_id=step.id,
+            user_id=payload.user_id,
+            status="pending",
+            assigned_at=datetime.now(timezone.utc),
+        ))
+    else:
+        assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
+
+    log_track_event(
+        db, track, current_user,
+        "reviewer_reassigned",
+        payload={"stage": step.id, "new_reviewer_id": payload.user_id},
+    )
+
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album, db=db)
+
+
 # ── Track reopen endpoints ──────────────────────────────────────────────────
 
 
@@ -836,8 +974,8 @@ def create_reopen_request(
         status="pending",
     )
     db.add(req)
-    notify(db, [album.producer_id], "reopen_request", "Track reopen requested",
-           f"「{track.title}」reopen requested by {current_user.display_name}.",
+    notify(db, [album.producer_id], "reopen_request", "请求重新开启曲目",
+           f"{current_user.display_name} 请求将「{track.title}」重新开启。",
            related_track_id=track.id, background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(req)
@@ -900,12 +1038,12 @@ def decide_reopen_request(
 
     if payload.decision == "approve":
         execute_reopen(db, album, track, current_user, req.target_stage_id, background_tasks)
-        notify(db, [req.requested_by_id], "reopen_approved", "Reopen approved",
-               f"「{track.title}」reopen request approved.",
+        notify(db, [req.requested_by_id], "reopen_approved", "重新开启已批准",
+               f"「{track.title}」的重新开启请求已获批准。",
                related_track_id=track.id, background_tasks=background_tasks, album_id=track.album_id)
     else:
-        notify(db, [req.requested_by_id], "reopen_rejected", "Reopen rejected",
-               f"「{track.title}」reopen request rejected.",
+        notify(db, [req.requested_by_id], "reopen_rejected", "重新开启已拒绝",
+               f"「{track.title}」的重新开启请求已被拒绝。",
                related_track_id=track.id, background_tasks=background_tasks, album_id=track.album_id)
 
     db.commit()
@@ -916,6 +1054,7 @@ def decide_reopen_request(
 @router.post("/{track_id}/source-versions", response_model=TrackRead)
 def upload_source_version(
     track_id: int,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -924,8 +1063,7 @@ def upload_source_version(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if track.submitter_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the submitter can upload a new source version.")
+    _ensure_revision_upload_permission(track, album, current_user)
 
     if album.workflow_config:
         # Custom workflow: use engine to resolve next status
@@ -935,8 +1073,15 @@ def upload_source_version(
         track.workflow_cycle += 1
         track.peer_reviewer_id = None
         track.rejection_mode = None
+        track.workflow_variant = WorkflowVariant.STANDARD.value
     elif track.status == TrackStatus.PEER_REVISION:
-        next_status = TrackStatus.PEER_REVIEW
+        # Producer-direct path has no peer reviewer, so revisions go straight
+        # back to the producer gate instead of peer review.
+        next_status = (
+            TrackStatus.PRODUCER_MASTERING_GATE
+            if track.workflow_variant == WorkflowVariant.PRODUCER_DIRECT.value
+            else TrackStatus.PEER_REVIEW
+        )
     elif track.status == TrackStatus.MASTERING_REVISION:
         next_status = TrackStatus.MASTERING
     else:
@@ -961,6 +1106,7 @@ def upload_source_version(
     )
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
@@ -984,6 +1130,7 @@ def intake_decision(
         selected = assign_random_peer_reviewer(db, album, track)
         track.status = TrackStatus.PEER_REVIEW
         track.rejection_mode = None
+        track.workflow_variant = WorkflowVariant.STANDARD.value
         log_track_event(
             db,
             track,
@@ -991,10 +1138,31 @@ def intake_decision(
             "submission_accepted",
             from_status=previous_status,
             to_status=track.status,
-            payload={"peer_reviewer_id": selected},
+            payload={"peer_reviewer_id": selected, "workflow_variant": track.workflow_variant},
         )
         notify(db, [track.submitter_id], "track_status_changed", "曲目进入审核",
                f"「{track.title}」已进入同行审核阶段", related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
+    elif payload.decision == "accept_producer_direct":
+        # Producer-direct path: skip peer review entirely. Track goes straight
+        # to the producer mastering gate, where the producer raises issues
+        # themselves (phase='producer') and then decides whether to send to
+        # mastering. peer_reviewer_id stays null.
+        track.status = TrackStatus.PRODUCER_MASTERING_GATE
+        track.rejection_mode = None
+        track.peer_reviewer_id = None
+        track.workflow_variant = WorkflowVariant.PRODUCER_DIRECT.value
+        log_track_event(
+            db,
+            track,
+            current_user,
+            "submission_accepted",
+            from_status=previous_status,
+            to_status=track.status,
+            payload={"workflow_variant": track.workflow_variant},
+        )
+        notify(db, [track.submitter_id], "track_status_changed", "制作人直接审核",
+               f"「{track.title}」已由制作人接收，进入制作人审核阶段", related_track_id=track.id,
                background_tasks=background_tasks, album_id=track.album_id)
     else:
         track.status = TrackStatus.REJECTED
@@ -1022,6 +1190,7 @@ def intake_decision(
 
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
@@ -1080,6 +1249,7 @@ def finish_peer_review(
                background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
@@ -1118,11 +1288,19 @@ def producer_gate(
                f"「{track.title}」已进入混音阶段", related_track_id=track.id,
                background_tasks=background_tasks, album_id=track.album_id)
     else:
-        notify(db, [track.submitter_id, track.peer_reviewer_id], "track_status_changed",
-               "制作人要求重新审核", f"「{track.title}」制作人要求重新进行同行审核", related_track_id=track.id,
+        is_producer_direct = track.workflow_variant == WorkflowVariant.PRODUCER_DIRECT.value
+        recipients = [track.submitter_id] if is_producer_direct else [track.submitter_id, track.peer_reviewer_id]
+        body = (
+            f"「{track.title}」制作人要求修改"
+            if is_producer_direct
+            else f"「{track.title}」制作人要求重新进行同行审核"
+        )
+        notify(db, recipients, "track_status_changed",
+               "制作人要求修改", body, related_track_id=track.id,
                background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
@@ -1155,6 +1333,7 @@ def request_mastering_revision(
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
@@ -1170,8 +1349,7 @@ def upload_master_delivery(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
-        raise HTTPException(status_code=403, detail="Only the mastering engineer can upload a master delivery.")
+    _ensure_delivery_upload_permission(track, album, current_user)
 
     delivery_number = 1
     current_delivery = current_master_delivery(track)
@@ -1247,6 +1425,7 @@ def approve_final_review(
                 sv.expires_at = expiry
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
@@ -1299,6 +1478,7 @@ def return_to_mastering(
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 

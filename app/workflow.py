@@ -1,8 +1,11 @@
 import json
+import logging
 import random
 from typing import Any
 
 from fastapi import HTTPException, status
+
+logger = logging.getLogger(__name__)
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -15,6 +18,7 @@ from app.models.comment_image import CommentImage
 from app.models.issue import Issue, IssueStatus
 from app.models.discussion import TrackDiscussion
 from app.models.master_delivery import MasterDelivery
+from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
@@ -109,6 +113,15 @@ def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
         return album
     # Submitter and peer reviewer of this specific track always have access
     if user.id == track.submitter_id or user.id == track.peer_reviewer_id:
+        return album
+    assignment_id = db.scalar(
+        select(StageAssignment.id).where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.user_id == user.id,
+            StageAssignment.status.in_(["pending", "completed"]),
+        )
+    )
+    if assignment_id is not None:
         return album
     # Must be an album member
     member_ids = get_album_member_ids(db, album.id)
@@ -224,6 +237,7 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
                 id=step.id,
                 label=step.label,
                 type=step.type,
+                ui_variant=step.ui_variant,
                 assignee_role=step.assignee_role,
                 order=step.order,
                 transitions=step.transitions,
@@ -253,6 +267,7 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
         duration=track.duration,
         status=track.status,
         rejection_mode=track.rejection_mode,
+        workflow_variant=track.workflow_variant or "standard",
         version=track.version,
         workflow_cycle=track.workflow_cycle,
         submitter_id=track.submitter_id,
@@ -457,12 +472,22 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         )
         for d in track.discussions
     ]
-    # Include workflow config for custom-workflow albums
+    # Include workflow config for custom-workflow albums. Mirror the defensive
+    # try/except used in `_album_to_read`: a stored config that no longer
+    # passes the current validator (e.g. a legacy `reject_to_*` pointing
+    # forwards) must not crash the entire track-detail read. Callers that
+    # need a valid config (workflow transitions, step view) will either skip
+    # gracefully or surface a targeted 4xx.
+    from app.workflow_engine import parse_workflow_config
+    from app.schemas.schemas import WorkflowConfigSchema
     wf_config_schema = None
-    if album.workflow_config:
-        from app.workflow_engine import parse_workflow_config
-        from app.schemas.schemas import WorkflowConfigSchema
+    try:
         wf_config_schema = WorkflowConfigSchema(**parse_workflow_config(album))
+    except Exception:
+        logger.warning(
+            "Album %d has an invalid workflow_config; track-detail will return it as None.",
+            album.id,
+        )
 
     return TrackDetailResponse(
         track=build_track_read(track, user, album),

@@ -11,8 +11,14 @@ legacy hard-coded endpoints.  This constant is used:
 Version history
 ---------------
 * **v1** – original gate-based config (legacy, still accepted for parsing).
-* **v2** – renamed ``gate`` → ``approval``; added ``producer_revision``,
-  ``final_revision`` stages; new per-step config fields.
+* **v2** – renamed ``gate`` → ``approval``; added ``producer_revision``
+  stage; new per-step config fields.  Originally shipped with a broken
+  ``final_revision`` stage (assigned to mastering_engineer but uploaded
+  via ``/source-versions``); this has been removed.  Backward
+  ``reject_to_*`` transitions were added to ``producer_gate``,
+  ``mastering`` and ``final_review`` so each approval stage can send
+  the track back to an earlier stage for re-review without requiring
+  a brand-new source upload.
 """
 
 STEP_TYPES = ("approval", "review", "revision", "delivery")
@@ -33,10 +39,12 @@ DEFAULT_WORKFLOW_CONFIG: dict = {
             "id": "intake",
             "label": "Intake",
             "type": "approval",
+            "ui_variant": "intake",
             "assignee_role": "producer",
             "order": 0,
             "transitions": {
                 "accept": "peer_review",
+                "accept_producer_direct": "producer_gate",
                 "reject_final": "__rejected",
                 "reject_resubmittable": "__rejected_resubmittable",
             },
@@ -46,6 +54,7 @@ DEFAULT_WORKFLOW_CONFIG: dict = {
             "id": "peer_review",
             "label": "Peer Review",
             "type": "review",
+            "ui_variant": "peer_review",
             "assignee_role": "peer_reviewer",
             "order": 1,
             "transitions": {
@@ -69,11 +78,13 @@ DEFAULT_WORKFLOW_CONFIG: dict = {
             "id": "producer_gate",
             "label": "Producer Review",
             "type": "approval",
+            "ui_variant": "producer_gate",
             "assignee_role": "producer",
             "order": 3,
             "transitions": {
                 "approve": "mastering",
                 "reject": "producer_revision",
+                "reject_to_peer_review": "peer_review",
             },
             "allow_permanent_reject": False,
         },
@@ -90,11 +101,13 @@ DEFAULT_WORKFLOW_CONFIG: dict = {
             "id": "mastering",
             "label": "Mastering",
             "type": "delivery",
+            "ui_variant": "mastering",
             "assignee_role": "mastering_engineer",
             "order": 5,
             "transitions": {
                 "deliver": "final_review",
                 "request_revision": "mastering_revision",
+                "reject_to_producer_gate": "producer_gate",
             },
             "revision_step": "mastering_revision",
             "require_confirmation": True,
@@ -112,22 +125,14 @@ DEFAULT_WORKFLOW_CONFIG: dict = {
             "id": "final_review",
             "label": "Final Review",
             "type": "approval",
+            "ui_variant": "final_review",
             "assignee_role": "producer",
             "order": 7,
             "transitions": {
-                "approve": "__completed",
-                "reject": "final_revision",
+                "reject": "mastering_revision",
+                "reject_to_mastering": "mastering",
             },
             "allow_permanent_reject": True,
-        },
-        {
-            "id": "final_revision",
-            "label": "Final Revision",
-            "type": "revision",
-            "assignee_role": "mastering_engineer",
-            "order": 8,
-            "return_to": "final_review",
-            "transitions": {},
         },
     ],
 }
