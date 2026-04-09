@@ -61,7 +61,7 @@ router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 # Resolved once at startup to avoid a mkdir syscall on every file-serve request.
 _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
 
-# One day in seconds — audio files are immutable (new versions create new files).
+# Used only for truly immutable URLs (source-version snapshots addressed by numeric ID).
 _AUDIO_CACHE_MAX_AGE = 86400
 
 
@@ -118,7 +118,7 @@ def _track_list_item(track: Track, user: User, album: Album) -> TrackListItem:
     return TrackListItem(**build_track_read(track, user, album).model_dump(), album_title=album.title)
 
 
-def _serve_path(path_str: str, filename_prefix: str) -> FileResponse:
+def _serve_path(path_str: str, filename_prefix: str, *, immutable: bool = False) -> FileResponse:
     file_path = Path(path_str).resolve()
     try:
         file_path.relative_to(_UPLOAD_BASE)
@@ -141,12 +141,17 @@ def _serve_path(path_str: str, filename_prefix: str) -> FileResponse:
     etag_raw = f"{file_path.name}-{stat.st_size}-{stat.st_mtime_ns}"
     etag = hashlib.md5(etag_raw.encode()).hexdigest()
 
+    if immutable:
+        cache_control = f"private, max-age={_AUDIO_CACHE_MAX_AGE}, immutable"
+    else:
+        cache_control = "private, max-age=0, must-revalidate"
+
     return FileResponse(
         path=str(file_path),
         media_type=media_type,
         filename=f"{filename_prefix}{file_path.suffix}",
         headers={
-            "Cache-Control": f"private, max-age={_AUDIO_CACHE_MAX_AGE}, immutable",
+            "Cache-Control": cache_control,
             "ETag": f'"{etag}"',
             "Accept-Ranges": "bytes",
         },
@@ -155,6 +160,7 @@ def _serve_path(path_str: str, filename_prefix: str) -> FileResponse:
 
 def _serve_audio(
     file_path: str, storage_backend: str, filename_prefix: str, resolve: str | None = None,
+    *, immutable: bool = False,
 ) -> FileResponse | RedirectResponse | dict:
     """Serve an audio file from local disk or redirect to R2 presigned URL.
 
@@ -162,6 +168,11 @@ def _serve_audio(
     presigned URL instead of a 307 redirect.  This lets the frontend obtain
     the direct R2 URL without hitting cross-origin redirect issues (e.g.
     wavesurfer.js ``fetch`` cannot follow a cross-origin 307).
+
+    Set ``immutable=True`` only for versioned URLs whose content can never
+    change (e.g. source-version snapshots addressed by their numeric ID).
+    Mutable "current audio" endpoints must use the default ``immutable=False``
+    so that browsers always revalidate after a new file is uploaded.
     """
     if storage_backend == "r2":
         from app.services.r2 import generate_download_url
@@ -169,12 +180,16 @@ def _serve_audio(
         url = generate_download_url(file_path)
         if resolve == "json":
             resp = JSONResponse({"url": url})
-            resp.headers["Cache-Control"] = f"private, max-age={_AUDIO_CACHE_MAX_AGE}"
+            resp.headers["Cache-Control"] = (
+                f"private, max-age={_AUDIO_CACHE_MAX_AGE}"
+                if immutable
+                else "private, max-age=0, must-revalidate"
+            )
             return resp
         return RedirectResponse(url, status_code=307)
     if resolve == "json":
         return {"url": None}
-    return _serve_path(file_path, filename_prefix)
+    return _serve_path(file_path, filename_prefix, immutable=immutable)
 
 
 @router.post("", response_model=TrackRead, status_code=status.HTTP_201_CREATED)
@@ -1113,7 +1128,8 @@ def serve_audio(
     ensure_track_visibility(track, current_user, db)
     if not track.file_path:
         raise HTTPException(status_code=404, detail="No source audio is available for this track.")
-    return _serve_audio(track.file_path, track.storage_backend, track.title, resolve)
+    # immutable=False: same URL serves different files as new versions are uploaded
+    return _serve_audio(track.file_path, track.storage_backend, track.title, resolve, immutable=False)
 
 
 @router.get("/{track_id}/source-versions/{version_id}/audio")
@@ -1135,7 +1151,8 @@ def get_source_version_audio(
     if version is None or version.track_id != track_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found.")
 
-    return _serve_audio(version.file_path, version.storage_backend, f"{track.title}-v{version.version_number}", resolve)
+    # immutable=True: version_id in URL guarantees content never changes
+    return _serve_audio(version.file_path, version.storage_backend, f"{track.title}-v{version.version_number}", resolve, immutable=True)
 
 
 @router.get("/{track_id}/master-audio")
@@ -1154,4 +1171,5 @@ def serve_master_audio(
     delivery = current_master_delivery(track)
     if delivery is None:
         raise HTTPException(status_code=404, detail="No master delivery is available for this track.")
-    return _serve_audio(delivery.file_path, delivery.storage_backend, f"{track.title}-master", resolve)
+    # immutable=False: same URL serves new master deliveries across workflow cycles
+    return _serve_audio(delivery.file_path, delivery.storage_backend, f"{track.title}-master", resolve, immutable=False)
