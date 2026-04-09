@@ -540,21 +540,21 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
         return
 
     # Verify user has access to this track's album.
-    # Single query: join Track → Album, then a second query for membership set.
     user_id = int(payload["sub"])
     db = SessionLocal()
     try:
-        # Query 1: fetch user + track + album in one join
-        row = db.execute(
-            select(User, Track, Album)
-            .join(Track, Track.id == track_id)
-            .join(Album, Album.id == Track.album_id)
-            .where(User.id == user_id)
-        ).first()
-        if row is None:
+        user = db.get(User, user_id)
+        if user is None or user.deleted_at is not None:
             await websocket.close(code=4001)
             return
-        user, track, album = row
+        track = db.get(Track, track_id)
+        if track is None:
+            await websocket.close(code=4001)
+            return
+        album = db.get(Album, track.album_id)
+        if album is None:
+            await websocket.close(code=4001)
+            return
         # Query 2: fetch album member ids
         member_ids: set[int] = set(
             db.scalars(

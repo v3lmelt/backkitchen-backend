@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 def list_users(
     db: Session = Depends(get_db), _current_user: User = Depends(get_current_user)
 ) -> list[User]:
-    stmt = select(User).order_by(User.id)
+    stmt = select(User).where(User.deleted_at.is_(None)).order_by(User.id)
     return list(db.scalars(stmt).all())
 
 
@@ -29,7 +29,9 @@ def create_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only producers can create new accounts.",
         )
-    existing = db.scalars(select(User).where(User.username == payload.username)).first()
+    existing = db.scalars(
+        select(User).where(User.username == payload.username, User.deleted_at.is_(None))
+    ).first()
     if existing is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -37,7 +39,9 @@ def create_user(
         )
 
     if payload.email is not None:
-        existing_email = db.scalars(select(User).where(User.email == payload.email)).first()
+        existing_email = db.scalars(
+            select(User).where(User.email == payload.email, User.deleted_at.is_(None))
+        ).first()
         if existing_email is not None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

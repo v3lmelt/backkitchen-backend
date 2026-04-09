@@ -22,6 +22,9 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, default=None, index=True
+    )
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, username='{self.username}', role='{self.role}')>"

@@ -114,7 +114,7 @@ def _resolve_bearer_user(
         return None
     payload = _decode_token(credentials.credentials)
     user = db.get(User, int(payload["sub"]))
-    if user is None:
+    if user is None or user.deleted_at is not None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authenticated user no longer exists.",
