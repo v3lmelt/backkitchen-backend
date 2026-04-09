@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -13,6 +14,7 @@ from app.workflow import (
     log_track_event,
     track_allowed_actions,
 )
+from app.workflow_engine import backfill_album_workflow_configs, upgrade_config_with_backward_transitions
 
 
 def test_current_source_version_returns_latest(factory):
@@ -126,3 +128,77 @@ def test_log_track_event_serializes_enums_and_datetimes(factory):
     assert event.payload is not None
     assert "resolved" in event.payload
     assert "2024-01-01T00:00:00+00:00" in event.payload
+
+
+def test_upgrade_config_backfills_producer_direct_intake_transition():
+    config = {
+        "version": 2,
+        "steps": [
+            {
+                "id": "intake",
+                "transitions": {
+                    "approve": "peer_review",
+                    "reject_final": "__rejected",
+                },
+            },
+            {"id": "peer_review", "transitions": {}},
+            {"id": "producer_gate", "transitions": {}},
+        ],
+    }
+
+    upgraded, changes = upgrade_config_with_backward_transitions(config)
+
+    intake = next(step for step in upgraded["steps"] if step["id"] == "intake")
+    assert intake["transitions"]["accept"] == "peer_review"
+    assert "approve" not in intake["transitions"]
+    assert intake["transitions"]["accept_producer_direct"] == "producer_gate"
+    assert any("accept_producer_direct" in change for change in changes)
+
+
+def test_backfill_album_workflow_configs_updates_stored_intake_transition(factory):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[producer])
+    album.workflow_config = (
+        '{"version":2,"steps":['
+        '{"id":"intake","type":"approval","assignee_role":"producer","order":0,'
+        '"transitions":{"approve":"peer_review","reject_final":"__rejected"}},'
+        '{"id":"peer_review","type":"review","assignee_role":"peer_reviewer","order":1,'
+        '"transitions":{}},'
+        '{"id":"producer_gate","type":"approval","assignee_role":"producer","order":2,'
+        '"transitions":{}}]}'
+    )
+    factory.session.commit()
+
+    updated = backfill_album_workflow_configs(factory.session)
+    factory.session.refresh(album)
+    stored = json.loads(album.workflow_config)
+    intake = next(step for step in stored["steps"] if step["id"] == "intake")
+
+    assert updated == 1
+    assert intake["transitions"]["accept"] == "peer_review"
+    assert intake["transitions"]["accept_producer_direct"] == "producer_gate"
+
+
+def test_upgrade_config_removes_legacy_final_review_approve_transition():
+    config = {
+        "version": 2,
+        "steps": [
+            {"id": "mastering", "transitions": {}},
+            {
+                "id": "final_review",
+                "transitions": {
+                    "approve": "__completed",
+                    "reject": "mastering_revision",
+                },
+            },
+            {"id": "mastering_revision", "transitions": {}},
+        ],
+    }
+
+    upgraded, changes = upgrade_config_with_backward_transitions(config)
+
+    final_review = next(step for step in upgraded["steps"] if step["id"] == "final_review")
+    assert "approve" not in final_review["transitions"]
+    assert final_review["transitions"]["reject_to_mastering"] == "mastering"
+    assert any("removed legacy approve transition" in change for change in changes)

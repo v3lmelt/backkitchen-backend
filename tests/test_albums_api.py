@@ -1,5 +1,9 @@
+import copy
+import json
+
 from app.models.issue import IssuePhase, IssueStatus
 from app.models.track import TrackStatus
+from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 
 def test_create_album(client, factory, auth_headers):
@@ -138,3 +142,56 @@ def test_list_album_tracks_forbidden_for_outsider(client, factory, auth_headers)
 
     response = client.get(f"/api/albums/{album.id}/tracks", headers=auth_headers(outsider))
     assert response.status_code == 403
+
+
+def test_create_album_sets_default_workflow_config(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(producer),
+        json={"title": "Workflow Album", "description": "desc"},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    normalized_response = json.loads(json.dumps(body["workflow_config"]))
+    normalized_default = json.loads(json.dumps(DEFAULT_WORKFLOW_CONFIG))
+
+    for step in normalized_response.get("steps", []):
+        for key in [
+            "ui_variant",
+            "return_to",
+            "revision_step",
+            "allow_permanent_reject",
+            "assignment_mode",
+            "reviewer_pool",
+            "required_reviewer_count",
+            "assignee_user_id",
+            "require_confirmation",
+        ]:
+            if step.get(key) is None:
+                step.pop(key, None)
+
+    assert normalized_response == normalized_default
+
+
+def test_update_workflow_rejects_forward_reject_to_target(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[producer])
+
+    bad_config = copy.deepcopy(DEFAULT_WORKFLOW_CONFIG)
+    for step in bad_config["steps"]:
+        if step["id"] == "producer_gate":
+            step["transitions"]["reject_to_forward"] = "mastering"
+            break
+
+    response = client.put(
+        f"/api/albums/{album.id}/workflow",
+        headers=auth_headers(producer),
+        json=bad_config,
+    )
+
+    assert response.status_code == 422
+    assert "must target an earlier step" in response.text

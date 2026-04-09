@@ -1,9 +1,11 @@
+import json
 from io import BytesIO
 
 from sqlalchemy import select
 
 from app.models.comment import Comment
 from app.models.issue import Issue, IssuePhase, IssueStatus
+from app.models.stage_assignment import StageAssignment
 from app.models.track import TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 
@@ -412,3 +414,129 @@ def test_add_comment_text_only(client, factory, auth_headers):
     body = response.json()
     assert body["content"] == "Just a text comment"
     assert body["images"] == []
+
+
+def test_create_issue_custom_review_step_allows_stage_assignment_reviewer(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_review",
+                    "label": "Custom Review",
+                    "type": "review",
+                    "ui_variant": "generic",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "final_gate"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 1,
+                },
+                {
+                    "id": "final_gate",
+                    "label": "Final Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_review"
+    db_session.add(
+        StageAssignment(
+            track_id=track.id,
+            stage_id="custom_review",
+            user_id=reviewer.id,
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        json={
+            "title": "Needs tweak",
+            "description": "Custom review note",
+            "phase": "custom_review",
+            "severity": "major",
+            "markers": [],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["phase"] == "custom_review"
+
+
+def test_create_issue_custom_review_step_rejects_unassigned_member(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    outsider = factory.user(username="outsider")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer, outsider],
+    )
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_review",
+                    "label": "Custom Review",
+                    "type": "review",
+                    "ui_variant": "generic",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "final_gate"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 1,
+                },
+                {
+                    "id": "final_gate",
+                    "label": "Final Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_review"
+    db_session.add(
+        StageAssignment(
+            track_id=track.id,
+            stage_id="custom_review",
+            user_id=reviewer.id,
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(outsider),
+        json={
+            "title": "Unauthorized note",
+            "description": "Should fail",
+            "phase": "custom_review",
+            "severity": "major",
+            "markers": [],
+        },
+    )
+
+    assert response.status_code == 403

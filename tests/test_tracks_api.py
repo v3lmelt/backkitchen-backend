@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
 
 from sqlalchemy import select
 
 from app.models.issue import IssuePhase, IssueStatus
 from app.models.master_delivery import MasterDelivery
+from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 from app.models.workflow_event import WorkflowEvent
@@ -219,6 +221,45 @@ def test_return_to_mastering_requires_open_final_review_issue(client, db_session
     )
     assert success.status_code == 200
     assert success.json()["status"] == TrackStatus.MASTERING.value
+
+
+def test_submitter_can_request_reopen_to_mastering_after_completion(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.COMPLETED)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/reopen-request",
+        headers=auth_headers(submitter),
+        json={"target_stage_id": "mastering", "reason": "Need another mastering pass."},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["track_id"] == track.id
+    assert body["target_stage_id"] == "mastering"
+    assert body["status"] == "pending"
+
+
+def test_producer_can_direct_reopen_completed_track_to_mastering(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.COMPLETED)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/reopen",
+        headers=auth_headers(producer),
+        json={"target_stage_id": "mastering"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == TrackStatus.MASTERING.value
+    assert body["workflow_cycle"] == track.workflow_cycle + 1
 
 
 def test_get_track_detail(client, factory, auth_headers):
@@ -523,3 +564,220 @@ def test_delete_track_removes_audio_file(client, db_session, factory, auth_heade
     db_session.expire_all()
     assert db_session.get(Track, track_id) is None
     assert not audio_path.exists()
+
+
+def test_assign_reviewer_rejects_non_album_member(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    valid_reviewer = factory.user(username="valid_reviewer")
+    outsider = factory.user(username="outsider")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, valid_reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.PEER_REVIEW,
+        peer_reviewer=valid_reviewer,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/assign-reviewer",
+        headers=auth_headers(producer),
+        json={"user_ids": [outsider.id]},
+    )
+
+    assert response.status_code == 400
+    assert "not members" in response.text
+
+
+def test_reassign_reviewer_rejects_non_album_member(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    current_reviewer = factory.user(username="reviewer")
+    outsider = factory.user(username="outsider")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, current_reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.PEER_REVIEW,
+        peer_reviewer=current_reviewer,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/reassign-reviewer",
+        headers=auth_headers(producer),
+        json={"user_id": outsider.id},
+    )
+
+    assert response.status_code == 400
+    assert "not a member" in response.text
+
+
+def test_upload_source_version_custom_revision_requires_assigned_user(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    outsider = factory.user(username="outsider")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, outsider])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_revision",
+                    "label": "Custom Revision",
+                    "type": "revision",
+                    "ui_variant": "generic",
+                    "assignee_role": "submitter",
+                    "order": 0,
+                    "return_to": "final_gate",
+                    "transitions": {},
+                },
+                {
+                    "id": "final_gate",
+                    "label": "Final Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_revision"
+    db_session.add(
+        StageAssignment(
+            track_id=track.id,
+            stage_id="custom_revision",
+            user_id=outsider.id,
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(outsider),
+        files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
+    )
+
+    assert response.status_code == 403
+    assert "assigned user" in response.text
+
+
+def test_upload_master_delivery_custom_delivery_requires_assigned_user(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    outsider = factory.user(username="outsider")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, outsider])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_delivery",
+                    "label": "Custom Delivery",
+                    "type": "delivery",
+                    "ui_variant": "generic",
+                    "assignee_role": "mastering_engineer",
+                    "order": 0,
+                    "transitions": {"deliver": "final_gate"},
+                    "require_confirmation": False,
+                },
+                {
+                    "id": "final_gate",
+                    "label": "Final Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_delivery"
+    db_session.add(
+        StageAssignment(
+            track_id=track.id,
+            stage_id="custom_delivery",
+            user_id=outsider.id,
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/master-deliveries",
+        headers=auth_headers(outsider),
+        files={"file": ("master.mp3", b"ID3master", "audio/mpeg")},
+    )
+
+    assert response.status_code == 403
+    assert "assigned user" in response.text
+
+
+def test_create_issue_custom_step_rejects_mismatched_phase(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_review",
+                    "label": "Custom Review",
+                    "type": "review",
+                    "ui_variant": "generic",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "final_gate"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 1,
+                },
+                {
+                    "id": "final_gate",
+                    "label": "Final Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_review"
+    db_session.add(
+        StageAssignment(
+            track_id=track.id,
+            stage_id="custom_review",
+            user_id=reviewer.id,
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        json={
+            "title": "Wrong phase",
+            "description": "Phase should be rejected",
+            "phase": "peer",
+            "severity": "major",
+            "markers": [],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "must match current workflow step" in response.text
