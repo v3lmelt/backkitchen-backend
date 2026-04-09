@@ -9,8 +9,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
+from app.models.album import Album
 from app.models.circle import Circle, CircleInviteCode, CircleMember
 from app.models.user import User
+from app.models.workflow_template import WorkflowTemplate
 from app.schemas.schemas import (
     CircleCreate,
     CircleMemberRead,
@@ -353,4 +355,85 @@ def remove_member(
         raise HTTPException(status_code=404, detail="Member not found")
 
     db.delete(member)
+    db.commit()
+
+
+# ── leave circle (self-service, non-owner) ───────────────────────────────────
+@router.post("/{circle_id}/leave", status_code=status.HTTP_204_NO_CONTENT)
+def leave_circle(
+    circle_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    circle = db.get(Circle, circle_id)
+    if not circle:
+        raise HTTPException(status_code=404, detail="Circle not found")
+    if circle.created_by == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The circle owner cannot leave. Delete the circle instead.",
+        )
+    member = db.execute(
+        select(CircleMember).where(
+            CircleMember.circle_id == circle_id,
+            CircleMember.user_id == current_user.id,
+        )
+    ).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="You are not a member of this circle")
+
+    db.delete(member)
+    db.commit()
+
+
+# ── delete circle (owner only) ───────────────────────────────────────────────
+@router.delete("/{circle_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_circle(
+    circle_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    circle = db.get(Circle, circle_id)
+    if not circle:
+        raise HTTPException(status_code=404, detail="Circle not found")
+    _ensure_circle_producer(circle, current_user)
+
+    # Refuse if any non-archived album is still linked to this circle.
+    active_album = db.execute(
+        select(Album.id).where(
+            Album.circle_id == circle_id,
+            Album.archived_at.is_(None),
+        ).limit(1)
+    ).scalar_one_or_none()
+    if active_album is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot delete circle: there are active albums linked to it. Archive or unlink them first.",
+        )
+
+    # Detach archived albums from the circle (set circle_id and workflow_template_id = NULL)
+    # so history is preserved and templates being deleted don't break FK references.
+    template_ids = list(db.scalars(
+        select(WorkflowTemplate.id).where(WorkflowTemplate.circle_id == circle_id)
+    ).all())
+    if template_ids:
+        db.execute(
+            Album.__table__.update()
+            .where(Album.workflow_template_id.in_(template_ids))
+            .values(workflow_template_id=None)
+        )
+    db.execute(
+        Album.__table__.update()
+        .where(Album.circle_id == circle_id)
+        .values(circle_id=None)
+    )
+
+    # Delete workflow templates tied to this circle (no cascade relationship exists)
+    if template_ids:
+        db.execute(
+            WorkflowTemplate.__table__.delete().where(WorkflowTemplate.circle_id == circle_id)
+        )
+
+    # Delete related invite codes and members via ORM cascade
+    db.delete(circle)
     db.commit()
