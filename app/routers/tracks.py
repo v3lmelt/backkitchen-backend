@@ -49,6 +49,7 @@ from app.workflow_engine import (
 )
 from app.notifications import notify
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
+from app.ws_manager import manager as ws_manager
 from app.services.audio import extract_audio_metadata
 from app.services.upload import stream_upload_sync
 from app.workflow import (
@@ -69,6 +70,11 @@ router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 
 # Resolved once at startup to avoid a mkdir syscall on every file-serve request.
 _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
+
+
+def _broadcast_track_updated(background_tasks: BackgroundTasks, track_id: int) -> None:
+    """Schedule a WebSocket broadcast notifying subscribers that a track changed."""
+    background_tasks.add_task(ws_manager.broadcast, track_id, {"type": "track_updated", "track_id": track_id})
 
 # Used only for truly immutable URLs (source-version snapshots addressed by numeric ID).
 _AUDIO_CACHE_MAX_AGE = 86400

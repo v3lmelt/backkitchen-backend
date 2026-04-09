@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +8,7 @@ from pathlib import Path
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from app.ws_manager import manager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, select, text
@@ -42,53 +42,6 @@ from app.routers import admin as admin_router
 from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users, workflow_templates
 from app.security import _decode_token, hash_password
 from app.workflow import is_album_completed, log_track_event
-
-
-class ConnectionManager:
-    MAX_CONNECTIONS_PER_TRACK = 50
-    MAX_TOTAL_CONNECTIONS = 200
-
-    def __init__(self) -> None:
-        self.active_connections: dict[int, list[WebSocket]] = defaultdict(list)
-        self._total_count = 0
-
-    async def connect(self, track_id: int, websocket: WebSocket) -> bool:
-        """Accept and register a WebSocket. Returns False if limits exceeded."""
-        if self._total_count >= self.MAX_TOTAL_CONNECTIONS:
-            await websocket.accept()
-            await websocket.close(code=1013, reason="Server connection limit reached")
-            return False
-        if len(self.active_connections[track_id]) >= self.MAX_CONNECTIONS_PER_TRACK:
-            await websocket.accept()
-            await websocket.close(code=1013, reason="Track connection limit reached")
-            return False
-        await websocket.accept()
-        self.active_connections[track_id].append(websocket)
-        self._total_count += 1
-        return True
-
-    def disconnect(self, track_id: int, websocket: WebSocket) -> None:
-        conns = self.active_connections.get(track_id, [])
-        if websocket in conns:
-            conns.remove(websocket)
-            self._total_count -= 1
-        if not conns and track_id in self.active_connections:
-            del self.active_connections[track_id]
-
-    async def broadcast(self, track_id: int, message: dict) -> None:
-        payload = json.dumps(message)
-        dead: list[WebSocket] = []
-        for ws in self.active_connections.get(track_id, []):
-            try:
-                await ws.send_text(payload)
-            except Exception as exc:  # noqa: BLE001
-                logging.getLogger(__name__).warning("WebSocket send failed: %s", exc)
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(track_id, ws)
-
-
-manager = ConnectionManager()
 
 
 def _run_sqlite_compat_migrations() -> None:
