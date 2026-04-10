@@ -152,8 +152,8 @@ def _handle_delivery_status(
         )
         # Notify mastering engineer that delivery needs confirmation
         notify(db, [album.mastering_engineer_id], "delivery_awaiting_confirmation",
-               "主控文件待确认",
-               f"「{track.title}」的主控文件已上传，请确认后继续流程",
+               "母带文件待确认",
+               f"「{track.title}」的母带文件已上传，请确认后继续流程",
                related_track_id=track.id,
                background_tasks=background_tasks, album_id=track.album_id)
         return
@@ -163,8 +163,8 @@ def _handle_delivery_status(
         from_status=previous_status, to_status=track.status,
         payload={"delivery_number": delivery_number},
     )
-    notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "主控文件已上传",
-           f"「{track.title}」主控文件已上传，等待审核", related_track_id=track.id,
+    notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "母带文件已上传",
+           f"「{track.title}」母带文件已上传，等待审核", related_track_id=track.id,
            background_tasks=background_tasks, album_id=track.album_id)
 
 
@@ -649,8 +649,8 @@ def confirm_delivery(
         from_status=previous_status, to_status=track.status,
         payload={"delivery_id": delivery.id, "delivery_number": delivery.delivery_number},
     )
-    notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "主控文件已确认",
-           f"「{track.title}」主控文件已确认，等待审核", related_track_id=track.id,
+    notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "母带文件已确认",
+           f"「{track.title}」母带文件已确认，等待审核", related_track_id=track.id,
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
