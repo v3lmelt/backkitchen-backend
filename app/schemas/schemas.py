@@ -473,6 +473,7 @@ class TrackDetailResponse(BaseModel):
     checklist_items: list[ChecklistItemRead]
     events: list[WorkflowEventRead]
     source_versions: list[TrackSourceVersionRead] = []
+    master_deliveries: list[MasterDeliveryRead] = []
     discussions: list["DiscussionRead"] = []
     workflow_config: "WorkflowConfigSchema | None" = None
 

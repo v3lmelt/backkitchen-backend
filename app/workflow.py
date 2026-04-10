@@ -471,11 +471,12 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
 
     anonymize = should_anonymize_track(track, user, album)
     return TrackDetailResponse(
-        track=build_track_read(track, user, album, anonymize=anonymize),
+        track=build_track_read(track, user, album, db=db, anonymize=anonymize),
         issues=issues,
         checklist_items=checklist_items,
         events=events,
         source_versions=[TrackSourceVersionRead.model_validate(v) for v in track.source_versions],
+        master_deliveries=[MasterDeliveryRead.model_validate(d) for d in track.master_deliveries],
         discussions=discussions,
         workflow_config=wf_config_schema,
     )

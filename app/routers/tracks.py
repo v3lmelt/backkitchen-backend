@@ -1360,3 +1360,28 @@ def serve_master_audio(
         raise HTTPException(status_code=404, detail="No master delivery is available for this track.")
     # immutable=False: same URL serves new master deliveries across workflow cycles
     return _serve_audio(delivery.file_path, delivery.storage_backend, f"{track.title}-master", resolve, immutable=False)
+
+
+@router.get("/{track_id}/master-deliveries/{delivery_id}/audio")
+def get_master_delivery_audio(
+    track_id: int,
+    delivery_id: int,
+    resolve: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    bearer_user: User | None = Depends(get_current_user_optional),
+    token_user: User | None = Depends(get_user_from_token_param),
+):
+    current_user = _resolve_audio_user(bearer_user, token_user)
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+
+    delivery = db.get(MasterDelivery, delivery_id)
+    if delivery is None or delivery.track_id != track_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found.")
+
+    filename = f"{track.title}-master-v{delivery.delivery_number}"
+    if delivery.workflow_cycle != track.workflow_cycle:
+        filename = f"{filename}-cycle-{delivery.workflow_cycle}"
+    return _serve_audio(delivery.file_path, delivery.storage_backend, filename, resolve, immutable=True)

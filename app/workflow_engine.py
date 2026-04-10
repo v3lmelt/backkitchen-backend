@@ -36,6 +36,23 @@ from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG, SPECIAL_TARGETS, STEP
 
 logger = logging.getLogger(__name__)
 
+
+def _is_delivery_transition_user_visible(step: "StepDef", decision: str) -> bool:
+    """Return whether a delivery-step transition should appear in the action bar.
+
+    Delivery advancement is driven by delivery upload/confirmation endpoints, so
+    the workflow transition API should only expose the non-upload side actions
+    (for example, requesting a revision). Older default configs also included a
+    mastering -> producer rollback that is no longer a valid path.
+    """
+    if step.type != "delivery":
+        return True
+    if decision == "deliver":
+        return False
+    if (step.ui_variant == "mastering" or step.id == "mastering") and decision == "reject_to_producer_gate":
+        return False
+    return True
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -425,6 +442,8 @@ def get_allowed_transitions(
 
     options: list[TransitionOption] = []
     for decision, target in step.transitions.items():
+        if not _is_delivery_transition_user_visible(step, decision):
+            continue
         label = decision.replace("_", " ").title()
         options.append(TransitionOption(decision=decision, target=target, label=label))
 
@@ -523,6 +542,12 @@ def execute_transition(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid decision '{decision}' for step '{step.id}'. "
             f"Valid: {list(step.transitions.keys())}",
+        )
+
+    if not _is_delivery_transition_user_visible(step, decision):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This delivery action must be completed from the delivery upload flow, not the workflow action bar.",
         )
 
     if step.type == "review" and (step.ui_variant == "peer_review" or step.id == "peer_review"):

@@ -107,7 +107,6 @@ DEFAULT_WORKFLOW_CONFIG: dict = {
             "transitions": {
                 "deliver": "final_review",
                 "request_revision": "mastering_revision",
-                "reject_to_producer_gate": "producer_gate",
             },
             "revision_step": "mastering_revision",
             "require_confirmation": True,
