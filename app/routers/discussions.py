@@ -13,7 +13,7 @@ from app.models.discussion import TrackDiscussion, TrackDiscussionImage
 from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
-from app.schemas.schemas import DiscussionImageRead, DiscussionRead, UserRead
+from app.schemas.schemas import DiscussionImageRead, DiscussionRead, DiscussionUpdate, UserRead
 from app.security import get_current_user
 from app.services.upload import stream_upload
 from app.workflow import ensure_track_visibility
@@ -141,3 +141,44 @@ async def create_discussion(
     db.commit()
     db.refresh(discussion)
     return _build_discussion_read(discussion)
+
+
+@router.patch(
+    "/api/discussions/{discussion_id}",
+    response_model=DiscussionRead,
+)
+def update_discussion(
+    discussion_id: int,
+    payload: DiscussionUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DiscussionRead:
+    discussion = db.get(TrackDiscussion, discussion_id)
+    if discussion is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discussion not found.")
+    if discussion.author_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can edit this discussion.")
+
+    discussion.content = payload.content
+    db.commit()
+    db.refresh(discussion)
+    return _build_discussion_read(discussion)
+
+
+@router.delete(
+    "/api/discussions/{discussion_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_discussion(
+    discussion_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    discussion = db.get(TrackDiscussion, discussion_id)
+    if discussion is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discussion not found.")
+    if discussion.author_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can delete this discussion.")
+
+    db.delete(discussion)
+    db.commit()

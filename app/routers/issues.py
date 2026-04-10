@@ -19,7 +19,7 @@ from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
 from app.schemas.schemas import (
-    CommentRead, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead, IssueUpdate,
+    CommentRead, CommentUpdate, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead, IssueUpdate,
     PresignedCommentAudioResponse, PresignedUploadResponse, RequestCommentAudioUploadParams,
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
@@ -631,3 +631,45 @@ def serve_comment_audio(
     }
     media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
     return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)
+
+
+# ── comment edit / delete ──────────────────────────────────────────────────
+
+
+@router.patch("/api/comments/{comment_id}", response_model=CommentRead)
+def update_comment(
+    comment_id: int,
+    payload: CommentUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CommentRead:
+    comment = db.get(Comment, comment_id)
+    if comment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
+    if comment.author_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can edit this comment.")
+    if comment.is_status_note:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Status notes cannot be edited.")
+
+    comment.content = payload.content
+    db.commit()
+    db.refresh(comment)
+    return build_comment_read(comment, db)
+
+
+@router.delete("/api/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_comment(
+    comment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    comment = db.get(Comment, comment_id)
+    if comment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
+    if comment.author_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can delete this comment.")
+    if comment.is_status_note:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Status notes cannot be deleted.")
+
+    db.delete(comment)
+    db.commit()

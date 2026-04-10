@@ -521,6 +521,14 @@ class DiscussionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DiscussionUpdate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=5000)
+
+
+class CommentUpdate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=5000)
+
+
 class WebhookConfig(BaseModel):
     url: str = ""
     enabled: bool = False
