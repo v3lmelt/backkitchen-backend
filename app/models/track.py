@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -80,6 +80,7 @@ class Track(Base):
         nullable=False,
     )
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None, index=True)
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
 
     album: Mapped["Album"] = relationship("Album", back_populates="tracks")  # noqa: F821
     submitter: Mapped["User | None"] = relationship(  # noqa: F821
