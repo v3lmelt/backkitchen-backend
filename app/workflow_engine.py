@@ -440,10 +440,20 @@ def get_allowed_transitions(
     elif not user_matches_role(user, album, track, step):
         return []
 
+    steps = get_steps(config)
+
     options: list[TransitionOption] = []
     for decision, target in step.transitions.items():
         if not _is_delivery_transition_user_visible(step, decision):
             continue
+        # Hide transitions whose target step has a lower order than the
+        # current step — this happens when users reorder the workflow
+        # (e.g. peer_review before intake) and the hardcoded transitions
+        # still point back to an already-completed earlier step.
+        if target not in SPECIAL_TARGETS:
+            target_step = get_step_by_id(steps, target)
+            if target_step and target_step.order < step.order:
+                continue
         label = decision.replace("_", " ").title()
         options.append(TransitionOption(decision=decision, target=target, label=label))
 
