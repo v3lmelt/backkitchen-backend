@@ -3,7 +3,6 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-from app.models.issue import IssuePhase, IssueStatus
 from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
@@ -110,40 +109,6 @@ def test_upload_source_version_resubmittable_resets_cycle_and_assignment(client,
     assert max(version.workflow_cycle for version in versions) == 2
 
 
-def test_finish_peer_review_requires_checklist_and_advances_state(client, db_session, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    reviewer = factory.user(username="reviewer")
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
-    track = factory.track(
-        album=album,
-        submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
-        peer_reviewer=reviewer,
-    )
-
-    failure = client.post(
-        f"/api/tracks/{track.id}/peer-review/finish",
-        headers=auth_headers(reviewer),
-        json={"decision": "pass"},
-    )
-    assert failure.status_code == 409
-
-    source_version = db_session.scalars(
-        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
-    ).first()
-    factory.checklist(track=track, reviewer=reviewer, source_version_id=source_version.id)
-
-    success = client.post(
-        f"/api/tracks/{track.id}/peer-review/finish",
-        headers=auth_headers(reviewer),
-        json={"decision": "pass"},
-    )
-    assert success.status_code == 200
-    assert success.json()["status"] == TrackStatus.PRODUCER_MASTERING_GATE.value
-
-
 def test_upload_master_delivery_increments_delivery_number(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -191,36 +156,6 @@ def test_final_review_requires_two_approvals_to_complete(client, db_session, fac
     db_session.refresh(delivery)
     assert delivery.producer_approved_at is not None
     assert delivery.submitter_approved_at is not None
-
-
-def test_return_to_mastering_requires_open_final_review_issue(client, db_session, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.FINAL_REVIEW)
-    delivery = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
-
-    failure = client.post(
-        f"/api/tracks/{track.id}/final-review/return",
-        headers=auth_headers(producer),
-    )
-    assert failure.status_code == 409
-
-    factory.issue(
-        track=track,
-        author=producer,
-        phase=IssuePhase.FINAL_REVIEW,
-        status=IssueStatus.OPEN,
-        master_delivery_id=delivery.id,
-    )
-
-    success = client.post(
-        f"/api/tracks/{track.id}/final-review/return",
-        headers=auth_headers(producer),
-    )
-    assert success.status_code == 200
-    assert success.json()["status"] == TrackStatus.MASTERING.value
 
 
 def test_submitter_can_request_reopen_to_mastering_after_completion(client, factory, auth_headers):
@@ -289,152 +224,6 @@ def test_get_track_not_found(client, factory, auth_headers):
     user = factory.user()
     response = client.get("/api/tracks/99999", headers=auth_headers(user))
     assert response.status_code == 404
-
-
-def test_intake_accept_assigns_peer_reviewer(client, db_session, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    reviewer = factory.user(username="reviewer")
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/intake-decision",
-        headers=auth_headers(producer),
-        json={"decision": "accept"},
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == TrackStatus.PEER_REVIEW.value
-    assert body["peer_reviewer_id"] is not None
-
-
-def test_intake_reject_resubmittable(client, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/intake-decision",
-        headers=auth_headers(producer),
-        json={"decision": "reject_resubmittable"},
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == TrackStatus.REJECTED.value
-    assert body["rejection_mode"] == RejectionMode.RESUBMITTABLE.value
-
-
-def test_intake_reject_final(client, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/intake-decision",
-        headers=auth_headers(producer),
-        json={"decision": "reject_final"},
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == TrackStatus.REJECTED.value
-    assert body["rejection_mode"] == RejectionMode.FINAL.value
-
-
-def test_intake_forbidden_for_non_producer(client, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/intake-decision",
-        headers=auth_headers(submitter),
-        json={"decision": "accept"},
-    )
-    assert response.status_code == 403
-
-
-def test_producer_gate_send_to_mastering(client, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PRODUCER_MASTERING_GATE)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/producer-gate",
-        headers=auth_headers(producer),
-        json={"decision": "send_to_mastering"},
-    )
-    assert response.status_code == 200
-    assert response.json()["status"] == TrackStatus.MASTERING.value
-
-
-def test_producer_gate_request_peer_revision(client, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PRODUCER_MASTERING_GATE)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/producer-gate",
-        headers=auth_headers(producer),
-        json={"decision": "request_peer_revision"},
-    )
-    assert response.status_code == 200
-    assert response.json()["status"] == TrackStatus.PEER_REVISION.value
-
-
-def test_producer_gate_forbidden_for_non_producer(client, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PRODUCER_MASTERING_GATE)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/producer-gate",
-        headers=auth_headers(submitter),
-        json={"decision": "send_to_mastering"},
-    )
-    assert response.status_code == 403
-
-
-def test_mastering_request_revision(client, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.MASTERING)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/mastering/request-revision",
-        headers=auth_headers(mastering),
-    )
-    assert response.status_code == 200
-    assert response.json()["status"] == TrackStatus.MASTERING_REVISION.value
-
-
-def test_mastering_request_revision_forbidden_for_non_mastering(client, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.MASTERING)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/mastering/request-revision",
-        headers=auth_headers(submitter),
-    )
-    assert response.status_code == 403
 
 
 def test_upload_source_version_from_peer_revision(client, db_session, factory, auth_headers):
@@ -511,30 +300,6 @@ def test_upload_source_version_forbidden_for_non_submitter(client, factory, auth
         files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
     )
     assert response.status_code == 403
-
-
-def test_finish_peer_review_needs_revision(client, db_session, factory, auth_headers):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    reviewer = factory.user(username="reviewer")
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
-    track = factory.track(
-        album=album,
-        submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
-        peer_reviewer=reviewer,
-    )
-    source_version = track.source_versions[-1]
-    factory.checklist(track=track, reviewer=reviewer, source_version_id=source_version.id)
-
-    response = client.post(
-        f"/api/tracks/{track.id}/peer-review/finish",
-        headers=auth_headers(reviewer),
-        json={"decision": "needs_revision"},
-    )
-    assert response.status_code == 200
-    assert response.json()["status"] == TrackStatus.PEER_REVISION.value
 
 
 def test_delete_track_forbidden_for_outsider(client, factory, auth_headers):

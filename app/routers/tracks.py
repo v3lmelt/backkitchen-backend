@@ -13,8 +13,6 @@ from app.config import settings
 from app.database import get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
-from app.models.checklist import ChecklistItem
-from app.models.issue import Issue, IssuePhase, IssueStatus
 from app.models.master_delivery import MasterDelivery
 from app.models.reopen_request import ReopenRequest
 from app.models.stage_assignment import StageAssignment
@@ -27,9 +25,7 @@ from app.schemas.schemas import (
     ConfirmTrackUploadParams,
     ConfirmUploadParams,
     DirectReopenRequest,
-    IntakeDecisionRequest,
     PresignedUploadResponse,
-    ProducerGateDecisionRequest,
     ReopenDecisionRequest,
     ReopenRequestCreate,
     ReopenRequestRead,
@@ -39,7 +35,6 @@ from app.schemas.schemas import (
     TrackDetailResponse,
     TrackListItem,
     TrackRead,
-    PeerReviewDecisionRequest,
     WorkflowTransitionRequest,
 )
 from app.workflow_engine import (
@@ -57,7 +52,6 @@ from app.ws_manager import manager as ws_manager
 from app.services.audio import extract_audio_metadata
 from app.services.upload import stream_upload_sync
 from app.workflow import (
-    assign_random_peer_reviewer,
     build_track_detail,
     build_track_read,
     current_master_delivery,
@@ -1110,233 +1104,6 @@ def upload_source_version(
     return build_track_read(track, current_user, album)
 
 
-@router.post("/{track_id}/intake-decision", response_model=TrackRead)
-def intake_decision(
-    track_id: int,
-    payload: IntakeDecisionRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> TrackRead:
-    track = db.get(Track, track_id)
-    if track is None:
-        raise HTTPException(status_code=404, detail="Track not found.")
-    album = ensure_track_visibility(track, current_user, db)
-    if album.producer_id != current_user.id or track.status != TrackStatus.SUBMITTED:
-        raise HTTPException(status_code=403, detail="Only the producer can intake submitted tracks.")
-
-    previous_status = track.status
-    if payload.decision == "accept":
-        selected = assign_random_peer_reviewer(db, album, track)
-        track.status = TrackStatus.PEER_REVIEW
-        track.rejection_mode = None
-        track.workflow_variant = WorkflowVariant.STANDARD.value
-        log_track_event(
-            db,
-            track,
-            current_user,
-            "submission_accepted",
-            from_status=previous_status,
-            to_status=track.status,
-            payload={"peer_reviewer_id": selected, "workflow_variant": track.workflow_variant},
-        )
-        notify(db, [track.submitter_id], "track_status_changed", "曲目进入审核",
-               f"「{track.title}」已进入同行审核阶段", related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
-    elif payload.decision == "accept_producer_direct":
-        # Producer-direct path: skip peer review entirely. Track goes straight
-        # to the producer mastering gate, where the producer raises issues
-        # themselves (phase='producer') and then decides whether to send to
-        # mastering. peer_reviewer_id stays null.
-        track.status = TrackStatus.PRODUCER_MASTERING_GATE
-        track.rejection_mode = None
-        track.peer_reviewer_id = None
-        track.workflow_variant = WorkflowVariant.PRODUCER_DIRECT.value
-        log_track_event(
-            db,
-            track,
-            current_user,
-            "submission_accepted",
-            from_status=previous_status,
-            to_status=track.status,
-            payload={"workflow_variant": track.workflow_variant},
-        )
-        notify(db, [track.submitter_id], "track_status_changed", "制作人直接审核",
-               f"「{track.title}」已由制作人接收，进入制作人审核阶段", related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
-    else:
-        track.status = TrackStatus.REJECTED
-        track.peer_reviewer_id = None
-        track.rejection_mode = (
-            RejectionMode.FINAL if payload.decision == "reject_final" else RejectionMode.RESUBMITTABLE
-        )
-        log_track_event(
-            db,
-            track,
-            current_user,
-            "submission_rejected",
-            from_status=previous_status,
-            to_status=track.status,
-            payload={"rejection_mode": track.rejection_mode.value},
-        )
-        # Schedule file cleanup for final rejections (1 day retention)
-        if track.rejection_mode == RejectionMode.FINAL:
-            expiry = datetime.now(timezone.utc) + timedelta(days=1)
-            for sv in track.source_versions:
-                sv.expires_at = expiry
-        notify(db, [track.submitter_id], "track_status_changed", "曲目被退回",
-               f"「{track.title}」已被退回", related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
-
-    db.commit()
-    db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
-
-
-@router.post("/{track_id}/peer-review/finish", response_model=TrackRead)
-def finish_peer_review(
-    track_id: int,
-    payload: PeerReviewDecisionRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> TrackRead:
-    track = db.get(Track, track_id)
-    if track is None:
-        raise HTTPException(status_code=404, detail="Track not found.")
-    album = ensure_track_visibility(track, current_user, db)
-    if track.status != TrackStatus.PEER_REVIEW or track.peer_reviewer_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the assigned peer reviewer can finish peer review.")
-    source_version = current_source_version(track)
-    if source_version is None:
-        raise HTTPException(status_code=409, detail="No source version found.")
-    checklist_count = db.scalar(
-        select(func.count(ChecklistItem.id)).where(
-            ChecklistItem.track_id == track.id,
-            ChecklistItem.reviewer_id == current_user.id,
-            ChecklistItem.source_version_id == source_version.id,
-        )
-    )
-    if not checklist_count:
-        raise HTTPException(status_code=409, detail="Submit the peer review checklist before finishing the review.")
-
-    previous_status = track.status
-    track.status = (
-        TrackStatus.PEER_REVISION
-        if payload.decision == "needs_revision"
-        else TrackStatus.PRODUCER_MASTERING_GATE
-    )
-    log_track_event(
-        db,
-        track,
-        current_user,
-        "peer_review_finished",
-        from_status=previous_status,
-        to_status=track.status,
-        payload={"decision": payload.decision, "source_version_id": source_version.id},
-    )
-    if payload.decision == "needs_revision":
-        notify(db, [track.submitter_id], "track_status_changed", "需要修改",
-               f"「{track.title}」需要修改", related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
-        notify(db, [track.peer_reviewer_id], "track_status_changed", "已发送修改请求",
-               f"「{track.title}」的修改请求已发送给作者", related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
-    else:
-        notify(db, [album.producer_id], "track_status_changed", "同行审核通过",
-               f"「{track.title}」同行审核已通过", related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
-    db.commit()
-    db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
-
-
-@router.post("/{track_id}/producer-gate", response_model=TrackRead)
-def producer_gate(
-    track_id: int,
-    payload: ProducerGateDecisionRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> TrackRead:
-    track = db.get(Track, track_id)
-    if track is None:
-        raise HTTPException(status_code=404, detail="Track not found.")
-    album = ensure_track_visibility(track, current_user, db)
-    if album.producer_id != current_user.id or track.status != TrackStatus.PRODUCER_MASTERING_GATE:
-        raise HTTPException(status_code=403, detail="Only the producer can decide the mastering gate.")
-
-    previous_status = track.status
-    track.status = (
-        TrackStatus.MASTERING
-        if payload.decision == "send_to_mastering"
-        else TrackStatus.PEER_REVISION
-    )
-    log_track_event(
-        db,
-        track,
-        current_user,
-        "producer_mastering_gate_decided",
-        from_status=previous_status,
-        to_status=track.status,
-        payload={"decision": payload.decision},
-    )
-    if payload.decision == "send_to_mastering":
-        notify(db, [album.mastering_engineer_id], "track_status_changed", "曲目进入混音阶段",
-               f"「{track.title}」已进入混音阶段", related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
-    else:
-        is_producer_direct = track.workflow_variant == WorkflowVariant.PRODUCER_DIRECT.value
-        recipients = [track.submitter_id] if is_producer_direct else [track.submitter_id, track.peer_reviewer_id]
-        body = (
-            f"「{track.title}」制作人要求修改"
-            if is_producer_direct
-            else f"「{track.title}」制作人要求重新进行同行审核"
-        )
-        notify(db, recipients, "track_status_changed",
-               "制作人要求修改", body, related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
-    db.commit()
-    db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
-
-
-@router.post("/{track_id}/mastering/request-revision", response_model=TrackRead)
-def request_mastering_revision(
-    track_id: int,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> TrackRead:
-    track = db.get(Track, track_id)
-    if track is None:
-        raise HTTPException(status_code=404, detail="Track not found.")
-    album = ensure_track_visibility(track, current_user, db)
-    if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
-        raise HTTPException(status_code=403, detail="Only the mastering engineer can request source revisions.")
-
-    previous_status = track.status
-    track.status = TrackStatus.MASTERING_REVISION
-    log_track_event(
-        db,
-        track,
-        current_user,
-        "mastering_revision_requested",
-        from_status=previous_status,
-        to_status=track.status,
-    )
-    notify(db, [track.submitter_id], "track_status_changed", "混音师请求源文件修改",
-           f"「{track.title}」混音师请求修改源文件", related_track_id=track.id,
-           background_tasks=background_tasks, album_id=track.album_id)
-    db.commit()
-    db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
-
-
 @router.post("/{track_id}/master-deliveries", response_model=TrackRead)
 def upload_master_delivery(
     track_id: int,
@@ -1423,59 +1190,6 @@ def approve_final_review(
         for sv in track.source_versions:
             if sv.version_number != track.version:
                 sv.expires_at = expiry
-    db.commit()
-    db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
-
-
-@router.post("/{track_id}/final-review/return", response_model=TrackRead)
-def return_to_mastering(
-    track_id: int,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-) -> TrackRead:
-    track = db.get(Track, track_id)
-    if track is None:
-        raise HTTPException(status_code=404, detail="Track not found.")
-    album = ensure_track_visibility(track, current_user, db)
-    if track.status != TrackStatus.FINAL_REVIEW or current_user.id not in {album.producer_id, track.submitter_id}:
-        raise HTTPException(status_code=403, detail="Only the producer or submitter can return the track to mastering.")
-    delivery = current_master_delivery(track)
-    if delivery is None:
-        raise HTTPException(status_code=409, detail="No master delivery available.")
-
-    open_final_review_issues = [
-        issue
-        for issue in track.issues
-        if issue.phase == IssuePhase.FINAL_REVIEW
-        and issue.workflow_cycle == track.workflow_cycle
-        and issue.master_delivery_id == delivery.id
-        and issue.status != IssueStatus.RESOLVED
-    ]
-    if not open_final_review_issues:
-        raise HTTPException(
-            status_code=409,
-            detail="Create at least one unresolved final review issue before returning to mastering.",
-        )
-
-    delivery.producer_approved_at = None
-    delivery.submitter_approved_at = None
-    previous_status = track.status
-    track.status = TrackStatus.MASTERING
-    log_track_event(
-        db,
-        track,
-        current_user,
-        "returned_to_mastering",
-        from_status=previous_status,
-        to_status=track.status,
-        payload={"delivery_id": delivery.id, "issue_count": len(open_final_review_issues)},
-    )
-    notify(db, [album.mastering_engineer_id], "track_status_changed", "曲目退回混音阶段",
-           f"「{track.title}」已退回混音阶段", related_track_id=track.id,
-           background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
     _broadcast_track_updated(background_tasks, track_id)

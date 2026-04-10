@@ -321,23 +321,6 @@ class TrackListItem(TrackRead):
     album_title: str = ""
 
 
-class IntakeDecisionRequest(BaseModel):
-    decision: Literal[
-        "accept",
-        "accept_producer_direct",
-        "reject_final",
-        "reject_resubmittable",
-    ]
-
-
-class PeerReviewDecisionRequest(BaseModel):
-    decision: Literal["needs_revision", "pass"]
-
-
-class ProducerGateDecisionRequest(BaseModel):
-    decision: Literal["send_to_mastering", "request_peer_revision"]
-
-
 class IssueMarkerCreate(BaseModel):
     marker_type: MarkerType = MarkerType.POINT
     time_start: float = Field(..., ge=0)
