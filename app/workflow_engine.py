@@ -722,14 +722,16 @@ def upgrade_config_with_backward_transitions(config: dict) -> tuple[dict, list[s
             transitions["reject_to_producer_gate"] = "producer_gate"
             changes.append("mastering: added reject_to_producer_gate")
 
-    # 4. final_review: remove legacy single-approve action, add reject_to_mastering,
-    #    and fix broken final_revision wiring.
+    # 4. final_review: add reject_to_mastering for backward rollback, and
+    #    fix broken final_revision wiring. The legacy 'approve → __completed'
+    #    transition is left intact — removing it was an old mistake that
+    #    stranded workflows without any completion path (runtime schema
+    #    validator still requires one of: __completed transition, or a
+    #    final_review step). final_review completes via the dedicated
+    #    /final-review/approve dual-confirmation endpoint regardless.
     if "final_review" in step_ids and "mastering" in step_ids:
         final_review = next(s for s in steps if s.get("id") == "final_review")
         transitions = final_review.setdefault("transitions", {})
-        if transitions.get("approve") == "__completed":
-            del transitions["approve"]
-            changes.append("final_review: removed legacy approve transition")
         if "reject_to_mastering" not in transitions:
             transitions["reject_to_mastering"] = "mastering"
             changes.append("final_review: added reject_to_mastering")

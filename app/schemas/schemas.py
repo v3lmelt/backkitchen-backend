@@ -660,13 +660,20 @@ class WorkflowConfigSchema(BaseModel):
                         f"must be of type 'revision'"
                     )
 
-        # At least one path to __completed
-        has_completed = any(
+        # Completion path requirement: either a transition to __completed
+        # (generic engine path) or a final_review step (which completes via
+        # the dedicated /final-review/approve dual-confirmation endpoint).
+        has_completed_transition = any(
             "__completed" in step.transitions.values() for step in self.steps
         )
-        if not has_completed:
+        has_final_review_step = any(
+            step.ui_variant == "final_review" or step.id == "final_review"
+            for step in self.steps
+        )
+        if not (has_completed_transition or has_final_review_step):
             raise ValueError(
-                "Workflow must have at least one transition to '__completed'"
+                "Workflow must have at least one path to completion "
+                "(either a transition to '__completed' or a 'final_review' step)"
             )
 
         return self

@@ -180,7 +180,14 @@ def test_backfill_album_workflow_configs_updates_stored_intake_transition(factor
     assert intake["transitions"]["accept_producer_direct"] == "producer_gate"
 
 
-def test_upgrade_config_removes_legacy_final_review_approve_transition():
+def test_upgrade_config_preserves_final_review_approve_transition():
+    """The legacy approve→__completed transition must be preserved.
+
+    Removing it strands workflows without any completion path. final_review
+    can still complete via the dedicated /final-review/approve endpoint,
+    but the transition is also a valid completion path used by the generic
+    workflow engine, and the schema validator requires one of the two.
+    """
     config = {
         "version": 2,
         "steps": [
@@ -199,6 +206,6 @@ def test_upgrade_config_removes_legacy_final_review_approve_transition():
     upgraded, changes = upgrade_config_with_backward_transitions(config)
 
     final_review = next(step for step in upgraded["steps"] if step["id"] == "final_review")
-    assert "approve" not in final_review["transitions"]
+    assert final_review["transitions"]["approve"] == "__completed"
     assert final_review["transitions"]["reject_to_mastering"] == "mastering"
-    assert any("removed legacy approve transition" in change for change in changes)
+    assert not any("removed legacy approve transition" in change for change in changes)
