@@ -46,14 +46,13 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
     phase_deadlines = json.loads(album.phase_deadlines) if album.phase_deadlines else None
     genres = json.loads(album.genres) if album.genres else None
     workflow_config: WorkflowConfigSchema | None = None
-    if album.workflow_config:
-        try:
-            workflow_config = WorkflowConfigSchema(**json.loads(album.workflow_config))
-        except Exception:
-            logger.warning(
-                "Album %d has an invalid workflow_config and will be read without it.",
-                album.id,
-            )
+    try:
+        workflow_config = WorkflowConfigSchema(**json.loads(album.workflow_config))
+    except Exception:
+        logger.warning(
+            "Album %d has an invalid workflow_config and will be read without it.",
+            album.id,
+        )
     track_count = db.scalar(
         select(func.count()).select_from(Track).where(
             Track.album_id == album.id,
@@ -534,9 +533,7 @@ def get_workflow_config(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-    if album.workflow_config:
-        return WorkflowConfigSchema(**json.loads(album.workflow_config))
-    return WorkflowConfigSchema(**DEFAULT_WORKFLOW_CONFIG)
+    return WorkflowConfigSchema(**json.loads(album.workflow_config))
 
 
 @router.put("/{album_id}/workflow", response_model=dict)

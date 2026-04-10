@@ -15,7 +15,7 @@ from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
 from app.services.audio import extract_audio_metadata
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueStatus, MarkerType
-from app.models.track import Track, TrackStatus
+from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
 from app.schemas.schemas import (
@@ -70,44 +70,6 @@ def _album_for_track(track: Track, db: Session) -> Album:
     return album
 
 
-def _ensure_issue_permission(track: Track, album: Album, user: User, phase: IssuePhase) -> None:
-    if phase == IssuePhase.PEER:
-        if track.status != TrackStatus.PEER_REVIEW or track.peer_reviewer_id != user.id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only the assigned peer reviewer can create peer review issues.",
-            )
-        return
-    if phase == IssuePhase.PRODUCER:
-        if track.status != TrackStatus.PRODUCER_MASTERING_GATE or album.producer_id != user.id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only the album producer can create producer review issues.",
-            )
-        return
-    if phase == IssuePhase.MASTERING:
-        if track.status != TrackStatus.MASTERING or album.mastering_engineer_id != user.id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only the album mastering engineer can create mastering issues.",
-            )
-        return
-    if phase == IssuePhase.FINAL_REVIEW:
-        if track.status != TrackStatus.FINAL_REVIEW or user.id not in {
-            album.producer_id,
-            track.submitter_id,
-        }:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only the producer or submitter can create final review issues.",
-            )
-        return
-
-
-def _is_custom_workflow_album(album: Album) -> bool:
-    return bool(album.workflow_config)
-
-
 def _match_custom_step_phase(track: Track, album: Album, phase: str):
     """Return current custom workflow step if issue phase is valid.
 
@@ -160,11 +122,8 @@ def _resolve_step_assignee_id(step, track: Track, album: Album) -> int | None:
 
 
 def _effective_issue_phase(issue: Issue, track: Track, album: Album) -> str:
-    """Normalize legacy/custom issue phase for permission decisions."""
+    """Normalize canonical issue phases to the active workflow step."""
     phase = issue.phase
-    if not _is_custom_workflow_album(album):
-        return phase
-
     if phase in {IssuePhase.PEER.value, IssuePhase.PRODUCER.value, IssuePhase.MASTERING.value, IssuePhase.FINAL_REVIEW.value}:
         config = parse_workflow_config(album)
         step = get_current_step(config, track)
@@ -176,11 +135,10 @@ def _phase_reviewer_id(issue: Issue, track: Track, album: Album) -> int | None:
     """Return the reviewer user-id for the issue's phase."""
     phase = _effective_issue_phase(issue, track, album)
 
-    if _is_custom_workflow_album(album):
-        config = parse_workflow_config(album)
-        step = get_current_step(config, track)
-        if step and infer_issue_phase_for_step(step) == phase:
-            return _resolve_step_assignee_id(step, track, album)
+    config = parse_workflow_config(album)
+    step = get_current_step(config, track)
+    if step and infer_issue_phase_for_step(step) == phase:
+        return _resolve_step_assignee_id(step, track, album)
 
     if phase == IssuePhase.PEER:
         return track.peer_reviewer_id
@@ -241,19 +199,9 @@ def create_issue(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    effective_phase = payload.phase
-    if _is_custom_workflow_album(album):
-        effective_phase = _ensure_custom_issue_permission(track, album, current_user, payload.phase, db)
-    else:
-        # Legacy workflow only accepts canonical phases.
-        try:
-            legacy_phase = IssuePhase(payload.phase)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Unsupported issue phase '{payload.phase}'",
-            ) from exc
-        _ensure_issue_permission(track, album, current_user, legacy_phase)
+    effective_phase = _ensure_custom_issue_permission(
+        track, album, current_user, payload.phase, db,
+    )
 
     for m in payload.markers:
         if m.marker_type == MarkerType.RANGE and m.time_end is None:

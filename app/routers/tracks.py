@@ -137,22 +137,20 @@ def _handle_delivery_status(
 ) -> None:
     """Advance track status after a master delivery upload.
 
-    For custom workflows with require_confirmation, the track stays put.
-    Otherwise, advances to the next step (or FINAL_REVIEW for legacy).
+    When the current step has ``require_confirmation=True`` the track stays
+    put until the mastering engineer explicitly confirms the delivery.
+    Otherwise it advances via the workflow engine.
     """
     previous_status = track.status
-    if album.workflow_config:
-        next_status = engine_delivery_upload(album, track)
-        if next_status is None:
-            log_track_event(
-                db, track, current_user, "master_delivery_uploaded",
-                from_status=previous_status, to_status=track.status,
-                payload={"delivery_number": delivery_number, "awaiting_confirmation": True},
-            )
-            return
-        track.status = next_status
-    else:
-        track.status = TrackStatus.FINAL_REVIEW
+    next_status = engine_delivery_upload(album, track)
+    if next_status is None:
+        log_track_event(
+            db, track, current_user, "master_delivery_uploaded",
+            from_status=previous_status, to_status=track.status,
+            payload={"delivery_number": delivery_number, "awaiting_confirmation": True},
+        )
+        return
+    track.status = next_status
     log_track_event(
         db, track, current_user, "master_delivery_uploaded",
         from_status=previous_status, to_status=track.status,
@@ -168,48 +166,47 @@ def _track_list_item(track: Track, user: User, album: Album) -> TrackListItem:
 
 
 def _ensure_revision_upload_permission(track: Track, album: Album, current_user: User) -> None:
-    if album.workflow_config:
-        config = engine_parse_workflow_config(album)
-        step = engine_get_current_step(config, track)
-        if step is None or step.type != "revision":
-            raise HTTPException(status_code=409, detail="This track is not waiting for a new source version.")
-        assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
-        if assignee_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Only the assigned user can upload a new source version.")
+    # Resubmit path: a finally-rejected-but-resubmittable track may always be
+    # re-uploaded by its original submitter, regardless of the current step.
+    if (
+        track.status == TrackStatus.REJECTED
+        and track.rejection_mode == RejectionMode.RESUBMITTABLE
+    ):
+        if track.submitter_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the submitter can resubmit this track.")
         return
 
-    if track.submitter_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the submitter can upload a new source version.")
+    config = engine_parse_workflow_config(album)
+    step = engine_get_current_step(config, track)
+    if step is None or step.type != "revision":
+        raise HTTPException(status_code=409, detail="This track is not waiting for a new source version.")
+    assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
+    if assignee_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the assigned user can upload a new source version.")
 
 
 def _ensure_delivery_upload_permission(track: Track, album: Album, current_user: User) -> None:
-    if album.workflow_config:
-        config = engine_parse_workflow_config(album)
-        step = engine_get_current_step(config, track)
-        if step is None or step.type != "delivery":
-            raise HTTPException(status_code=409, detail="Track is not in a delivery stage.")
-        assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
-        if assignee_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Only the assigned user can upload a master delivery.")
-        return
-
-    if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
-        raise HTTPException(status_code=403, detail="Only the mastering engineer can upload a master delivery.")
+    config = engine_parse_workflow_config(album)
+    step = engine_get_current_step(config, track)
+    if step is None or step.type != "delivery":
+        raise HTTPException(status_code=409, detail="Track is not in a delivery stage.")
+    assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
+    if assignee_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the assigned user can upload a master delivery.")
+    if step.assignee_role == "mastering_engineer" and album.mastering_engineer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the album mastering engineer can upload this delivery.")
 
 
 def _ensure_delivery_confirm_permission(track: Track, album: Album, current_user: User) -> None:
-    if album.workflow_config:
-        config = engine_parse_workflow_config(album)
-        step = engine_get_current_step(config, track)
-        if step is None or step.type != "delivery":
-            raise HTTPException(status_code=409, detail="Track is not in a delivery stage.")
-        assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
-        if assignee_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Only the assigned user can confirm delivery.")
-        return
-
-    if album.mastering_engineer_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the mastering engineer can confirm delivery.")
+    config = engine_parse_workflow_config(album)
+    step = engine_get_current_step(config, track)
+    if step is None or step.type != "delivery":
+        raise HTTPException(status_code=409, detail="Track is not in a delivery stage.")
+    assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
+    if assignee_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the assigned user can confirm delivery.")
+    if step.assignee_role == "mastering_engineer" and album.mastering_engineer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the album mastering engineer can confirm delivery.")
 
 
 def _serve_path(path_str: str, filename_prefix: str, *, immutable: bool = False) -> FileResponse:
@@ -502,26 +499,20 @@ def confirm_source_version_upload(
     album = ensure_track_visibility(track, current_user, db)
     _ensure_revision_upload_permission(track, album, current_user)
 
-    if album.workflow_config:
-        next_status = engine_revision_upload(album, track)
-    elif track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.RESUBMITTABLE:
-        next_status = TrackStatus.SUBMITTED
+    # Resolve the next step *before* mutating rejection_mode so that the
+    # engine can recognise a resubmit on a rejected+resubmittable track.
+    next_status = engine_revision_upload(album, track)
+
+    # Resubmit path: rejected+resubmittable tracks re-enter the workflow from
+    # the first step with a fresh cycle and no reviewer assignment.
+    if (
+        track.status == TrackStatus.REJECTED
+        and track.rejection_mode == RejectionMode.RESUBMITTABLE
+    ):
         track.workflow_cycle += 1
         track.peer_reviewer_id = None
         track.rejection_mode = None
         track.workflow_variant = WorkflowVariant.STANDARD.value
-    elif track.status == TrackStatus.PEER_REVISION:
-        # Producer-direct path has no peer reviewer, so revisions go straight
-        # back to the producer gate instead of peer review.
-        next_status = (
-            TrackStatus.PRODUCER_MASTERING_GATE
-            if track.workflow_variant == WorkflowVariant.PRODUCER_DIRECT.value
-            else TrackStatus.PEER_REVIEW
-        )
-    elif track.status == TrackStatus.MASTERING_REVISION:
-        next_status = TrackStatus.MASTERING
-    else:
-        raise HTTPException(status_code=409, detail="This track is not waiting for a new source version.")
 
     duration, _bitrate, _sample_rate = _extract_r2_metadata(params.object_key)
     if params.duration is not None and duration is None:
@@ -749,16 +740,11 @@ def workflow_transition(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
-    """Generic workflow transition for albums with custom workflow config."""
+    """Generic workflow transition driven by the album's workflow config."""
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if not album.workflow_config:
-        raise HTTPException(
-            status_code=400,
-            detail="This album uses the default workflow. Use the specific action endpoints.",
-        )
     engine_execute_transition(db, album, track, current_user, payload.decision, background_tasks)
     db.commit()
     db.refresh(track)
@@ -1055,27 +1041,20 @@ def upload_source_version(
     album = ensure_track_visibility(track, current_user, db)
     _ensure_revision_upload_permission(track, album, current_user)
 
-    if album.workflow_config:
-        # Custom workflow: use engine to resolve next status
-        next_status = engine_revision_upload(album, track)
-    elif track.status == TrackStatus.REJECTED and track.rejection_mode == RejectionMode.RESUBMITTABLE:
-        next_status = TrackStatus.SUBMITTED
+    # Resolve the next step *before* mutating rejection_mode so that the
+    # engine can recognise a resubmit on a rejected+resubmittable track.
+    next_status = engine_revision_upload(album, track)
+
+    # Resubmit path: rejected+resubmittable tracks re-enter the workflow from
+    # the first step with a fresh cycle and no reviewer assignment.
+    if (
+        track.status == TrackStatus.REJECTED
+        and track.rejection_mode == RejectionMode.RESUBMITTABLE
+    ):
         track.workflow_cycle += 1
         track.peer_reviewer_id = None
         track.rejection_mode = None
         track.workflow_variant = WorkflowVariant.STANDARD.value
-    elif track.status == TrackStatus.PEER_REVISION:
-        # Producer-direct path has no peer reviewer, so revisions go straight
-        # back to the producer gate instead of peer review.
-        next_status = (
-            TrackStatus.PRODUCER_MASTERING_GATE
-            if track.workflow_variant == WorkflowVariant.PRODUCER_DIRECT.value
-            else TrackStatus.PEER_REVIEW
-        )
-    elif track.status == TrackStatus.MASTERING_REVISION:
-        next_status = TrackStatus.MASTERING
-    else:
-        raise HTTPException(status_code=409, detail="This track is not waiting for a new source version.")
 
     previous_status = track.status
     file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_v{track.version + 1}")

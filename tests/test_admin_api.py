@@ -70,14 +70,14 @@ def test_update_user_not_found(client, factory, auth_headers):
 
 
 def test_delete_user_as_admin(client, factory, auth_headers):
-    admin_user = factory.user(username="admin", is_admin=True)
+    admin_user = factory.user(username="admin", is_admin=True, role="producer")
     target = factory.user(username="todelete")
     response = client.delete(
         f"/api/admin/users/{target.id}",
         headers=auth_headers(admin_user),
     )
     assert response.status_code == 204
-    # Confirm gone
+    # Confirm gone (GET /api/users/{id} requires producer or self)
     get_resp = client.get(f"/api/users/{target.id}", headers=auth_headers(admin_user))
     assert get_resp.status_code == 404
 

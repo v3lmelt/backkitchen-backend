@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -24,12 +25,13 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.album import Album
+from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus, RejectionMode, WorkflowVariant
 from app.models.user import User
 from app.notifications import notify
-from app.workflow import assign_random_peer_reviewer, current_source_version, log_track_event
+from app.workflow import current_source_version, log_track_event
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG, SPECIAL_TARGETS, STEP_TYPE_ALIASES
 
 logger = logging.getLogger(__name__)
@@ -77,7 +79,11 @@ class TransitionOption:
 def parse_workflow_config(album: Album) -> dict:
     """Return the parsed workflow config dict for an album.
 
-    Handles v1→v2 migration on the fly (normalises ``gate`` → ``approval``).
+    Every album is expected to have a non-NULL ``workflow_config`` (the
+    album create endpoint always assigns :data:`DEFAULT_WORKFLOW_CONFIG`
+    when the caller does not provide one). The built-in default is used as
+    a last-resort fallback for any lingering edge case. Handles v1→v2
+    migration on the fly (normalises ``gate`` → ``approval``).
     """
     if album.workflow_config:
         config = json.loads(album.workflow_config)
@@ -155,10 +161,8 @@ def get_first_step(config: dict) -> StepDef:
 
 def get_initial_track_status(album: Album) -> str:
     """Return the initial status for a new track in this album."""
-    if album.workflow_config:
-        config = parse_workflow_config(album)
-        return get_first_step(config).id
-    return TrackStatus.SUBMITTED
+    config = parse_workflow_config(album)
+    return get_first_step(config).id
 
 
 # ---------------------------------------------------------------------------
@@ -304,14 +308,39 @@ def assign_reviewers(
     return []
 
 
+def _assign_random_peer_reviewer(db: Session, album: Album, track: Track) -> int:
+    """Fallback reviewer picker for manual-mode peer_review steps.
+
+    Chooses a random album member (excluding the submitter and the mastering
+    engineer) and sets it as ``track.peer_reviewer_id``. Used when a review
+    step is wired to ``peer_reviewer`` role in manual mode and no reviewer
+    was explicitly assigned by the producer yet.
+    """
+    members = db.scalars(select(AlbumMember).where(AlbumMember.album_id == album.id)).all()
+    candidates = [
+        member.user_id
+        for member in members
+        if member.user_id != track.submitter_id and member.user_id != album.mastering_engineer_id
+    ]
+    if not candidates:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No eligible peer reviewer is available for this track.",
+        )
+    selected = random.choice(candidates)
+    track.peer_reviewer_id = selected
+    return selected
+
+
 def assign_peer_reviewer_for_step(
     db: Session, album: Album, track: Track, step: StepDef,
     background_tasks: BackgroundTasks | None = None,
 ) -> None:
     """Handle reviewer assignment when entering a review step.
 
-    For legacy ``peer_reviewer`` role, uses the existing random assignment.
-    For custom review steps, uses the new assignment system.
+    For ``peer_reviewer`` role in manual mode, picks a random album member
+    as a fallback if no reviewer has been explicitly assigned. For other
+    configurations, uses the custom reviewer assignment system.
     """
     if step.type != "review":
         return
@@ -322,9 +351,8 @@ def assign_peer_reviewer_for_step(
         return
 
     if step.assignee_role == "peer_reviewer" and step.assignment_mode != "auto":
-        # Legacy-compatible: use random assignment if no pool configured
         if track.peer_reviewer_id is None:
-            assign_random_peer_reviewer(db, album, track)
+            _assign_random_peer_reviewer(db, album, track)
         return
 
     assigned = assign_reviewers(db, album, track, step, background_tasks)
@@ -557,10 +585,24 @@ def execute_revision_upload(
     album: Album,
     track: Track,
 ) -> str:
-    """Resolve the next status after a source version upload for custom workflows.
+    """Resolve the next status after a source version upload.
 
     Returns the target step ID. Does NOT update track.status (caller does that).
+
+    Two valid cases:
+    1. Track is in a ``revision`` step → return ``step.return_to``.
+    2. Track is in ``rejected`` with ``RESUBMITTABLE`` mode → return the first
+       step (caller is responsible for resetting rejection_mode/cycle).
     """
+    # Resubmit path: a finally-rejected-but-resubmittable track re-enters the
+    # workflow at the first step.
+    if (
+        track.status == TrackStatus.REJECTED
+        and track.rejection_mode == RejectionMode.RESUBMITTABLE
+    ):
+        config = parse_workflow_config(album)
+        return get_first_step(config).id
+
     config = parse_workflow_config(album)
     step = get_current_step(config, track)
 
@@ -573,7 +615,7 @@ def execute_revision_upload(
     if step.type != "revision":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Track is not in a revision step (current: '{step.id}').",
+            detail="This track is not waiting for a new source version.",
         )
 
     if not step.return_to:
@@ -647,174 +689,6 @@ def execute_delivery_confirm(
     if deliver_target == "__completed":
         return "completed"
     return deliver_target
-
-
-# ---------------------------------------------------------------------------
-# One-time config upgrade for stored workflow configs
-# ---------------------------------------------------------------------------
-
-
-def upgrade_config_with_backward_transitions(config: dict) -> tuple[dict, list[str]]:
-    """Surgically upgrade a stored workflow config with compatibility fixes.
-
-    Adds ``reject_to_*`` transitions so each approval/delivery stage can
-    send the track back to an earlier stage for re-review without requiring
-    a new source upload. Also backfills the intake-stage
-    ``accept_producer_direct`` transition for the producer-direct path and
-    normalises older ``approve`` naming on the first intake step. Finally,
-    fixes the broken ``final_revision`` stage
-    (assigned to mastering_engineer but uploaded via ``/source-versions``)
-    by rewriting ``final_review.reject`` to ``mastering_revision`` and
-    removing ``final_revision`` entirely.
-
-    Only steps with well-known default IDs are touched; custom stages are
-    preserved as-is. Returns the (possibly mutated) config dict and a
-    list of human-readable descriptions of the changes applied.
-    """
-    changes: list[str] = []
-    steps = config.get("steps", [])
-    step_ids = {s.get("id") for s in steps}
-
-    # 1. Intake: normalise the forward transition and backfill
-    #    producer-direct intake on classic/default workflows.
-    for step in steps:
-        step_id = step.get("id")
-        if step_id not in {"intake", "submitted"}:
-            continue
-
-        transitions = step.setdefault("transitions", {})
-        accept_target = transitions.get("accept")
-        approve_target = transitions.get("approve")
-        if accept_target is None and approve_target:
-            transitions["accept"] = approve_target
-            del transitions["approve"]
-            changes.append(f"{step_id}: renamed approve to accept")
-            accept_target = approve_target
-
-        if accept_target != "peer_review":
-            continue
-
-        producer_gate_target = None
-        if "producer_gate" in step_ids:
-            producer_gate_target = "producer_gate"
-        elif "producer_mastering_gate" in step_ids:
-            producer_gate_target = "producer_mastering_gate"
-
-        if producer_gate_target and "accept_producer_direct" not in transitions:
-            transitions["accept_producer_direct"] = producer_gate_target
-            changes.append(
-                f"{step_id}: added accept_producer_direct to {producer_gate_target}"
-            )
-
-    # 2. producer_gate: add reject_to_peer_review
-    if "producer_gate" in step_ids and "peer_review" in step_ids:
-        producer_gate = next(s for s in steps if s.get("id") == "producer_gate")
-        transitions = producer_gate.setdefault("transitions", {})
-        if "reject_to_peer_review" not in transitions:
-            transitions["reject_to_peer_review"] = "peer_review"
-            changes.append("producer_gate: added reject_to_peer_review")
-
-    # 3. mastering: add reject_to_producer_gate
-    if "mastering" in step_ids and "producer_gate" in step_ids:
-        mastering = next(s for s in steps if s.get("id") == "mastering")
-        transitions = mastering.setdefault("transitions", {})
-        if "reject_to_producer_gate" not in transitions:
-            transitions["reject_to_producer_gate"] = "producer_gate"
-            changes.append("mastering: added reject_to_producer_gate")
-
-    # 4. final_review: add reject_to_mastering for backward rollback, and
-    #    fix broken final_revision wiring. The legacy 'approve → __completed'
-    #    transition is left intact — removing it was an old mistake that
-    #    stranded workflows without any completion path (runtime schema
-    #    validator still requires one of: __completed transition, or a
-    #    final_review step). final_review completes via the dedicated
-    #    /final-review/approve dual-confirmation endpoint regardless.
-    if "final_review" in step_ids and "mastering" in step_ids:
-        final_review = next(s for s in steps if s.get("id") == "final_review")
-        transitions = final_review.setdefault("transitions", {})
-        if "reject_to_mastering" not in transitions:
-            transitions["reject_to_mastering"] = "mastering"
-            changes.append("final_review: added reject_to_mastering")
-        # Repoint final_review.reject → mastering_revision (was final_revision)
-        if (
-            transitions.get("reject") == "final_revision"
-            and "mastering_revision" in step_ids
-        ):
-            transitions["reject"] = "mastering_revision"
-            changes.append("final_review: rewrote reject → mastering_revision")
-
-    # 5. Drop the broken final_revision step (it was assigned to
-    #    mastering_engineer but uploaded via /source-versions, which is
-    #    semantically nonsense — source uploads are done by the submitter).
-    if "final_revision" in step_ids:
-        config["steps"] = [s for s in steps if s.get("id") != "final_revision"]
-        changes.append("removed broken final_revision step")
-
-    return config, changes
-
-
-def _album_has_active_tracks_in_step(db: Session, album_id: int, step_id: str) -> bool:
-    """True if any active (non-archived) track is currently in ``step_id``."""
-    row = db.scalar(
-        select(Track.id).where(
-            Track.album_id == album_id,
-            Track.status == step_id,
-            Track.archived_at.is_(None),
-        ).limit(1)
-    )
-    return row is not None
-
-
-def backfill_album_workflow_configs(db: Session) -> int:
-    """Apply stored-workflow compatibility upgrades to existing albums.
-
-    Scans all albums with a stored ``workflow_config`` and applies the
-    surgical upgrades from ``upgrade_config_with_backward_transitions``.
-    Skips albums where a track is currently sitting in ``final_revision``
-    (dropping the step would strand the track); those need manual editing
-    in the workflow builder.
-
-    Returns the number of albums that were actually updated.
-    """
-    albums = db.scalars(
-        select(Album).where(Album.workflow_config.isnot(None))
-    ).all()
-
-    updated_count = 0
-    for album in albums:
-        try:
-            original_config = json.loads(album.workflow_config)
-        except (ValueError, TypeError):
-            logger.warning("Album %d has invalid workflow_config JSON; skipping.", album.id)
-            continue
-
-        # Defensive copy so we can bail out cleanly if anything goes wrong
-        config_copy = json.loads(json.dumps(original_config))
-
-        # Skip the final_revision cleanup if any track is currently stuck there
-        if _album_has_active_tracks_in_step(db, album.id, "final_revision"):
-            logger.warning(
-                "Album %d has active tracks in 'final_revision'; skipping config upgrade.",
-                album.id,
-            )
-            continue
-
-        upgraded, changes = upgrade_config_with_backward_transitions(config_copy)
-        if not changes:
-            continue
-
-        album.workflow_config = json.dumps(upgraded)
-        updated_count += 1
-        logger.info(
-            "Album %d workflow_config upgraded: %s",
-            album.id,
-            "; ".join(changes),
-        )
-
-    if updated_count:
-        db.flush()
-
-    return updated_count
 
 
 # ---------------------------------------------------------------------------

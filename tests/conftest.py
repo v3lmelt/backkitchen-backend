@@ -1,3 +1,5 @@
+import copy
+import json
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -28,6 +30,7 @@ from app.models.invitation import Invitation
 from app.models.notification import Notification
 from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users
 from app.security import create_access_token
+from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 
 @pytest.fixture
@@ -155,13 +158,20 @@ class Factory:
         mastering_engineer: User,
         members: list[User] | None = None,
         title: str | None = None,
+        workflow_config: dict | None = None,
     ) -> Album:
+        effective_workflow = (
+            workflow_config
+            if workflow_config is not None
+            else copy.deepcopy(DEFAULT_WORKFLOW_CONFIG)
+        )
         album = Album(
             title=title or self._next("album"),
             description="test album",
             cover_color="#abcdef",
             producer_id=producer.id,
             mastering_engineer_id=mastering_engineer.id,
+            workflow_config=json.dumps(effective_workflow, ensure_ascii=False),
         )
         self.session.add(album)
         self.session.commit()

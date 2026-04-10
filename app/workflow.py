@@ -1,6 +1,5 @@
 import json
 import logging
-import random
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -19,7 +18,7 @@ from app.models.issue import Issue, IssueStatus
 from app.models.discussion import TrackDiscussion
 from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
-from app.models.track import RejectionMode, Track, TrackStatus
+from app.models.track import Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
@@ -159,41 +158,10 @@ def track_allowed_actions(
     track: Track, user: User, album: Album, *,
     _wf_config: dict | None = None, db: Session | None = None,
 ) -> list[str]:
-    if album.workflow_config:
-        from app.workflow_engine import get_allowed_action_names, parse_workflow_config
+    from app.workflow_engine import get_allowed_action_names, parse_workflow_config
 
-        config = _wf_config or parse_workflow_config(album)
-        return get_allowed_action_names(config, track, user, album, db=db)
-
-    # Legacy hardcoded logic for albums without custom workflow
-    actions: list[str] = []
-    is_submitter = track.submitter_id == user.id
-    is_peer_reviewer = track.peer_reviewer_id == user.id
-    is_producer = album.producer_id == user.id
-    is_mastering_engineer = album.mastering_engineer_id == user.id
-
-    if is_producer and track.status == TrackStatus.SUBMITTED:
-        actions.append("intake")
-    if is_peer_reviewer and track.status == TrackStatus.PEER_REVIEW:
-        actions.append("peer_review")
-    if is_submitter and track.status in {
-        TrackStatus.PEER_REVISION,
-        TrackStatus.MASTERING_REVISION,
-    }:
-        actions.append("upload_revision")
-    if (
-        is_submitter
-        and track.status == TrackStatus.REJECTED
-        and track.rejection_mode == RejectionMode.RESUBMITTABLE
-    ):
-        actions.append("resubmit")
-    if is_producer and track.status == TrackStatus.PRODUCER_MASTERING_GATE:
-        actions.append("producer_gate")
-    if is_mastering_engineer and track.status == TrackStatus.MASTERING:
-        actions.append("mastering")
-    if track.status == TrackStatus.FINAL_REVIEW and (is_submitter or is_producer):
-        actions.append("final_review")
-    return actions
+    config = _wf_config or parse_workflow_config(album)
+    return get_allowed_action_names(config, track, user, album, db=db)
 
 
 def _user_read(user: User | None) -> UserRead | None:
@@ -215,46 +183,44 @@ def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead
 
 
 def build_track_read(track: Track, user: User, album: Album, db: Session | None = None) -> TrackRead:
+    from app.workflow_engine import (
+        get_allowed_transitions,
+        get_current_step,
+        parse_workflow_config,
+    )
+    from app.schemas.schemas import WorkflowStepDefSchema
+
     current_source = current_source_version(track)
     current_master = current_master_delivery(track)
     open_issue_count = sum(1 for i in track.issues if i.status == IssueStatus.OPEN)
 
     workflow_step = None
     workflow_transitions = None
-    wf_config = None
-    if album.workflow_config:
-        from app.workflow_engine import (
-            get_allowed_transitions,
-            get_current_step,
-            parse_workflow_config,
+    wf_config = parse_workflow_config(album)
+    step = get_current_step(wf_config, track)
+    if step:
+        workflow_step = WorkflowStepDefSchema(
+            id=step.id,
+            label=step.label,
+            type=step.type,
+            ui_variant=step.ui_variant,
+            assignee_role=step.assignee_role,
+            order=step.order,
+            transitions=step.transitions,
+            return_to=step.return_to,
+            revision_step=step.revision_step,
+            allow_permanent_reject=step.allow_permanent_reject,
+            assignment_mode=step.assignment_mode,
+            reviewer_pool=step.reviewer_pool,
+            required_reviewer_count=step.required_reviewer_count,
+            assignee_user_id=step.assignee_user_id,
+            require_confirmation=step.require_confirmation,
         )
-        from app.schemas.schemas import WorkflowStepDefSchema
-
-        wf_config = parse_workflow_config(album)
-        step = get_current_step(wf_config, track)
-        if step:
-            workflow_step = WorkflowStepDefSchema(
-                id=step.id,
-                label=step.label,
-                type=step.type,
-                ui_variant=step.ui_variant,
-                assignee_role=step.assignee_role,
-                order=step.order,
-                transitions=step.transitions,
-                return_to=step.return_to,
-                revision_step=step.revision_step,
-                allow_permanent_reject=step.allow_permanent_reject,
-                assignment_mode=step.assignment_mode,
-                reviewer_pool=step.reviewer_pool,
-                required_reviewer_count=step.required_reviewer_count,
-                assignee_user_id=step.assignee_user_id,
-                require_confirmation=step.require_confirmation,
-            )
-        transitions = get_allowed_transitions(wf_config, track, user, album, db=db)
-        if transitions:
-            workflow_transitions = [
-                {"decision": t.decision, "label": t.label} for t in transitions
-            ]
+    transitions = get_allowed_transitions(wf_config, track, user, album, db=db)
+    if transitions:
+        workflow_transitions = [
+            {"decision": t.decision, "label": t.label} for t in transitions
+        ]
 
     return TrackRead(
         id=track.id,
@@ -472,12 +438,11 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         )
         for d in track.discussions
     ]
-    # Include workflow config for custom-workflow albums. Mirror the defensive
-    # try/except used in `_album_to_read`: a stored config that no longer
-    # passes the current validator (e.g. a legacy `reject_to_*` pointing
-    # forwards) must not crash the entire track-detail read. Callers that
-    # need a valid config (workflow transitions, step view) will either skip
-    # gracefully or surface a targeted 4xx.
+    # Mirror the defensive try/except used in `_album_to_read`: a stored
+    # config that no longer passes the current validator must not crash the
+    # entire track-detail read. Callers that need a valid config (workflow
+    # transitions, step view) will either skip gracefully or surface a
+    # targeted 4xx.
     from app.workflow_engine import parse_workflow_config
     from app.schemas.schemas import WorkflowConfigSchema
     wf_config_schema = None
@@ -530,18 +495,3 @@ def log_track_event(
     return event
 
 
-def assign_random_peer_reviewer(db: Session, album: Album, track: Track) -> int:
-    members = db.scalars(select(AlbumMember).where(AlbumMember.album_id == album.id)).all()
-    candidates = [
-        member.user_id
-        for member in members
-        if member.user_id != track.submitter_id and member.user_id != album.mastering_engineer_id
-    ]
-    if not candidates:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="No eligible peer reviewer is available for this track.",
-        )
-    selected = random.choice(candidates)
-    track.peer_reviewer_id = selected
-    return selected

@@ -7,7 +7,7 @@ from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 
 def test_create_album(client, factory, auth_headers):
-    user = factory.user()
+    user = factory.user(role="producer")
     response = client.post(
         "/api/albums",
         headers=auth_headers(user),

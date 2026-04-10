@@ -42,7 +42,6 @@ from app.routers import admin as admin_router
 from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users, workflow_templates
 from app.security import _decode_token, hash_password
 from app.workflow import is_album_completed, log_track_event
-from app.workflow_engine import backfill_album_workflow_configs
 
 
 def _run_sqlite_compat_migrations() -> None:
@@ -188,19 +187,6 @@ def _backfill_workflow_data() -> None:
                 track = db.get(Track, item.track_id)
                 if track:
                     item.workflow_cycle = track.workflow_cycle
-
-        # --- Album workflow_config: apply stored compatibility upgrades ---
-        try:
-            upgraded = backfill_album_workflow_configs(db)
-            if upgraded:
-                logging.getLogger(__name__).info(
-                    "Upgraded workflow_config on %d album(s) with compatibility fixes",
-                    upgraded,
-                )
-        except Exception:
-            logging.getLogger(__name__).warning(
-                "Failed to backfill album workflow configs", exc_info=True
-            )
 
         # --- Tracks missing source_versions ---
         has_versions = exists(

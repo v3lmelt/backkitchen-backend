@@ -25,7 +25,9 @@ def test_create_track_creates_source_version_and_event(client, db_session, facto
 
     assert response.status_code == 201
     body = response.json()
-    assert body["status"] == TrackStatus.SUBMITTED.value
+    # Default workflow's first step is ``intake`` (replaces the legacy
+    # ``submitted`` status).
+    assert body["status"] == "intake"
     assert body["version"] == 1
     assert body["workflow_cycle"] == 1
     track_id = body["id"]
@@ -95,7 +97,8 @@ def test_upload_source_version_resubmittable_resets_cycle_and_assignment(client,
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == TrackStatus.SUBMITTED.value
+    # Resubmit sends the track back to the first step of the default workflow.
+    assert body["status"] == "intake"
     assert body["version"] == 2
     assert body["workflow_cycle"] == 2
     assert body["peer_reviewer_id"] is None
@@ -124,7 +127,9 @@ def test_upload_master_delivery_increments_delivery_number(client, db_session, f
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == TrackStatus.FINAL_REVIEW.value
+    # The default workflow's ``mastering`` step has ``require_confirmation``
+    # set, so the track stays put until the mastering engineer confirms.
+    assert response.json()["status"] == TrackStatus.MASTERING.value
     deliveries = db_session.scalars(
         select(MasterDelivery).where(MasterDelivery.track_id == track.id)
     ).all()

@@ -54,9 +54,11 @@ def test_create_final_review_issue_binds_to_current_delivery(client, factory, au
     track = factory.track(album=album, submitter=submitter, status=TrackStatus.FINAL_REVIEW)
     delivery = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
 
+    # The default workflow's ``final_review`` step is assigned to the
+    # producer, so only the producer (not the submitter) may raise issues.
     response = client.post(
         f"/api/tracks/{track.id}/issues",
-        headers=auth_headers(submitter),
+        headers=auth_headers(producer),
         json={
             "title": "Master too bright",
             "description": "The top end feels sharp.",

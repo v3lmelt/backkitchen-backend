@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.album import Album
 from app.models.checklist import ChecklistItem
-from app.models.track import Track, TrackStatus
+from app.models.track import Track
 from app.models.user import User
 from app.schemas.schemas import (
     ChecklistItemRead,
@@ -41,25 +41,18 @@ def submit_checklist(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
 
-    if album.workflow_config:
-        config = parse_workflow_config(album)
-        step = get_current_step(config, track)
-        if step is None or step.type != "review":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Checklist can only be submitted in a review step.",
-            )
-        if not user_matches_role_or_assignment(current_user, album, track, step, db):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only the assigned reviewer can submit the checklist.",
-            )
-    else:
-        if track.status != TrackStatus.PEER_REVIEW or track.peer_reviewer_id != current_user.id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only the assigned peer reviewer can submit the checklist.",
-            )
+    config = parse_workflow_config(album)
+    step = get_current_step(config, track)
+    if step is None or step.type != "review":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Checklist can only be submitted in a review step.",
+        )
+    if not user_matches_role_or_assignment(current_user, album, track, step, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the assigned reviewer can submit the checklist.",
+        )
 
     source_version = current_source_version(track)
     if source_version is None:
