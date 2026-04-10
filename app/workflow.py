@@ -163,8 +163,9 @@ def current_master_delivery(track: Track) -> MasterDelivery | None:
     current_cycle_deliveries = [
         item for item in track.master_deliveries if item.workflow_cycle == track.workflow_cycle
     ]
-    deliveries = current_cycle_deliveries or track.master_deliveries
-    return max(deliveries, key=lambda item: item.delivery_number)
+    if not current_cycle_deliveries:
+        return None
+    return max(current_cycle_deliveries, key=lambda item: item.delivery_number)
 
 
 def track_allowed_actions(
