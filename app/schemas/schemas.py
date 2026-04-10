@@ -280,7 +280,17 @@ class TrackBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     artist: str = Field(..., min_length=1, max_length=100)
     album_id: int
-    bpm: int | None = None
+    bpm: str | None = Field(default=None, max_length=100)
+    original_title: str | None = Field(default=None, max_length=200)
+    original_artist: str | None = Field(default=None, max_length=200)
+
+
+class TrackMetadataUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    artist: str | None = Field(default=None, min_length=1, max_length=100)
+    bpm: str | None = Field(default=None, max_length=100)
+    original_title: str | None = Field(default=None, max_length=200)
+    original_artist: str | None = Field(default=None, max_length=200)
 
 
 class TrackOrderUpdate(BaseModel):
@@ -790,7 +800,9 @@ class RequestTrackUploadParams(RequestUploadParams):
     album_id: int
     title: str
     artist: str
-    bpm: int | None = None
+    bpm: str | None = None
+    original_title: str | None = None
+    original_artist: str | None = None
 
 
 class PresignedUploadResponse(BaseModel):
@@ -810,7 +822,9 @@ class ConfirmTrackUploadParams(ConfirmUploadParams):
     album_id: int
     title: str
     artist: str
-    bpm: int | None = None
+    bpm: str | None = None
+    original_title: str | None = None
+    original_artist: str | None = None
 
 
 class RequestCommentAudioUploadParams(BaseModel):

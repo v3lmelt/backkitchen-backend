@@ -35,6 +35,7 @@ from app.schemas.schemas import (
     StageAssignmentRead,
     TrackDetailResponse,
     TrackListItem,
+    TrackMetadataUpdate,
     TrackRead,
     WorkflowTransitionRequest,
 )
@@ -295,7 +296,9 @@ def create_track(
     title: str = Form(...),
     artist: str = Form(...),
     album_id: int = Form(...),
-    bpm: int | None = Form(default=None),
+    bpm: str | None = Form(default=None),
+    original_title: str | None = Form(default=None),
+    original_artist: str | None = Form(default=None),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -316,7 +319,9 @@ def create_track(
         artist=artist,
         album_id=album_id,
         submitter_id=current_user.id,
-        bpm=bpm,
+        bpm=bpm or None,
+        original_title=original_title or None,
+        original_artist=original_artist or None,
         track_number=max_num + 1,
         file_path=file_path,
         duration=duration,
@@ -440,7 +445,9 @@ def confirm_track_upload(
         artist=params.artist,
         album_id=params.album_id,
         submitter_id=current_user.id,
-        bpm=params.bpm,
+        bpm=params.bpm or None,
+        original_title=params.original_title or None,
+        original_artist=params.original_artist or None,
         track_number=max_num + 1,
         file_path=params.object_key,
         storage_backend="r2",
@@ -764,6 +771,52 @@ def set_track_visibility(
     track.is_public = payload.is_public
     db.commit()
     db.refresh(track)
+    return build_track_read(track, current_user, album, db=db)
+
+
+@router.patch("/{track_id}/metadata", response_model=TrackRead)
+def update_track_metadata(
+    track_id: int,
+    payload: TrackMetadataUpdate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    """Update track metadata (title, artist, bpm, original_title, original_artist).
+
+    Only the track submitter or the album producer may call this endpoint.
+    """
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = db.get(Album, track.album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    if current_user.id not in {track.submitter_id, album.producer_id}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the track submitter or album producer can edit track metadata.",
+        )
+
+    changes: dict[str, dict[str, str | None]] = {}
+    for field in ("title", "artist", "bpm", "original_title", "original_artist"):
+        new_value = getattr(payload, field)
+        if new_value is not None:
+            old_value = getattr(track, field)
+            if new_value != old_value:
+                changes[field] = {"old": old_value, "new": new_value}
+                setattr(track, field, new_value)
+
+    if not changes:
+        return build_track_read(track, current_user, album, db=db)
+
+    log_track_event(
+        db, track, current_user, "metadata_updated",
+        payload={"changes": changes},
+    )
+    db.commit()
+    db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 

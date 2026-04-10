@@ -51,7 +51,9 @@ class Track(Base):
     file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     storage_backend: Mapped[str] = mapped_column(String(10), nullable=False, default="local")
     duration: Mapped[float | None] = mapped_column(Float, nullable=True)
-    bpm: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bpm: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    original_title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    original_artist: Mapped[str | None] = mapped_column(String(200), nullable=True)
     track_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(
         String(50),
