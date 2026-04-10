@@ -662,6 +662,7 @@ def confirm_delivery(
 def list_tracks(
     status_filter: str | None = Query(default=None, alias="status"),
     album_id: int | None = Query(default=None),
+    search: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -702,6 +703,8 @@ def list_tracks(
         stmt = stmt.where(Track.status == status_filter)
     if album_id is not None:
         stmt = stmt.where(Track.album_id == album_id)
+    if search:
+        stmt = stmt.where(Track.title.ilike(f"%{search}%"))
     tracks = list(db.scalars(stmt).all())
 
     results: list[TrackListItem] = []
