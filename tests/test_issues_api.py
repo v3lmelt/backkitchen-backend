@@ -1,9 +1,11 @@
+import json
 from io import BytesIO
 
 from sqlalchemy import select
 
 from app.models.comment import Comment
 from app.models.issue import Issue, IssuePhase, IssueStatus
+from app.models.stage_assignment import StageAssignment
 from app.models.track import TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 
@@ -17,7 +19,7 @@ def test_create_peer_issue_binds_to_current_source_version(client, db_session, f
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     latest_version = db_session.scalars(
@@ -31,15 +33,17 @@ def test_create_peer_issue_binds_to_current_source_version(client, db_session, f
             "title": "Clicks at intro",
             "description": "Please clean this up.",
             "phase": "peer",
-            "issue_type": "point",
             "severity": "major",
-            "time_start": 1.2,
+            "markers": [{"marker_type": "point", "time_start": 1.2}],
         },
     )
 
     assert response.status_code == 201
     assert response.json()["phase"] == IssuePhase.PEER.value
     assert response.json()["source_version_id"] == latest_version.id
+    assert len(response.json()["markers"]) == 1
+    assert response.json()["markers"][0]["marker_type"] == "point"
+    assert response.json()["markers"][0]["time_start"] == 1.2
 
 
 def test_create_final_review_issue_binds_to_current_delivery(client, factory, auth_headers):
@@ -50,16 +54,17 @@ def test_create_final_review_issue_binds_to_current_delivery(client, factory, au
     track = factory.track(album=album, submitter=submitter, status=TrackStatus.FINAL_REVIEW)
     delivery = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
 
+    # The default workflow's ``final_review`` step is assigned to the
+    # producer, so only the producer (not the submitter) may raise issues.
     response = client.post(
         f"/api/tracks/{track.id}/issues",
-        headers=auth_headers(submitter),
+        headers=auth_headers(producer),
         json={
             "title": "Master too bright",
             "description": "The top end feels sharp.",
             "phase": "final_review",
-            "issue_type": "point",
             "severity": "major",
-            "time_start": 9.5,
+            "markers": [{"marker_type": "point", "time_start": 9.5}],
         },
     )
 
@@ -67,7 +72,7 @@ def test_create_final_review_issue_binds_to_current_delivery(client, factory, au
     assert response.json()["master_delivery_id"] == delivery.id
 
 
-def test_create_range_issue_requires_time_end(client, factory, auth_headers):
+def test_create_general_issue_no_markers(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user()
@@ -76,7 +81,71 @@ def test_create_range_issue_requires_time_end(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        json={
+            "title": "Overall mix too bright",
+            "description": "The whole track feels harsh.",
+            "phase": "peer",
+            "severity": "major",
+            "markers": [],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["markers"] == []
+
+
+def test_create_multi_marker_issue(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        json={
+            "title": "Clicks in multiple places",
+            "description": "Clicks at intro and bridge.",
+            "phase": "peer",
+            "severity": "major",
+            "markers": [
+                {"marker_type": "point", "time_start": 1.2},
+                {"marker_type": "range", "time_start": 30.0, "time_end": 45.0},
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    assert len(response.json()["markers"]) == 2
+    assert response.json()["markers"][0]["marker_type"] == "point"
+    assert response.json()["markers"][1]["marker_type"] == "range"
+    assert response.json()["markers"][1]["time_end"] == 45.0
+
+
+def test_create_range_marker_requires_time_end(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
 
@@ -87,9 +156,8 @@ def test_create_range_issue_requires_time_end(client, factory, auth_headers):
             "title": "Long problem section",
             "description": "This needs fixing.",
             "phase": "peer",
-            "issue_type": "range",
             "severity": "minor",
-            "time_start": 4.0,
+            "markers": [{"marker_type": "range", "time_start": 4.0}],
         },
     )
 
@@ -106,7 +174,7 @@ def test_update_issue_enforces_phase_permissions(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     source_version = track.source_versions[-1]
@@ -142,7 +210,7 @@ def test_add_comment_rejects_invalid_image_type(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER, source_version_id=track.source_versions[-1].id)
@@ -166,7 +234,7 @@ def test_add_comment_persists_images(client, db_session, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER, source_version_id=track.source_versions[-1].id)
@@ -200,7 +268,7 @@ def test_list_issues_for_track(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     sv = track.source_versions[-1]
@@ -221,7 +289,7 @@ def test_get_issue_detail(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     sv = track.source_versions[-1]
@@ -232,6 +300,7 @@ def test_get_issue_detail(client, factory, auth_headers):
     body = response.json()
     assert body["id"] == issue.id
     assert "comments" in body
+    assert "markers" in body
 
 
 def test_get_issue_not_found(client, factory, auth_headers):
@@ -249,7 +318,7 @@ def test_batch_update_issues(client, db_session, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     sv = track.source_versions[-1]
@@ -280,7 +349,7 @@ def test_batch_update_issues_forbidden_for_outsider(client, factory, auth_header
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     sv = track.source_versions[-1]
@@ -294,7 +363,7 @@ def test_batch_update_issues_forbidden_for_outsider(client, factory, auth_header
     assert response.status_code == 403
 
 
-def test_create_issue_time_end_must_exceed_time_start(client, factory, auth_headers):
+def test_create_marker_time_end_must_exceed_time_start(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user()
@@ -303,7 +372,7 @@ def test_create_issue_time_end_must_exceed_time_start(client, factory, auth_head
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
 
@@ -314,10 +383,8 @@ def test_create_issue_time_end_must_exceed_time_start(client, factory, auth_head
             "title": "Bad range",
             "description": "End before start.",
             "phase": "peer",
-            "issue_type": "range",
             "severity": "minor",
-            "time_start": 10.0,
-            "time_end": 5.0,
+            "markers": [{"marker_type": "range", "time_start": 10.0, "time_end": 5.0}],
         },
     )
     assert response.status_code == 422
@@ -332,7 +399,7 @@ def test_add_comment_text_only(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     issue = factory.issue(
@@ -349,3 +416,129 @@ def test_add_comment_text_only(client, factory, auth_headers):
     body = response.json()
     assert body["content"] == "Just a text comment"
     assert body["images"] == []
+
+
+def test_create_issue_custom_review_step_allows_stage_assignment_reviewer(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_review",
+                    "label": "Custom Review",
+                    "type": "review",
+                    "ui_variant": "generic",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "final_gate"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 1,
+                },
+                {
+                    "id": "final_gate",
+                    "label": "Final Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_review"
+    db_session.add(
+        StageAssignment(
+            track_id=track.id,
+            stage_id="custom_review",
+            user_id=reviewer.id,
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        json={
+            "title": "Needs tweak",
+            "description": "Custom review note",
+            "phase": "custom_review",
+            "severity": "major",
+            "markers": [],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["phase"] == "custom_review"
+
+
+def test_create_issue_custom_review_step_rejects_unassigned_member(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    outsider = factory.user(username="outsider")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer, outsider],
+    )
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_review",
+                    "label": "Custom Review",
+                    "type": "review",
+                    "ui_variant": "generic",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "final_gate"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 1,
+                },
+                {
+                    "id": "final_gate",
+                    "label": "Final Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_review"
+    db_session.add(
+        StageAssignment(
+            track_id=track.id,
+            stage_id="custom_review",
+            user_id=reviewer.id,
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(outsider),
+        json={
+            "title": "Unauthorized note",
+            "description": "Should fail",
+            "phase": "custom_review",
+            "severity": "major",
+            "markers": [],
+        },
+    )
+
+    assert response.status_code == 403

@@ -3,7 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.models.issue import IssuePhase, IssueSeverity, IssueStatus, IssueType
+from app.models.issue import IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.track import RejectionMode, TrackStatus
 from app.workflow_defaults import SPECIAL_TARGETS
 
@@ -54,6 +54,19 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=8)
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(..., min_length=3)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8)
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -94,6 +107,8 @@ class AlbumCreate(AlbumBase):
 
 
 class AlbumMetadataUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
     release_date: date | None = None
     catalog_number: str | None = Field(default=None, max_length=50)
     circle_name: str | None = Field(default=None, max_length=200)
@@ -156,6 +171,7 @@ class AlbumRead(AlbumBase):
     workflow_template_name: str | None = None
     created_at: datetime
     updated_at: datetime
+    archived_at: datetime | None = None
     track_count: int = 0
     producer: UserRead | None = None
     mastering_engineer: UserRead | None = None
@@ -252,6 +268,7 @@ class MasterDeliveryRead(BaseModel):
     delivery_number: int
     file_path: str
     uploaded_by_id: int | None = None
+    confirmed_at: datetime | None = None
     producer_approved_at: datetime | None = None
     submitter_approved_at: datetime | None = None
     created_at: datetime
@@ -271,18 +288,22 @@ class TrackOrderUpdate(BaseModel):
 
 
 class TrackRead(TrackBase):
+    # artist overrides TrackBase — None when the track is shown anonymised to the viewer
+    artist: str | None = None
     id: int
     track_number: int | None = None
     file_path: str | None = None
     duration: float | None = None
     status: str
     rejection_mode: RejectionMode | None = None
+    workflow_variant: str = "standard"
     version: int
     workflow_cycle: int
     submitter_id: int | None = None
     peer_reviewer_id: int | None = None
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
+    is_public: bool = False
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None = None
@@ -303,29 +324,35 @@ class TrackListItem(TrackRead):
     album_title: str = ""
 
 
-class IntakeDecisionRequest(BaseModel):
-    decision: Literal["accept", "reject_final", "reject_resubmittable"]
+class SetPublicRequest(BaseModel):
+    is_public: bool
 
 
-class PeerReviewDecisionRequest(BaseModel):
-    decision: Literal["needs_revision", "pass"]
+class IssueMarkerCreate(BaseModel):
+    marker_type: MarkerType = MarkerType.POINT
+    time_start: float = Field(..., ge=0)
+    time_end: float | None = Field(default=None, ge=0)
 
 
-class ProducerGateDecisionRequest(BaseModel):
-    decision: Literal["send_to_mastering", "request_peer_revision"]
+class IssueMarkerRead(BaseModel):
+    id: int
+    issue_id: int
+    marker_type: MarkerType
+    time_start: float
+    time_end: float | None = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class IssueBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     description: str = Field(..., min_length=1)
-    issue_type: IssueType = IssueType.POINT
     severity: IssueSeverity = IssueSeverity.MAJOR
-    time_start: float = Field(..., ge=0)
-    time_end: float | None = Field(default=None, ge=0)
 
 
 class IssueCreate(IssueBase):
     phase: str
+    markers: list[IssueMarkerCreate] = []
 
 
 class IssueUpdate(BaseModel):
@@ -346,6 +373,7 @@ class IssueRead(IssueBase):
     source_version_number: int | None = None
     master_delivery_id: int | None = None
     status: IssueStatus
+    markers: list[IssueMarkerRead] = []
     created_at: datetime
     updated_at: datetime
     comment_count: int = 0
@@ -445,6 +473,7 @@ class TrackDetailResponse(BaseModel):
     checklist_items: list[ChecklistItemRead]
     events: list[WorkflowEventRead]
     source_versions: list[TrackSourceVersionRead] = []
+    master_deliveries: list[MasterDeliveryRead] = []
     discussions: list["DiscussionRead"] = []
     workflow_config: "WorkflowConfigSchema | None" = None
 
@@ -493,10 +522,30 @@ class DiscussionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DiscussionUpdate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=5000)
+
+
+class CommentUpdate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=5000)
+
+
 class WebhookConfig(BaseModel):
     url: str = ""
     enabled: bool = False
     events: list[str] = []
+
+
+class WebhookDeliveryRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    event_type: str
+    success: bool
+    status_code: int | None
+    target_url: str
+    error_detail: str | None
+    created_at: datetime
 
 
 class IssueBatchUpdate(BaseModel):
@@ -515,29 +564,62 @@ class WorkflowTransitionRequest(BaseModel):
 class WorkflowStepDefSchema(BaseModel):
     id: str = Field(..., pattern=r"^[a-z][a-z0-9_]{1,49}$")
     label: str = Field(..., min_length=1, max_length=100)
-    type: Literal["gate", "review", "revision", "delivery"]
+    type: Literal["approval", "gate", "review", "revision", "delivery"]
+    ui_variant: Literal[
+        "generic",
+        "intake",
+        "peer_review",
+        "producer_gate",
+        "mastering",
+        "final_review",
+    ] | None = None
     assignee_role: str
     order: int = Field(..., ge=0)
     transitions: dict[str, str] = {}
     return_to: str | None = None
     revision_step: str | None = None
+    # Approval-specific
+    allow_permanent_reject: bool | None = None
+    # Review-specific
+    assignment_mode: Literal["manual", "auto"] | None = None
+    reviewer_pool: list[int] | None = None
+    required_reviewer_count: int | None = Field(default=None, ge=1)
+    # Approval/delivery override
+    assignee_user_id: int | None = None
+    # Delivery-specific
+    require_confirmation: bool | None = None
+    # Additional roles that may act on this step
+    actor_roles: list[str] | None = None
+
+    @model_validator(mode="after")
+    def normalize_gate_to_approval(self) -> "WorkflowStepDefSchema":
+        """Accept legacy ``gate`` type but normalise to ``approval``."""
+        if self.type == "gate":
+            self.type = "approval"
+        return self
 
 
 class WorkflowConfigSchema(BaseModel):
     version: int = 1
-    steps: list[WorkflowStepDefSchema] = Field(..., min_length=1, max_length=20)
+    steps: list[WorkflowStepDefSchema] = Field(..., min_length=1, max_length=30)
 
     @model_validator(mode="after")
     def validate_workflow(self) -> "WorkflowConfigSchema":
-
-        step_ids = {s.id for s in self.steps}
+        step_by_id = {s.id: s for s in self.steps}
+        step_ids = set(step_by_id.keys())
         seen_ids: set[str] = set()
+        seen_orders: set[int] = set()
 
         for step in self.steps:
             # Unique IDs
             if step.id in seen_ids:
                 raise ValueError(f"Duplicate step id: '{step.id}'")
             seen_ids.add(step.id)
+
+            # Unique order index to keep step ordering deterministic
+            if step.order in seen_orders:
+                raise ValueError(f"Duplicate step order: '{step.order}'")
+            seen_orders.add(step.order)
 
             # Validate transition targets
             for decision, target in step.transitions.items():
@@ -546,6 +628,24 @@ class WorkflowConfigSchema(BaseModel):
                         f"Step '{step.id}' transition '{decision}' targets "
                         f"unknown step '{target}'"
                     )
+
+                # reject_to_* must always be a rollback to an earlier stage.
+                if decision.startswith("reject_to_"):
+                    if target not in step_ids:
+                        raise ValueError(
+                            f"Step '{step.id}' transition '{decision}' must target a workflow step, "
+                            f"not special target '{target}'"
+                        )
+                    target_step = step_by_id[target]
+                    if target_step.id == step.id:
+                        raise ValueError(
+                            f"Step '{step.id}' transition '{decision}' cannot target itself"
+                        )
+                    if target_step.order >= step.order:
+                        raise ValueError(
+                            f"Step '{step.id}' transition '{decision}' must target an earlier step. "
+                            f"Got order {target_step.order} >= {step.order}"
+                        )
 
             # Revision steps must have return_to
             if step.type == "revision":
@@ -573,16 +673,79 @@ class WorkflowConfigSchema(BaseModel):
                         f"must be of type 'revision'"
                     )
 
-        # At least one path to __completed
-        has_completed = any(
+        # Completion path requirement: either a transition to __completed
+        # (generic engine path) or a final_review step (which completes via
+        # the dedicated /final-review/approve dual-confirmation endpoint).
+        has_completed_transition = any(
             "__completed" in step.transitions.values() for step in self.steps
         )
-        if not has_completed:
+        has_final_review_step = any(
+            step.ui_variant == "final_review" or step.id == "final_review"
+            for step in self.steps
+        )
+        if not (has_completed_transition or has_final_review_step):
             raise ValueError(
-                "Workflow must have at least one transition to '__completed'"
+                "Workflow must have at least one path to completion "
+                "(either a transition to '__completed' or a 'final_review' step)"
             )
 
         return self
+
+
+# ── Stage assignment schemas ──────────────────────────────────────────────────
+
+
+class StageAssignmentRead(BaseModel):
+    id: int
+    track_id: int
+    stage_id: str
+    user_id: int
+    status: str
+    assigned_at: datetime
+    completed_at: datetime | None = None
+    user: UserRead | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AssignReviewerRequest(BaseModel):
+    user_ids: list[int] = Field(..., min_length=1)
+
+
+class ReassignReviewerRequest(BaseModel):
+    user_id: int | None = None
+
+
+# ── Reopen request schemas ────────────────────────────────────────────────────
+
+
+class ReopenRequestCreate(BaseModel):
+    target_stage_id: str = Field(..., min_length=1, max_length=50)
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+
+class DirectReopenRequest(BaseModel):
+    target_stage_id: str = Field(..., min_length=1, max_length=50)
+
+
+class ReopenDecisionRequest(BaseModel):
+    decision: Literal["approve", "reject"]
+
+
+class ReopenRequestRead(BaseModel):
+    id: int
+    track_id: int
+    requested_by_id: int
+    target_stage_id: str
+    reason: str
+    status: str
+    decided_by_id: int | None = None
+    created_at: datetime
+    decided_at: datetime | None = None
+    requested_by: UserRead | None = None
+    decided_by: UserRead | None = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ── Workflow template schemas ────────────────────────────────────────────────

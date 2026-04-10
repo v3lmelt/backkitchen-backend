@@ -14,6 +14,7 @@ from app.schemas.schemas import (
     UserRead,
 )
 from app.security import get_current_user
+from app.notifications import notify
 from app.workflow import ensure_album_producer, ensure_album_visibility, get_album_member_ids
 
 router = APIRouter(tags=["invitations"])
@@ -135,6 +136,12 @@ def accept_invitation(
 
     db.add(AlbumMember(album_id=invitation.album_id, user_id=current_user.id))
     invitation.status = "accepted"
+
+    album = db.get(Album, invitation.album_id)
+    album_title = album.title if album else "未知专辑"
+    notify(db, [invitation.invited_by_user_id], "invitation_accepted", "邀请已被接受",
+           f"{current_user.display_name or current_user.username} 已接受加入「{album_title}」的邀请")
+
     db.commit()
     db.refresh(invitation)
     return _invitation_to_read(invitation, db, include_album=True)
@@ -161,6 +168,12 @@ def decline_invitation(
         )
 
     invitation.status = "declined"
+
+    album = db.get(Album, invitation.album_id)
+    album_title = album.title if album else "未知专辑"
+    notify(db, [invitation.invited_by_user_id], "invitation_declined", "邀请已被拒绝",
+           f"{current_user.display_name or current_user.username} 已拒绝加入「{album_title}」的邀请")
+
     db.commit()
     db.refresh(invitation)
     return _invitation_to_read(invitation, db, include_album=True)

@@ -3,15 +3,13 @@ from datetime import datetime, timezone
 import pytest
 from fastapi import HTTPException
 
-from app.models.issue import IssuePhase, IssueStatus
-from app.models.track import RejectionMode, TrackStatus
+from app.models.issue import IssueStatus
+from app.models.track import TrackStatus
 from app.workflow import (
-    assign_random_peer_reviewer,
     current_master_delivery,
     current_source_version,
     ensure_track_visibility,
     log_track_event,
-    track_allowed_actions,
 )
 
 
@@ -37,57 +35,6 @@ def test_current_master_delivery_prefers_current_cycle(factory):
     factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=4, workflow_cycle=1)
     current = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1, workflow_cycle=2)
     assert current_master_delivery(track).id == current.id
-
-
-def test_track_allowed_actions_cover_core_roles(factory):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    reviewer = factory.user(username="reviewer")
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
-
-    submitted = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED)
-    rejected = factory.track(
-        album=album,
-        submitter=submitter,
-        status=TrackStatus.REJECTED,
-        rejection_mode=RejectionMode.RESUBMITTABLE,
-    )
-    peer = factory.track(album=album, submitter=submitter, status=TrackStatus.PEER_REVIEW, peer_reviewer=reviewer)
-    mastering_track = factory.track(album=album, submitter=submitter, status=TrackStatus.MASTERING)
-
-    assert track_allowed_actions(submitted, producer, album) == ["intake"]
-    assert track_allowed_actions(rejected, submitter, album) == ["resubmit"]
-    assert track_allowed_actions(peer, reviewer, album) == ["peer_review"]
-    assert track_allowed_actions(mastering_track, mastering, album) == ["mastering"]
-
-
-def test_assign_random_peer_reviewer_excludes_submitter_and_mastering(factory, monkeypatch):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    reviewer = factory.user(username="reviewer")
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer, mastering])
-    track = factory.track(album=album, submitter=submitter)
-    monkeypatch.setattr("app.workflow.random.choice", lambda candidates: candidates[-1])
-
-    selected = assign_random_peer_reviewer(factory.session, album, track)
-
-    assert selected == reviewer.id
-    assert track.peer_reviewer_id == reviewer.id
-
-
-def test_assign_random_peer_reviewer_raises_when_no_candidate(factory):
-    producer = factory.user(role="producer")
-    mastering = factory.user(role="mastering_engineer")
-    submitter = factory.user()
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, mastering])
-    track = factory.track(album=album, submitter=submitter)
-
-    with pytest.raises(HTTPException) as exc:
-        assign_random_peer_reviewer(factory.session, album, track)
-
-    assert exc.value.status_code == 409
 
 
 def test_ensure_track_visibility_allows_submitter_and_blocks_outsider(factory):
@@ -118,8 +65,8 @@ def test_log_track_event_serializes_enums_and_datetimes(factory):
         track,
         submitter,
         "issue_updated",
-        from_status=TrackStatus.PEER_REVIEW,
-        to_status=TrackStatus.PEER_REVISION,
+        from_status="peer_review",
+        to_status="peer_revision",
         payload={"status": IssueStatus.RESOLVED, "at": datetime(2024, 1, 1, tzinfo=timezone.utc)},
     )
 

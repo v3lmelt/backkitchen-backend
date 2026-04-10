@@ -7,7 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
 
-class IssueType(str, enum.Enum):
+class MarkerType(str, enum.Enum):
     POINT = "point"
     RANGE = "range"
 
@@ -54,11 +54,6 @@ class Issue(Base):
     )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    issue_type: Mapped[IssueType] = mapped_column(
-        Enum(IssueType, values_callable=lambda items: [item.value for item in items]),
-        nullable=False,
-        default=IssueType.POINT,
-    )
     severity: Mapped[IssueSeverity] = mapped_column(
         Enum(IssueSeverity, values_callable=lambda items: [item.value for item in items]),
         nullable=False,
@@ -70,8 +65,6 @@ class Issue(Base):
         default=IssueStatus.OPEN,
         index=True,
     )
-    time_start: Mapped[float] = mapped_column(Float, nullable=False)
-    time_end: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
@@ -86,6 +79,31 @@ class Issue(Base):
     comments: Mapped[list["Comment"]] = relationship(  # noqa: F821
         "Comment", back_populates="issue", cascade="all, delete-orphan"
     )
+    markers: Mapped[list["IssueMarker"]] = relationship(
+        "IssueMarker", back_populates="issue", cascade="all, delete-orphan",
+        order_by="IssueMarker.id",
+    )
 
     def __repr__(self) -> str:
         return f"<Issue(id={self.id}, title='{self.title}', status='{self.status}')>"
+
+
+class IssueMarker(Base):
+    __tablename__ = "issue_markers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    issue_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("issues.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    marker_type: Mapped[MarkerType] = mapped_column(
+        Enum(MarkerType, values_callable=lambda items: [item.value for item in items]),
+        nullable=False,
+        default=MarkerType.POINT,
+    )
+    time_start: Mapped[float] = mapped_column(Float, nullable=False)
+    time_end: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    issue: Mapped["Issue"] = relationship("Issue", back_populates="markers")
+
+    def __repr__(self) -> str:
+        return f"<IssueMarker(id={self.id}, issue_id={self.issue_id}, type='{self.marker_type}', start={self.time_start})>"

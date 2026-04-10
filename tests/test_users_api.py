@@ -4,24 +4,24 @@ def test_list_users_requires_auth(client):
 
 
 def test_list_users(client, factory, auth_headers):
-    u1 = factory.user(username="alice")
+    producer = factory.user(username="alice", role="producer")
     u2 = factory.user(username="bob")
-    response = client.get("/api/users", headers=auth_headers(u1))
+    response = client.get("/api/users", headers=auth_headers(producer))
     assert response.status_code == 200
     ids = {u["id"] for u in response.json()}
-    assert {u1.id, u2.id} <= ids
+    assert {producer.id, u2.id} <= ids
 
 
 def test_get_user_by_id(client, factory, auth_headers):
     user = factory.user(username="target")
-    caller = factory.user(username="caller")
+    caller = factory.user(username="caller", role="producer")
     response = client.get(f"/api/users/{user.id}", headers=auth_headers(caller))
     assert response.status_code == 200
     assert response.json()["username"] == "target"
 
 
 def test_get_user_not_found(client, factory, auth_headers):
-    caller = factory.user()
+    caller = factory.user(role="producer")
     response = client.get("/api/users/99999", headers=auth_headers(caller))
     assert response.status_code == 404
 

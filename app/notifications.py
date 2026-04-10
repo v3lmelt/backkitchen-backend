@@ -11,6 +11,22 @@ from app.models.notification import Notification
 from app.services.webhook import build_webhook_payload, post_webhook
 
 
+async def _deliver_webhook_background(
+    url: str,
+    payload: dict,
+    album_id: int,
+    event_type: str,
+) -> None:
+    """Background-task wrapper that opens its own DB session for logging."""
+    from app.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        await post_webhook(url, payload, db=db, album_id=album_id, event_type=event_type)
+    finally:
+        db.close()
+
+
 def notify(
     db: Session,
     user_ids: list[int | None],
@@ -74,4 +90,5 @@ def _try_dispatch_webhook(
         event_type, title, body,
         track_id=track_id, album_id=album_id, issue_id=issue_id,
     )
-    background_tasks.add_task(post_webhook, config["url"], payload)
+    url = config["url"]
+    background_tasks.add_task(_deliver_webhook_background, url, payload, album_id, event_type)

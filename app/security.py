@@ -114,7 +114,7 @@ def _resolve_bearer_user(
         return None
     payload = _decode_token(credentials.credentials)
     user = db.get(User, int(payload["sub"]))
-    if user is None:
+    if user is None or user.deleted_at is not None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authenticated user no longer exists.",
@@ -133,6 +133,15 @@ def get_current_user(
             detail="Authentication required.",
         )
     return user
+
+
+def require_producer(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "producer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only producers can perform this action.",
+        )
+    return current_user
 
 
 def get_current_user_optional(

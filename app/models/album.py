@@ -5,6 +5,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
+ALBUM_ARCHIVE_RETENTION_DAYS = 14
+
 
 class Album(Base):
     __tablename__ = "albums"
@@ -43,6 +45,9 @@ class Album(Base):
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, default=None, index=True
+    )
 
     tracks: Mapped[list["Track"]] = relationship(  # noqa: F821
         "Track", back_populates="album", cascade="all, delete-orphan"
@@ -61,6 +66,9 @@ class Album(Base):
     )
     workflow_template: Mapped["WorkflowTemplate | None"] = relationship(  # noqa: F821
         "WorkflowTemplate", foreign_keys=[workflow_template_id]
+    )
+    webhook_deliveries: Mapped[list["WebhookDelivery"]] = relationship(  # noqa: F821
+        "WebhookDelivery", back_populates="album", cascade="all, delete-orphan"
     )
 
     def __repr__(self) -> str:

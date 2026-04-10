@@ -10,18 +10,22 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.email_verification import EmailVerificationToken
+from app.models.password_reset import PasswordResetToken
 from app.models.user import User
 from app.schemas.schemas import (
     AuthResponse,
     ChangePasswordRequest,
+    DeleteAccountRequest,
+    ForgotPasswordRequest,
     LoginRequest,
     RegisterRequest,
     RegisterResponse,
+    ResetPasswordRequest,
     UserRead,
     UserUpdateProfile,
 )
 from app.security import create_access_token, get_current_user, hash_password, verify_password
-from app.services.email import send_verification_email
+from app.services.email import send_password_reset_email, send_verification_email
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 _DUMMY_HASH = hash_password("__dummy_timing_guard__")
 
 _VERIFICATION_TOKEN_EXPIRE_MINUTES = 30
+_PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 60
 
 
 def _build_auth_response(user: User) -> AuthResponse:
@@ -61,7 +66,9 @@ def _create_verification_token(email: str, db: Session) -> str:
 
 @router.post("/login", response_model=AuthResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
-    user = db.scalars(select(User).where(User.email == payload.email)).first()
+    user = db.scalars(
+        select(User).where(User.email == payload.email, User.deleted_at.is_(None))
+    ).first()
     stored = user.password if user is not None else _DUMMY_HASH
     if not verify_password(payload.password, stored):
         raise HTTPException(
@@ -78,12 +85,16 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
 
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> RegisterResponse:
-    if db.scalars(select(User).where(User.email == payload.email)).first() is not None:
+    if db.scalars(
+        select(User).where(User.email == payload.email, User.deleted_at.is_(None))
+    ).first() is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Email is already registered.",
         )
-    if db.scalars(select(User).where(User.username == payload.username)).first() is not None:
+    if db.scalars(
+        select(User).where(User.username == payload.username, User.deleted_at.is_(None))
+    ).first() is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username is already taken.",
@@ -144,6 +155,76 @@ def resend_verification(email: str, db: Session = Depends(get_db)) -> None:
         return
     token = _create_verification_token(email, db)
     send_verification_email(email, token)
+
+
+def _create_password_reset_token(email: str, db: Session) -> str:
+    # Invalidate any existing unused tokens for this email
+    existing = db.scalars(
+        select(PasswordResetToken).where(
+            PasswordResetToken.email == email,
+            PasswordResetToken.used.is_(False),
+        )
+    ).all()
+    for t in existing:
+        t.used = True
+
+    token = secrets.token_urlsafe(48)
+    record = PasswordResetToken(
+        token=token,
+        email=email,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=_PASSWORD_RESET_TOKEN_EXPIRE_MINUTES),
+    )
+    db.add(record)
+    db.commit()
+    return token
+
+
+@router.post("/forgot-password", status_code=status.HTTP_204_NO_CONTENT)
+def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)) -> None:
+    """Request a password reset email.
+
+    Always returns 204 regardless of whether the email exists, to avoid enumeration.
+    """
+    user = db.scalars(
+        select(User).where(User.email == payload.email, User.deleted_at.is_(None))
+    ).first()
+    if user is None or not user.email_verified:
+        return
+    token = _create_password_reset_token(payload.email, db)
+    send_password_reset_email(payload.email, token)
+
+
+@router.post("/reset-password", response_model=AuthResponse)
+def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)) -> AuthResponse:
+    record = db.scalars(
+        select(PasswordResetToken).where(PasswordResetToken.token == payload.token)
+    ).first()
+    if record is None or record.used:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset link.",
+        )
+    now = datetime.now(timezone.utc)
+    expires = record.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if now > expires:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Reset link has expired.",
+        )
+
+    user = db.scalars(
+        select(User).where(User.email == record.email, User.deleted_at.is_(None))
+    ).first()
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    user.password = hash_password(payload.new_password)
+    record.used = True
+    db.commit()
+    db.refresh(user)
+    return _build_auth_response(user)
 
 
 @router.get("/me", response_model=UserRead)
@@ -242,4 +323,67 @@ def change_password(
     if not verify_password(payload.current_password, current_user.password or ""):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect.")
     current_user.password = hash_password(payload.new_password)
+    db.commit()
+
+
+@router.post("/me/delete-account", status_code=status.HTTP_204_NO_CONTENT)
+def delete_account(
+    payload: DeleteAccountRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    """Soft-delete the current user's account.
+
+    Refuses if the user still owns circles or produces non-archived albums.
+    Anonymizes display_name and suffixes username/email to free up uniqueness.
+    """
+    from app.models.album import Album
+    from app.models.circle import Circle
+
+    if not verify_password(payload.password, current_user.password or ""):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password is incorrect.",
+        )
+
+    # Block if the user still owns circles
+    owned_circle = db.scalars(
+        select(Circle.id).where(Circle.created_by == current_user.id).limit(1)
+    ).first()
+    if owned_circle is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You still own one or more circles. Delete them before closing your account.",
+        )
+
+    # Block if the user still produces non-archived albums
+    produced_album = db.scalars(
+        select(Album.id).where(
+            Album.producer_id == current_user.id,
+            Album.archived_at.is_(None),
+        ).limit(1)
+    ).first()
+    if produced_album is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You still produce one or more active albums. Archive or transfer them before closing your account.",
+        )
+
+    now = datetime.now(timezone.utc)
+    original_email = current_user.email
+    current_user.deleted_at = now
+    current_user.display_name = "[deleted user]"
+    # Suffix username/email with deleted-<id>-<ts> to free the unique constraints
+    suffix = f".deleted-{current_user.id}-{int(now.timestamp())}"
+    if current_user.username:
+        current_user.username = f"{current_user.username}{suffix}"
+    if current_user.email:
+        current_user.email = f"{current_user.email}{suffix}"
+    # Invalidate any outstanding password reset tokens tied to the original email
+    if original_email:
+        db.execute(
+            PasswordResetToken.__table__.update()
+            .where(PasswordResetToken.email == original_email, PasswordResetToken.used.is_(False))
+            .values(used=True)
+        )
     db.commit()

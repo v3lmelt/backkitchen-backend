@@ -42,10 +42,10 @@ def _get_circle_membership(
     return circle, membership
 
 
-def _ensure_producer(user: User, circle: Circle, membership: CircleMember | None) -> None:
-    if user.role != "producer":
+def _ensure_circle_owner(user: User, circle: Circle) -> None:
+    if circle.created_by != user.id:
         raise HTTPException(
-            status_code=403, detail="Only producers can manage workflow templates"
+            status_code=403, detail="Only the circle owner can manage workflow templates"
         )
 
 
@@ -125,8 +125,8 @@ def create_template(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    circle, membership = _get_circle_membership(circle_id, current_user, db)
-    _ensure_producer(current_user, circle, membership)
+    circle, _ = _get_circle_membership(circle_id, current_user, db)
+    _ensure_circle_owner(current_user, circle)
 
     template = WorkflowTemplate(
         circle_id=circle_id,
@@ -151,8 +151,8 @@ def update_template(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    circle, membership = _get_circle_membership(circle_id, current_user, db)
-    _ensure_producer(current_user, circle, membership)
+    circle, _ = _get_circle_membership(circle_id, current_user, db)
+    _ensure_circle_owner(current_user, circle)
 
     template = db.get(WorkflowTemplate, template_id)
     if not template or template.circle_id != circle_id:
@@ -179,8 +179,8 @@ def delete_template(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    circle, membership = _get_circle_membership(circle_id, current_user, db)
-    _ensure_producer(current_user, circle, membership)
+    circle, _ = _get_circle_membership(circle_id, current_user, db)
+    _ensure_circle_owner(current_user, circle)
 
     template = db.get(WorkflowTemplate, template_id)
     if not template or template.circle_id != circle_id:

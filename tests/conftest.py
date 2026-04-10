@@ -1,3 +1,5 @@
+import copy
+import json
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -19,15 +21,16 @@ from app.database import Base, get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
-from app.models.issue import Issue, IssuePhase, IssueSeverity, IssueStatus, IssueType
+from app.models.issue import Issue, IssueMarker, IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.master_delivery import MasterDelivery
-from app.models.track import RejectionMode, Track, TrackStatus
+from app.models.track import RejectionMode, Track
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.invitation import Invitation
 from app.models.notification import Notification
 from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users
 from app.security import create_access_token
+from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 
 @pytest.fixture
@@ -155,13 +158,20 @@ class Factory:
         mastering_engineer: User,
         members: list[User] | None = None,
         title: str | None = None,
+        workflow_config: dict | None = None,
     ) -> Album:
+        effective_workflow = (
+            workflow_config
+            if workflow_config is not None
+            else copy.deepcopy(DEFAULT_WORKFLOW_CONFIG)
+        )
         album = Album(
             title=title or self._next("album"),
             description="test album",
             cover_color="#abcdef",
             producer_id=producer.id,
             mastering_engineer_id=mastering_engineer.id,
+            workflow_config=json.dumps(effective_workflow, ensure_ascii=False),
         )
         self.session.add(album)
         self.session.commit()
@@ -178,7 +188,7 @@ class Factory:
         *,
         album: Album,
         submitter: User,
-        status: TrackStatus = TrackStatus.SUBMITTED,
+        status: str = "intake",
         peer_reviewer: User | None = None,
         rejection_mode: RejectionMode | None = None,
         version: int = 1,
@@ -266,8 +276,15 @@ class Factory:
         source_version_id: int | None = None,
         master_delivery_id: int | None = None,
         workflow_cycle: int | None = None,
-        issue_type: IssueType = IssueType.POINT,
+        marker_type: MarkerType = MarkerType.POINT,
     ) -> Issue:
+        markers = [
+            IssueMarker(
+                marker_type=marker_type,
+                time_start=12.3,
+                time_end=18.0 if marker_type == MarkerType.RANGE else None,
+            )
+        ]
         issue = Issue(
             track_id=track.id,
             author_id=author.id,
@@ -277,11 +294,9 @@ class Factory:
             master_delivery_id=master_delivery_id,
             title=self._next("issue"),
             description="issue description",
-            issue_type=issue_type,
             severity=IssueSeverity.MAJOR,
             status=status,
-            time_start=12.3,
-            time_end=18.0 if issue_type == IssueType.RANGE else None,
+            markers=markers,
         )
         self.session.add(issue)
         self.session.commit()

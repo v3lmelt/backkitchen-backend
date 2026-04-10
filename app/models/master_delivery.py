@@ -20,6 +20,7 @@ class MasterDelivery(Base):
     uploaded_by_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("users.id"), nullable=True, index=True
     )
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
     producer_approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     submitter_approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

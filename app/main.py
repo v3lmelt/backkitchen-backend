@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +8,7 @@ from pathlib import Path
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from app.ws_manager import manager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, select, text
@@ -30,7 +30,6 @@ from app.models import (  # noqa: F401
     IssuePhase,
     IssueSeverity,
     IssueStatus,
-    IssueType,
     MasterDelivery,
     Notification,
     RejectionMode,
@@ -43,53 +42,6 @@ from app.routers import admin as admin_router
 from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users, workflow_templates
 from app.security import _decode_token, hash_password
 from app.workflow import is_album_completed, log_track_event
-
-
-class ConnectionManager:
-    MAX_CONNECTIONS_PER_TRACK = 50
-    MAX_TOTAL_CONNECTIONS = 200
-
-    def __init__(self) -> None:
-        self.active_connections: dict[int, list[WebSocket]] = defaultdict(list)
-        self._total_count = 0
-
-    async def connect(self, track_id: int, websocket: WebSocket) -> bool:
-        """Accept and register a WebSocket. Returns False if limits exceeded."""
-        if self._total_count >= self.MAX_TOTAL_CONNECTIONS:
-            await websocket.accept()
-            await websocket.close(code=1013, reason="Server connection limit reached")
-            return False
-        if len(self.active_connections[track_id]) >= self.MAX_CONNECTIONS_PER_TRACK:
-            await websocket.accept()
-            await websocket.close(code=1013, reason="Track connection limit reached")
-            return False
-        await websocket.accept()
-        self.active_connections[track_id].append(websocket)
-        self._total_count += 1
-        return True
-
-    def disconnect(self, track_id: int, websocket: WebSocket) -> None:
-        conns = self.active_connections.get(track_id, [])
-        if websocket in conns:
-            conns.remove(websocket)
-            self._total_count -= 1
-        if not conns and track_id in self.active_connections:
-            del self.active_connections[track_id]
-
-    async def broadcast(self, track_id: int, message: dict) -> None:
-        payload = json.dumps(message)
-        dead: list[WebSocket] = []
-        for ws in self.active_connections.get(track_id, []):
-            try:
-                await ws.send_text(payload)
-            except Exception as exc:  # noqa: BLE001
-                logging.getLogger(__name__).warning("WebSocket send failed: %s", exc)
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(track_id, ws)
-
-
-manager = ConnectionManager()
 
 
 def _run_sqlite_compat_migrations() -> None:
@@ -147,8 +99,6 @@ def _run_sqlite_compat_migrations() -> None:
             conn.execute(text("UPDATE tracks SET status = 'completed' WHERE lower(status) = 'approved' OR status = 'APPROVED'"))
 
         if "issues" in columns_by_table:
-            conn.execute(text("UPDATE issues SET issue_type = 'point' WHERE lower(issue_type) = 'point' OR issue_type = 'POINT'"))
-            conn.execute(text("UPDATE issues SET issue_type = 'range' WHERE lower(issue_type) = 'range' OR issue_type = 'RANGE'"))
             conn.execute(text("UPDATE issues SET severity = 'critical' WHERE lower(severity) = 'critical' OR severity = 'CRITICAL'"))
             conn.execute(text("UPDATE issues SET severity = 'major' WHERE lower(severity) = 'major' OR severity = 'MAJOR'"))
             conn.execute(text("UPDATE issues SET severity = 'minor' WHERE lower(severity) = 'minor' OR severity = 'MINOR'"))
@@ -346,7 +296,7 @@ def _seed_demo_data() -> None:
             artist="Nova",
             album_id=album.id,
             submitter_id=submitter.id,
-            status=TrackStatus.SUBMITTED,
+            status="intake",
             version=1,
             workflow_cycle=1,
             created_at=now,
@@ -354,7 +304,7 @@ def _seed_demo_data() -> None:
         )
         db.add(track)
         db.flush()
-        log_track_event(db, track, submitter, "track_submitted", to_status=TrackStatus.SUBMITTED)
+        log_track_event(db, track, submitter, "track_submitted", to_status="intake")
 
         db.commit()
     except Exception:
@@ -488,8 +438,46 @@ def _run_archived_track_cleanup() -> int:
     return deleted
 
 
+def _run_archived_album_cleanup() -> int:
+    """Hard-delete albums whose archived_at exceeded the retention period.
+
+    Cascade-deletes all tracks, members, invitations, etc., and cleans up
+    files from disk/R2. Returns the number of albums deleted.
+    """
+    from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS
+    from app.services.cleanup import cleanup_files, collect_album_files
+
+    db = SessionLocal()
+    deleted = 0
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=ALBUM_ARCHIVE_RETENTION_DAYS)
+        expired_ids = list(db.scalars(
+            select(Album.id).where(
+                Album.archived_at.isnot(None),
+                Album.archived_at < cutoff,
+            ).limit(_ARCHIVE_CLEANUP_BATCH)
+        ).all())
+
+        for album_id in expired_ids:
+            try:
+                album = db.get(Album, album_id)
+                if album is None:
+                    continue
+                local_paths, r2_keys = collect_album_files(album)
+                db.delete(album)
+                db.commit()
+                cleanup_files(local_paths, r2_keys)
+                deleted += 1
+            except Exception:
+                db.rollback()
+                _cleanup_logger.warning("Failed to hard-delete archived album %d", album_id, exc_info=True)
+    finally:
+        db.close()
+    return deleted
+
+
 async def _periodic_cleanup() -> None:
-    """Background loop that cleans up expired source versions and archived tracks every hour."""
+    """Background loop that cleans up expired source versions and archived tracks/albums every hour."""
     while True:
         await asyncio.sleep(_CLEANUP_INTERVAL)
         try:
@@ -504,6 +492,12 @@ async def _periodic_cleanup() -> None:
                 _cleanup_logger.info("Hard-deleted %d expired archived tracks", count)
         except Exception:
             _cleanup_logger.warning("Periodic archive cleanup failed", exc_info=True)
+        try:
+            count = _run_archived_album_cleanup()
+            if count:
+                _cleanup_logger.info("Hard-deleted %d expired archived albums", count)
+        except Exception:
+            _cleanup_logger.warning("Periodic album archive cleanup failed", exc_info=True)
 
 
 @asynccontextmanager
@@ -590,21 +584,21 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
         return
 
     # Verify user has access to this track's album.
-    # Single query: join Track → Album, then a second query for membership set.
     user_id = int(payload["sub"])
     db = SessionLocal()
     try:
-        # Query 1: fetch user + track + album in one join
-        row = db.execute(
-            select(User, Track, Album)
-            .join(Track, Track.id == track_id)
-            .join(Album, Album.id == Track.album_id)
-            .where(User.id == user_id)
-        ).first()
-        if row is None:
+        user = db.get(User, user_id)
+        if user is None or user.deleted_at is not None:
             await websocket.close(code=4001)
             return
-        user, track, album = row
+        track = db.get(Track, track_id)
+        if track is None:
+            await websocket.close(code=4001)
+            return
+        album = db.get(Album, track.album_id)
+        if album is None:
+            await websocket.close(code=4001)
+            return
         # Query 2: fetch album member ids
         member_ids: set[int] = set(
             db.scalars(

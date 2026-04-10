@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -10,12 +10,14 @@ ARCHIVE_RETENTION_DAYS = 14
 
 
 class TrackStatus(str, enum.Enum):
-    SUBMITTED = "submitted"
-    PEER_REVIEW = "peer_review"
-    PEER_REVISION = "peer_revision"
-    PRODUCER_MASTERING_GATE = "producer_mastering_gate"
-    MASTERING = "mastering"
-    MASTERING_REVISION = "mastering_revision"
+    """Terminal / special track statuses used by the runtime.
+
+    Active workflow step IDs (e.g. ``"intake"``, ``"peer_review"``,
+    ``"mastering"``) are plain strings stored in ``track.status`` and
+    are NOT part of this enum — they are defined in the album's
+    ``workflow_config``.
+    """
+
     FINAL_REVIEW = "final_review"
     COMPLETED = "completed"
     REJECTED = "rejected"
@@ -24,6 +26,11 @@ class TrackStatus(str, enum.Enum):
 class RejectionMode(str, enum.Enum):
     FINAL = "final"
     RESUBMITTABLE = "resubmittable"
+
+
+class WorkflowVariant(str, enum.Enum):
+    STANDARD = "standard"
+    PRODUCER_DIRECT = "producer_direct"
 
 
 class Track(Base):
@@ -49,11 +56,17 @@ class Track(Base):
     status: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
-        default=TrackStatus.SUBMITTED.value,
+        default="intake",
     )
     rejection_mode: Mapped[RejectionMode | None] = mapped_column(
         Enum(RejectionMode, values_callable=lambda items: [item.value for item in items]),
         nullable=True,
+    )
+    workflow_variant: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=WorkflowVariant.STANDARD.value,
+        server_default=WorkflowVariant.STANDARD.value,
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     workflow_cycle: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -67,6 +80,7 @@ class Track(Base):
         nullable=False,
     )
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None, index=True)
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
 
     album: Mapped["Album"] = relationship("Album", back_populates="tracks")  # noqa: F821
     submitter: Mapped["User | None"] = relationship(  # noqa: F821

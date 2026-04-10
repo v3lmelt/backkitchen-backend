@@ -222,4 +222,4 @@ def test_upload_circle_logo_validates_file_type(client, factory, auth_headers):
     assert bad_type.status_code == 400
     assert bad_ext.status_code == 400
     assert ok.status_code == 200
-    assert ok.json()["logo_url"].startswith("/uploads/")
+    assert ok.json()["logo_url"].startswith("logos/")

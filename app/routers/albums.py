@@ -1,29 +1,34 @@
 import io
 import json
+import logging
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+logger = logging.getLogger(__name__)
+
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
-from app.models.album import Album
+from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
 from app.models.album_member import AlbumMember
 from app.models.circle import CircleMember
 from app.models.issue import Issue, IssueStatus
 from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
-from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WorkflowConfigSchema
-from app.security import get_current_user
+from app.notifications import notify
+from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema
+from app.security import get_current_user, require_producer
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
 from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed
+from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
@@ -40,11 +45,14 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
     ]
     phase_deadlines = json.loads(album.phase_deadlines) if album.phase_deadlines else None
     genres = json.loads(album.genres) if album.genres else None
-    workflow_config = (
-        WorkflowConfigSchema(**json.loads(album.workflow_config))
-        if album.workflow_config
-        else None
-    )
+    workflow_config: WorkflowConfigSchema | None = None
+    try:
+        workflow_config = WorkflowConfigSchema(**json.loads(album.workflow_config))
+    except Exception:
+        logger.warning(
+            "Album %d has an invalid workflow_config and will be read without it.",
+            album.id,
+        )
     track_count = db.scalar(
         select(func.count()).select_from(Track).where(
             Track.album_id == album.id,
@@ -76,6 +84,7 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         workflow_template_name=template_name,
         created_at=album.created_at,
         updated_at=album.updated_at,
+        archived_at=album.archived_at,
         track_count=track_count,
         producer=UserRead.model_validate(album.producer) if album.producer else None,
         mastering_engineer=(
@@ -91,7 +100,7 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
 def create_album(
     payload: AlbumCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_producer),
 ) -> AlbumRead:
     album_data = payload.model_dump()
     genres = album_data.pop("genres", None)
@@ -100,8 +109,8 @@ def create_album(
     album = Album(**album_data, producer_id=current_user.id)
     if genres:
         album.genres = json.dumps(genres, ensure_ascii=False)
-    if wf_config is not None:
-        album.workflow_config = json.dumps(wf_config, ensure_ascii=False)
+    effective_workflow = wf_config if wf_config is not None else DEFAULT_WORKFLOW_CONFIG
+    album.workflow_config = json.dumps(effective_workflow, ensure_ascii=False)
     if wf_template_id is not None:
         album.workflow_template_id = wf_template_id
     db.add(album)
@@ -114,10 +123,17 @@ def create_album(
 
 @router.get("", response_model=list[AlbumRead])
 def list_albums(
+    include_archived: bool = Query(False),
+    archived_only: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[AlbumRead]:
-    albums = list(db.scalars(select(Album).order_by(Album.id)).all())
+    stmt = select(Album).order_by(Album.id)
+    if archived_only:
+        stmt = stmt.where(Album.archived_at.isnot(None))
+    elif not include_archived:
+        stmt = stmt.where(Album.archived_at.is_(None))
+    albums = list(db.scalars(stmt).all())
     members_by_album = get_all_album_member_ids(db)
     visible: list[AlbumRead] = []
     for album in albums:
@@ -226,6 +242,9 @@ def update_album_metadata(
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
     album = ensure_album_producer(album_id, current_user, db)
+    if payload.title is not None:
+        album.title = payload.title
+    album.description = payload.description
     album.release_date = payload.release_date
     album.catalog_number = payload.catalog_number
     album.circle_name = payload.circle_name
@@ -482,8 +501,62 @@ async def test_webhook(
     if not config.get("url"):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No webhook URL configured.")
     payload = build_webhook_payload("test", "Webhook Test", f"Test from album: {album.title}", album_id=album.id)
-    success = await post_webhook(config["url"], payload)
+    success = await post_webhook(config["url"], payload, db=db, album_id=album.id, event_type="test")
     return {"success": success}
+
+
+@router.get("/{album_id}/webhook/deliveries", response_model=list[WebhookDeliveryRead])
+def get_webhook_deliveries(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[WebhookDeliveryRead]:
+    album = ensure_album_producer(album_id, current_user, db)
+    from app.models.webhook_delivery import WebhookDelivery
+    records = (
+        db.query(WebhookDelivery)
+        .filter(WebhookDelivery.album_id == album_id)
+        .order_by(WebhookDelivery.id.desc())
+        .limit(50)
+        .all()
+    )
+    return [WebhookDeliveryRead.model_validate(r) for r in records]
+
+
+@router.get("/{album_id}/workflow", response_model=WorkflowConfigSchema)
+def get_workflow_config(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> WorkflowConfigSchema:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    ensure_album_visibility(album, current_user, db)
+    return WorkflowConfigSchema(**json.loads(album.workflow_config))
+
+
+@router.put("/{album_id}/workflow", response_model=dict)
+def update_workflow_config(
+    album_id: int,
+    payload: WorkflowConfigSchema,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    from app.workflow_engine import migrate_tracks_on_workflow_change, parse_workflow_config
+
+    album = ensure_album_producer(album_id, current_user, db)
+
+    old_config = parse_workflow_config(album)
+    new_config = payload.model_dump()
+
+    album.workflow_config = json.dumps(new_config, ensure_ascii=False)
+    migrations = migrate_tracks_on_workflow_change(db, album, old_config, new_config, background_tasks)
+
+    db.commit()
+    db.refresh(album)
+    return {"ok": True, "migrations": migrations}
 
 
 @router.get("/{album_id}/export")
@@ -558,3 +631,62 @@ def export_album(
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{safe_album_title}.zip"'},
     )
+
+
+@router.post("/{album_id}/archive", response_model=AlbumRead)
+def archive_album(
+    album_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AlbumRead:
+    album = ensure_album_producer(album_id, current_user, db)
+    if album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Album is already archived.")
+    album.archived_at = datetime.now(timezone.utc)
+    member_ids = list(get_album_member_ids(db, album.id))
+    notify(
+        db,
+        member_ids,
+        "album_archived",
+        "专辑已归档",
+        f"「{album.title}」已被制作人归档",
+        album_id=album.id,
+        background_tasks=background_tasks,
+    )
+    db.commit()
+    db.refresh(album)
+    return _album_to_read(album, db)
+
+
+@router.post("/{album_id}/restore", response_model=AlbumRead)
+def restore_album(
+    album_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AlbumRead:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    if album.producer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the album producer can restore albums.",
+        )
+    if album.archived_at is None:
+        raise HTTPException(status_code=409, detail="Album is not archived.")
+    album.archived_at = None
+    member_ids = list(get_album_member_ids(db, album.id))
+    notify(
+        db,
+        member_ids,
+        "album_restored",
+        "专辑已恢复",
+        f"「{album.title}」已被制作人恢复",
+        album_id=album.id,
+        background_tasks=background_tasks,
+    )
+    db.commit()
+    db.refresh(album)
+    return _album_to_read(album, db)
