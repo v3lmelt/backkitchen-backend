@@ -1,7 +1,6 @@
 import json
 
 from app.models.stage_assignment import StageAssignment
-from app.models.track import TrackStatus
 
 
 def test_submit_checklist_replaces_existing_items_for_current_source_version(client, db_session, factory, auth_headers):
@@ -13,7 +12,7 @@ def test_submit_checklist_replaces_existing_items_for_current_source_version(cli
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     source_version = track.source_versions[-1]
@@ -41,7 +40,7 @@ def test_get_checklist_only_returns_current_source_version_items(client, factory
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
         version=2,
     )
@@ -66,7 +65,7 @@ def test_submit_checklist_requires_assigned_reviewer(client, factory, auth_heade
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
 
@@ -85,7 +84,7 @@ def test_submit_checklist_custom_review_allows_stage_assignment_reviewer(client,
     submitter = factory.user()
     reviewer = factory.user(username="reviewer")
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
 
     album.workflow_config = json.dumps(
         {
@@ -140,7 +139,7 @@ def test_submit_checklist_custom_review_rejects_unassigned_member(client, db_ses
     reviewer = factory.user(username="reviewer")
     outsider = factory.user(username="outsider")
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer, outsider])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
 
     album.workflow_config = json.dumps(
         {

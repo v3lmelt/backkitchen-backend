@@ -19,7 +19,7 @@ def test_create_peer_issue_binds_to_current_source_version(client, db_session, f
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     latest_version = db_session.scalars(
@@ -81,7 +81,7 @@ def test_create_general_issue_no_markers(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
 
@@ -110,7 +110,7 @@ def test_create_multi_marker_issue(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
 
@@ -145,7 +145,7 @@ def test_create_range_marker_requires_time_end(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
 
@@ -174,7 +174,7 @@ def test_update_issue_enforces_phase_permissions(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     source_version = track.source_versions[-1]
@@ -210,7 +210,7 @@ def test_add_comment_rejects_invalid_image_type(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER, source_version_id=track.source_versions[-1].id)
@@ -234,7 +234,7 @@ def test_add_comment_persists_images(client, db_session, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER, source_version_id=track.source_versions[-1].id)
@@ -268,7 +268,7 @@ def test_list_issues_for_track(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     sv = track.source_versions[-1]
@@ -289,7 +289,7 @@ def test_get_issue_detail(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     sv = track.source_versions[-1]
@@ -318,7 +318,7 @@ def test_batch_update_issues(client, db_session, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     sv = track.source_versions[-1]
@@ -349,7 +349,7 @@ def test_batch_update_issues_forbidden_for_outsider(client, factory, auth_header
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     sv = track.source_versions[-1]
@@ -372,7 +372,7 @@ def test_create_marker_time_end_must_exceed_time_start(client, factory, auth_hea
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
 
@@ -399,7 +399,7 @@ def test_add_comment_text_only(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
     issue = factory.issue(
@@ -424,7 +424,7 @@ def test_create_issue_custom_review_step_allows_stage_assignment_reviewer(client
     submitter = factory.user()
     reviewer = factory.user(username="reviewer")
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
 
     album.workflow_config = json.dumps(
         {
@@ -490,7 +490,7 @@ def test_create_issue_custom_review_step_rejects_unassigned_member(client, db_se
         mastering_engineer=mastering,
         members=[submitter, reviewer, outsider],
     )
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
 
     album.workflow_config = json.dumps(
         {

@@ -55,7 +55,7 @@ def test_list_tracks_respects_submitter_and_reviewer_visibility(client, factory,
     reviewer_track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
 
@@ -63,7 +63,7 @@ def test_list_tracks_respects_submitter_and_reviewer_visibility(client, factory,
     reviewer_response = client.get(
         "/api/tracks",
         headers=auth_headers(reviewer),
-        params={"status": TrackStatus.PEER_REVIEW.value, "album_id": album.id},
+        params={"status": "peer_review".value, "album_id": album.id},
     )
     outsider_response = client.get("/api/tracks", headers=auth_headers(outsider))
 
@@ -117,7 +117,7 @@ def test_upload_master_delivery_increments_delivery_number(client, db_session, f
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user()
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.MASTERING)
+    track = factory.track(album=album, submitter=submitter, status="mastering")
     factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
 
     response = client.post(
@@ -129,7 +129,7 @@ def test_upload_master_delivery_increments_delivery_number(client, db_session, f
     assert response.status_code == 200
     # The default workflow's ``mastering`` step has ``require_confirmation``
     # set, so the track stays put until the mastering engineer confirms.
-    assert response.json()["status"] == TrackStatus.MASTERING.value
+    assert response.json()["status"] == "mastering".value
     deliveries = db_session.scalars(
         select(MasterDelivery).where(MasterDelivery.track_id == track.id)
     ).all()
@@ -198,7 +198,7 @@ def test_producer_can_direct_reopen_completed_track_to_mastering(client, factory
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == TrackStatus.MASTERING.value
+    assert body["status"] == "mastering".value
     assert body["workflow_cycle"] == track.workflow_cycle + 1
 
 
@@ -211,7 +211,7 @@ def test_get_track_detail(client, factory, auth_headers):
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=reviewer,
     )
 
@@ -240,7 +240,7 @@ def test_upload_source_version_from_peer_revision(client, db_session, factory, a
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVISION,
+        status="peer_revision",
         peer_reviewer=reviewer,
     )
 
@@ -251,7 +251,7 @@ def test_upload_source_version_from_peer_revision(client, db_session, factory, a
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == TrackStatus.PEER_REVIEW.value
+    assert body["status"] == "peer_review".value
     assert body["version"] == 2
 
 
@@ -263,7 +263,7 @@ def test_upload_source_version_from_mastering_revision(client, db_session, facto
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.MASTERING_REVISION,
+        status="mastering_revision",
     )
 
     response = client.post(
@@ -273,7 +273,7 @@ def test_upload_source_version_from_mastering_revision(client, db_session, facto
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == TrackStatus.MASTERING.value
+    assert body["status"] == "mastering".value
     assert body["version"] == 2
 
 
@@ -282,7 +282,7 @@ def test_upload_source_version_wrong_status_fails(client, factory, auth_headers)
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user()
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PEER_REVIEW)
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
 
     response = client.post(
         f"/api/tracks/{track.id}/source-versions",
@@ -297,7 +297,7 @@ def test_upload_source_version_forbidden_for_non_submitter(client, factory, auth
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user()
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.PEER_REVISION)
+    track = factory.track(album=album, submitter=submitter, status="peer_revision")
 
     response = client.post(
         f"/api/tracks/{track.id}/source-versions",
@@ -346,7 +346,7 @@ def test_assign_reviewer_rejects_non_album_member(client, factory, auth_headers)
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=valid_reviewer,
     )
 
@@ -370,7 +370,7 @@ def test_reassign_reviewer_rejects_non_album_member(client, factory, auth_header
     track = factory.track(
         album=album,
         submitter=submitter,
-        status=TrackStatus.PEER_REVIEW,
+        status="peer_review",
         peer_reviewer=current_reviewer,
     )
 
@@ -390,7 +390,7 @@ def test_upload_source_version_custom_revision_requires_assigned_user(client, db
     submitter = factory.user()
     outsider = factory.user(username="outsider")
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, outsider])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
 
     album.workflow_config = json.dumps(
         {
@@ -444,7 +444,7 @@ def test_upload_master_delivery_custom_delivery_requires_assigned_user(client, d
     submitter = factory.user()
     outsider = factory.user(username="outsider")
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, outsider])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
 
     album.workflow_config = json.dumps(
         {
@@ -498,7 +498,7 @@ def test_create_issue_custom_step_rejects_mismatched_phase(client, db_session, f
     submitter = factory.user()
     reviewer = factory.user(username="reviewer")
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
-    track = factory.track(album=album, submitter=submitter, status=TrackStatus.SUBMITTED, peer_reviewer=None)
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
 
     album.workflow_config = json.dumps(
         {

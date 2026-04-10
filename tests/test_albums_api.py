@@ -101,7 +101,7 @@ def test_album_stats(client, factory, auth_headers):
     reviewer = factory.user(username="reviewer")
     album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
 
-    track1 = factory.track(album=album, submitter=submitter, status=TrackStatus.PEER_REVIEW, peer_reviewer=reviewer)
+    track1 = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
     factory.track(album=album, submitter=submitter, status=TrackStatus.COMPLETED)
     sv = track1.source_versions[-1]
     factory.issue(

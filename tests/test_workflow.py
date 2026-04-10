@@ -65,8 +65,8 @@ def test_log_track_event_serializes_enums_and_datetimes(factory):
         track,
         submitter,
         "issue_updated",
-        from_status=TrackStatus.PEER_REVIEW,
-        to_status=TrackStatus.PEER_REVISION,
+        from_status="peer_review",
+        to_status="peer_revision",
         payload={"status": IssueStatus.RESOLVED, "at": datetime(2024, 1, 1, tzinfo=timezone.utc)},
     )
 
