@@ -24,7 +24,7 @@ from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.notifications import notify
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WorkflowConfigSchema
-from app.security import get_current_user
+from app.security import get_current_user, require_producer
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
 from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed
@@ -101,7 +101,7 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
 def create_album(
     payload: AlbumCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_producer),
 ) -> AlbumRead:
     album_data = payload.model_dump()
     genres = album_data.pop("genres", None)

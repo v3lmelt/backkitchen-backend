@@ -24,7 +24,7 @@ from app.schemas.schemas import (
     JoinCircleRequest,
     UserRead,
 )
-from app.security import get_current_user
+from app.security import get_current_user, require_producer
 from app.services.upload import stream_upload
 
 router = APIRouter(prefix="/api/circles", tags=["circles"])
@@ -102,11 +102,8 @@ def list_circles(
 def create_circle(
     data: CircleCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_producer),
 ):
-    if current_user.role != "producer":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only producers can create circles")
-
     circle = Circle(
         name=data.name,
         description=data.description,

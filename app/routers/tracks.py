@@ -191,8 +191,6 @@ def _ensure_delivery_upload_permission(track: Track, album: Album, current_user:
         assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
         if assignee_id != current_user.id:
             raise HTTPException(status_code=403, detail="Only the assigned user can upload a master delivery.")
-        if step.assignee_role == "mastering_engineer" and album.mastering_engineer_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Only the album mastering engineer can upload this delivery.")
         return
 
     if album.mastering_engineer_id != current_user.id or track.status != TrackStatus.MASTERING:
@@ -208,8 +206,6 @@ def _ensure_delivery_confirm_permission(track: Track, album: Album, current_user
         assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
         if assignee_id != current_user.id:
             raise HTTPException(status_code=403, detail="Only the assigned user can confirm delivery.")
-        if step.assignee_role == "mastering_engineer" and album.mastering_engineer_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Only the album mastering engineer can confirm delivery.")
         return
 
     if album.mastering_engineer_id != current_user.id:
