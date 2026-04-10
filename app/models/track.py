@@ -10,12 +10,14 @@ ARCHIVE_RETENTION_DAYS = 14
 
 
 class TrackStatus(str, enum.Enum):
-    SUBMITTED = "submitted"
-    PEER_REVIEW = "peer_review"
-    PEER_REVISION = "peer_revision"
-    PRODUCER_MASTERING_GATE = "producer_mastering_gate"
-    MASTERING = "mastering"
-    MASTERING_REVISION = "mastering_revision"
+    """Terminal / special track statuses used by the runtime.
+
+    Active workflow step IDs (e.g. ``"intake"``, ``"peer_review"``,
+    ``"mastering"``) are plain strings stored in ``track.status`` and
+    are NOT part of this enum — they are defined in the album's
+    ``workflow_config``.
+    """
+
     FINAL_REVIEW = "final_review"
     COMPLETED = "completed"
     REJECTED = "rejected"
@@ -54,7 +56,7 @@ class Track(Base):
     status: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
-        default=TrackStatus.SUBMITTED.value,
+        default="intake",
     )
     rejection_mode: Mapped[RejectionMode | None] = mapped_column(
         Enum(RejectionMode, values_callable=lambda items: [item.value for item in items]),

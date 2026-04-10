@@ -31,6 +31,7 @@ from app.schemas.schemas import (
     ReopenRequestRead,
     RequestTrackUploadParams,
     RequestUploadParams,
+    SetPublicRequest,
     StageAssignmentRead,
     TrackDetailResponse,
     TrackListItem,
@@ -60,8 +61,8 @@ from app.workflow import (
     ensure_track_visibility,
     get_all_album_member_ids,
     get_album_member_ids,
-    is_album_completed,
     log_track_event,
+    should_anonymize_track,
 )
 
 router = APIRouter(prefix="/api/tracks", tags=["tracks"])
@@ -161,8 +162,8 @@ def _handle_delivery_status(
            background_tasks=background_tasks, album_id=track.album_id)
 
 
-def _track_list_item(track: Track, user: User, album: Album) -> TrackListItem:
-    return TrackListItem(**build_track_read(track, user, album).model_dump(), album_title=album.title)
+def _track_list_item(track: Track, user: User, album: Album, *, anonymize: bool = False) -> TrackListItem:
+    return TrackListItem(**build_track_read(track, user, album, anonymize=anonymize).model_dump(), album_title=album.title)
 
 
 def _ensure_revision_upload_permission(track: Track, album: Album, current_user: User) -> None:
@@ -697,26 +698,26 @@ def list_tracks(
         stmt = stmt.where(Track.album_id == album_id)
     tracks = list(db.scalars(stmt).all())
 
-    _completed_cache: dict[int, bool] = {}
-
     results: list[TrackListItem] = []
     for track in tracks:
         alb = albums_by_id.get(track.album_id)
         if alb is None:
             continue
+        is_privileged = current_user.id in (alb.producer_id, alb.mastering_engineer_id)
+        is_submitter = track.submitter_id == current_user.id
+        is_reviewer = track.peer_reviewer_id == current_user.id
         if track.album_id not in visible_album_ids:
-            if track.submitter_id != current_user.id and track.peer_reviewer_id != current_user.id:
+            # Not a member of this album: only own tracks are accessible
+            if not is_submitter and not is_reviewer:
                 continue
         else:
-            # Member-level visibility: privileged roles see all, others only own/reviewer
-            is_privileged = current_user.id in (alb.producer_id, alb.mastering_engineer_id)
-            is_own = track.submitter_id == current_user.id or track.peer_reviewer_id == current_user.id
-            if not is_privileged and not is_own:
-                if track.album_id not in _completed_cache:
-                    _completed_cache[track.album_id] = is_album_completed(db, track.album_id)
-                if not _completed_cache[track.album_id]:
+            # Album member: privileged roles and direct participants see all tracks;
+            # regular members only see completed or public tracks
+            if not is_privileged and not is_submitter and not is_reviewer:
+                if track.status != TrackStatus.COMPLETED and not track.is_public:
                     continue
-        results.append(_track_list_item(track, current_user, alb))
+        anonymize = should_anonymize_track(track, current_user, alb)
+        results.append(_track_list_item(track, current_user, alb, anonymize=anonymize))
     return results
 
 
@@ -730,6 +731,31 @@ def get_track(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     return build_track_detail(track, current_user, db)
+
+
+@router.patch("/{track_id}/visibility", response_model=TrackRead)
+def set_track_visibility(
+    track_id: int,
+    payload: SetPublicRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    """Toggle per-track public visibility. Only the album producer may call this."""
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = db.get(Album, track.album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    if album.producer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the album producer can change track visibility.",
+        )
+    track.is_public = payload.is_public
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.post("/{track_id}/workflow/transition", response_model=TrackRead)
@@ -816,6 +842,13 @@ def assign_reviewer(
     if created and not track.peer_reviewer_id:
         track.peer_reviewer_id = created[0].user_id
 
+    # Notify assigned reviewers
+    for sa in created:
+        notify(db, [sa.user_id], "reviewer_assigned", "你被指派为评审人",
+               f"你已被指派评审「{track.title}」",
+               related_track_id=track.id,
+               album_id=track.album_id)
+
     db.commit()
     for sa in created:
         db.refresh(sa)
@@ -897,6 +930,10 @@ def reassign_reviewer(
             status="pending",
             assigned_at=datetime.now(timezone.utc),
         ))
+        notify(db, [payload.user_id], "reviewer_assigned", "你被指派为评审人",
+               f"你已被指派评审「{track.title}」",
+               related_track_id=track.id,
+               album_id=track.album_id)
     else:
         assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
 

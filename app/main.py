@@ -296,7 +296,7 @@ def _seed_demo_data() -> None:
             artist="Nova",
             album_id=album.id,
             submitter_id=submitter.id,
-            status=TrackStatus.SUBMITTED,
+            status="intake",
             version=1,
             workflow_cycle=1,
             created_at=now,
@@ -304,7 +304,7 @@ def _seed_demo_data() -> None:
         )
         db.add(track)
         db.flush()
-        log_track_event(db, track, submitter, "track_submitted", to_status=TrackStatus.SUBMITTED)
+        log_track_event(db, track, submitter, "track_submitted", to_status="intake")
 
         db.commit()
     except Exception:

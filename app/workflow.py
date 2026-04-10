@@ -103,6 +103,19 @@ def is_album_completed(db: Session, album_id: int) -> bool:
     return total > 0 and total == completed
 
 
+def should_anonymize_track(track: Track, user: User, album: Album) -> bool:
+    """Return True if the user should see an anonymized view of this track.
+
+    Full info is shown to: the album producer, the mastering engineer, and the
+    track's own submitter.  Everyone else sees artist/submitter redacted.
+    """
+    if user.id in (album.producer_id, album.mastering_engineer_id):
+        return False
+    if user.id == track.submitter_id:
+        return False
+    return True
+
+
 def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
     album = db.get(Album, track.album_id)
     if album is None:
@@ -129,8 +142,8 @@ def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have access to this album.",
         )
-    # Regular members can see all tracks only after album is completed
-    if not is_album_completed(db, album.id):
+    # Regular members can only see tracks that are completed or marked public
+    if track.status != TrackStatus.COMPLETED and not track.is_public:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have access to this track.",
@@ -182,7 +195,7 @@ def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead
     return MasterDeliveryRead.model_validate(delivery)
 
 
-def build_track_read(track: Track, user: User, album: Album, db: Session | None = None) -> TrackRead:
+def build_track_read(track: Track, user: User, album: Album, db: Session | None = None, *, anonymize: bool = False) -> TrackRead:
     from app.workflow_engine import (
         get_allowed_transitions,
         get_current_step,
@@ -225,7 +238,7 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
     return TrackRead(
         id=track.id,
         title=track.title,
-        artist=track.artist,
+        artist=None if anonymize else track.artist,
         album_id=track.album_id,
         bpm=track.bpm,
         track_number=track.track_number,
@@ -236,21 +249,22 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
         workflow_variant=track.workflow_variant or "standard",
         version=track.version,
         workflow_cycle=track.workflow_cycle,
-        submitter_id=track.submitter_id,
-        peer_reviewer_id=track.peer_reviewer_id,
+        submitter_id=None if anonymize else track.submitter_id,
+        peer_reviewer_id=None if anonymize else track.peer_reviewer_id,
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
         created_at=track.created_at,
         updated_at=track.updated_at,
         issue_count=len(track.issues),
         open_issue_count=open_issue_count,
-        submitter=_user_read(track.submitter),
-        peer_reviewer=_user_read(track.peer_reviewer),
+        submitter=None if anonymize else _user_read(track.submitter),
+        peer_reviewer=None if anonymize else _user_read(track.peer_reviewer),
         current_source_version=_source_version_read(current_source),
         current_master_delivery=_master_delivery_read(current_master),
         allowed_actions=track_allowed_actions(track, user, album, _wf_config=wf_config, db=db),
         workflow_step=workflow_step,
         workflow_transitions=workflow_transitions,
+        is_public=track.is_public,
     )
 
 
@@ -454,8 +468,9 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             album.id,
         )
 
+    anonymize = should_anonymize_track(track, user, album)
     return TrackDetailResponse(
-        track=build_track_read(track, user, album),
+        track=build_track_read(track, user, album, anonymize=anonymize),
         issues=issues,
         checklist_items=checklist_items,
         events=events,
