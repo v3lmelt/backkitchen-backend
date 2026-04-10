@@ -1106,6 +1106,7 @@ def upload_source_version(
     file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_v{track.version + 1}")
     track.version += 1
     track.file_path = file_path
+    track.storage_backend = "local"
     track.duration = duration
     track.status = next_status
     source_version = _source_version_create(track, current_user, file_path, duration)
