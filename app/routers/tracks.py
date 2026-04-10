@@ -150,6 +150,12 @@ def _handle_delivery_status(
             from_status=previous_status, to_status=track.status,
             payload={"delivery_number": delivery_number, "awaiting_confirmation": True},
         )
+        # Notify mastering engineer that delivery needs confirmation
+        notify(db, [album.mastering_engineer_id], "delivery_awaiting_confirmation",
+               "主控文件待确认",
+               f"「{track.title}」的主控文件已上传，请确认后继续流程",
+               related_track_id=track.id,
+               background_tasks=background_tasks, album_id=track.album_id)
         return
     track.status = next_status
     log_track_event(

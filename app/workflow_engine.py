@@ -302,6 +302,17 @@ def assign_reviewers(
                 status="pending",
                 assigned_at=now,
             ))
+        # Notify assigned reviewers
+        step_label = _step_label_zh(step)
+        notify(
+            db, selected,
+            "reviewer_assigned",
+            "你被指派为评审人",
+            f"你已被自动分配评审「{track.title}」（{step_label}）",
+            related_track_id=track.id,
+            background_tasks=background_tasks,
+            album_id=track.album_id,
+        )
         return selected
 
     # Manual mode — no auto-assignment
@@ -348,11 +359,27 @@ def assign_peer_reviewer_for_step(
     # Step-level assignee_user_id override takes precedence over all other modes.
     if step.assignee_user_id:
         track.peer_reviewer_id = step.assignee_user_id
+        notify(
+            db, [step.assignee_user_id],
+            "reviewer_assigned", "你被指派为评审人",
+            f"你已被指派评审「{track.title}」",
+            related_track_id=track.id,
+            background_tasks=background_tasks,
+            album_id=track.album_id,
+        )
         return
 
     if step.assignee_role == "peer_reviewer" and step.assignment_mode != "auto":
         if track.peer_reviewer_id is None:
-            _assign_random_peer_reviewer(db, album, track)
+            assigned_id = _assign_random_peer_reviewer(db, album, track)
+            notify(
+                db, [assigned_id],
+                "reviewer_assigned", "你被指派为评审人",
+                f"你已被指派评审「{track.title}」",
+                related_track_id=track.id,
+                background_tasks=background_tasks,
+                album_id=track.album_id,
+            )
         return
 
     assigned = assign_reviewers(db, album, track, step, background_tasks)
