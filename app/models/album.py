@@ -67,6 +67,9 @@ class Album(Base):
     workflow_template: Mapped["WorkflowTemplate | None"] = relationship(  # noqa: F821
         "WorkflowTemplate", foreign_keys=[workflow_template_id]
     )
+    webhook_deliveries: Mapped[list["WebhookDelivery"]] = relationship(  # noqa: F821
+        "WebhookDelivery", back_populates="album", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<Album(id={self.id}, title='{self.title}')>"

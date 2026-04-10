@@ -17,6 +17,7 @@ from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
+from app.models.webhook_delivery import WebhookDelivery
 from app.models.workflow_event import WorkflowEvent
 from app.models.workflow_template import WorkflowTemplate
 
@@ -50,6 +51,7 @@ __all__ = [
     "TrackStatus",
     "TrackSourceVersion",
     "User",
+    "WebhookDelivery",
     "WorkflowEvent",
     "WorkflowTemplate",
 ]

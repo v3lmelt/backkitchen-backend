@@ -288,6 +288,8 @@ class TrackOrderUpdate(BaseModel):
 
 
 class TrackRead(TrackBase):
+    # artist overrides TrackBase — None when the track is shown anonymised to the viewer
+    artist: str | None = None
     id: int
     track_number: int | None = None
     file_path: str | None = None
@@ -301,6 +303,7 @@ class TrackRead(TrackBase):
     peer_reviewer_id: int | None = None
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
+    is_public: bool = False
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None = None
@@ -319,6 +322,10 @@ class TrackRead(TrackBase):
 
 class TrackListItem(TrackRead):
     album_title: str = ""
+
+
+class SetPublicRequest(BaseModel):
+    is_public: bool
 
 
 class IssueMarkerCreate(BaseModel):
@@ -518,6 +525,18 @@ class WebhookConfig(BaseModel):
     url: str = ""
     enabled: bool = False
     events: list[str] = []
+
+
+class WebhookDeliveryRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    event_type: str
+    success: bool
+    status_code: int | None
+    target_url: str
+    error_detail: str | None
+    created_at: datetime
 
 
 class IssueBatchUpdate(BaseModel):

@@ -23,7 +23,7 @@ from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.notifications import notify
-from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WorkflowConfigSchema
+from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema
 from app.security import get_current_user, require_producer
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
@@ -502,8 +502,26 @@ async def test_webhook(
     if not config.get("url"):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No webhook URL configured.")
     payload = build_webhook_payload("test", "Webhook Test", f"Test from album: {album.title}", album_id=album.id)
-    success = await post_webhook(config["url"], payload)
+    success = await post_webhook(config["url"], payload, db=db, album_id=album.id, event_type="test")
     return {"success": success}
+
+
+@router.get("/{album_id}/webhook/deliveries", response_model=list[WebhookDeliveryRead])
+def get_webhook_deliveries(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[WebhookDeliveryRead]:
+    album = ensure_album_producer(album_id, current_user, db)
+    from app.models.webhook_delivery import WebhookDelivery
+    records = (
+        db.query(WebhookDelivery)
+        .filter(WebhookDelivery.album_id == album_id)
+        .order_by(WebhookDelivery.id.desc())
+        .limit(50)
+        .all()
+    )
+    return [WebhookDeliveryRead.model_validate(r) for r in records]
 
 
 @router.get("/{album_id}/workflow", response_model=WorkflowConfigSchema)
