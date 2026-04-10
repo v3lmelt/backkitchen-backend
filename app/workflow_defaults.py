@@ -127,12 +127,12 @@ DEFAULT_WORKFLOW_CONFIG: dict = {
             "type": "approval",
             "ui_variant": "final_review",
             "assignee_role": "producer",
+            "actor_roles": ["submitter"],
             "order": 7,
             "transitions": {
-                "reject": "mastering_revision",
                 "reject_to_mastering": "mastering",
             },
-            "allow_permanent_reject": True,
+            "allow_permanent_reject": False,
         },
     ],
 }

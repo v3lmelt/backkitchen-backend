@@ -62,6 +62,8 @@ class StepDef:
     assignee_user_id: int | None = None
     # Delivery-specific
     require_confirmation: bool = False
+    # Additional roles that may act on this step (beyond assignee_role)
+    actor_roles: list[str] | None = None
 
 
 @dataclass
@@ -119,6 +121,7 @@ def get_steps(config: dict) -> list[StepDef]:
             required_reviewer_count=s.get("required_reviewer_count", 1),
             assignee_user_id=s.get("assignee_user_id"),
             require_confirmation=s.get("require_confirmation", False),
+            actor_roles=s.get("actor_roles"),
         )
         for s in config["steps"]
     ]
@@ -202,11 +205,21 @@ def user_matches_role(user: User, album: Album, track: Track, step: StepDef) -> 
     For steps with ``assignee_user_id`` override, use that directly.
     For review steps, check ``StageAssignment`` (handled at call site).
     Otherwise, fall back to role-based matching.
+    Also checks ``actor_roles`` for steps that allow multiple roles to act
+    (e.g. final_review where both producer and submitter can reject).
     """
     if step.assignee_user_id:
-        return user.id == step.assignee_user_id
+        if user.id == step.assignee_user_id:
+            return True
     assignee_id = resolve_assignee(album, track, step.assignee_role)
-    return assignee_id is not None and user.id == assignee_id
+    if assignee_id is not None and user.id == assignee_id:
+        return True
+    if step.actor_roles:
+        for role in step.actor_roles:
+            role_id = resolve_assignee(album, track, role)
+            if role_id is not None and user.id == role_id:
+                return True
+    return False
 
 
 def user_matches_role_or_assignment(

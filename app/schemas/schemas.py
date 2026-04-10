@@ -587,6 +587,8 @@ class WorkflowStepDefSchema(BaseModel):
     assignee_user_id: int | None = None
     # Delivery-specific
     require_confirmation: bool | None = None
+    # Additional roles that may act on this step
+    actor_roles: list[str] | None = None
 
     @model_validator(mode="after")
     def normalize_gate_to_approval(self) -> "WorkflowStepDefSchema":

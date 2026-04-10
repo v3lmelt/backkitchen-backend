@@ -228,6 +228,7 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
             required_reviewer_count=step.required_reviewer_count,
             assignee_user_id=step.assignee_user_id,
             require_confirmation=step.require_confirmation,
+            actor_roles=step.actor_roles,
         )
     transitions = get_allowed_transitions(wf_config, track, user, album, db=db)
     if transitions:
