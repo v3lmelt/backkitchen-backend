@@ -228,7 +228,11 @@ def _validate_status_transition(
     # Reviewer actions
     if is_reviewer and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
         return
-    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status in (IssueStatus.OPEN, IssueStatus.RESOLVED):
+    # Only the issue creator can publish an internal issue (pending_discussion → open)
+    is_creator = user.id == issue.author_id
+    if is_creator and old == IssueStatus.PENDING_DISCUSSION and new_status in (IssueStatus.OPEN, IssueStatus.RESOLVED):
+        return
+    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.RESOLVED:
         return
     if is_reviewer and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
         return
@@ -260,6 +264,7 @@ async def create_issue(
     issue_phase: str
     severity_enum: _IssueSeverity
     parsed_markers: list[IssueMarkerCreate]
+    issue_visibility: str = "public"
     audios: list[StarletteUploadFile] = []
     audio_object_keys: str | None = None
     audio_original_filenames: str | None = None
@@ -284,12 +289,14 @@ async def create_issue(
         issue_phase = payload.phase
         severity_enum = payload.severity
         parsed_markers = payload.markers
+        issue_visibility = payload.visibility
     else:
         form = await request.form()
         title = str(form.get("title") or "").strip()
         description = str(form.get("description") or "").strip()
         phase = str(form.get("phase") or "").strip()
         severity = str(form.get("severity") or "major").strip() or "major"
+        visibility = str(form.get("visibility") or "public").strip() or "public"
         markers_json = str(form.get("markers_json") or "[]")
 
         if not title or not description or not phase:
@@ -300,6 +307,7 @@ async def create_issue(
         issue_title = title
         issue_description = description
         issue_phase = phase
+        issue_visibility = visibility
 
         audios = [item for item in form.getlist("audios") if isinstance(item, StarletteUploadFile)]
         raw_audio_keys = form.get("audio_object_keys")
@@ -334,16 +342,7 @@ async def create_issue(
     effective_phase = _ensure_custom_issue_permission(
         track, album, current_user, issue_phase, db,
     )
-    config = parse_workflow_config(album)
-    current_step = get_current_step(config, track)
-    initial_status = IssueStatus.OPEN
-    if (
-        current_step
-        and current_step.type == "review"
-        and infer_issue_phase_for_step(current_step) == effective_phase
-        and (current_step.required_reviewer_count or 1) > 1
-    ):
-        initial_status = IssueStatus.PENDING_DISCUSSION
+    initial_status = IssueStatus.PENDING_DISCUSSION if issue_visibility == "internal" else IssueStatus.OPEN
 
     for m in parsed_markers:
         if m.marker_type == MarkerType.RANGE and m.time_end is None:

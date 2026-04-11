@@ -707,6 +707,18 @@ def execute_transition(
                 )
                 .values(status="cancelled")
             )
+            # Discard internal issues on reject too
+            from app.models.issue import Issue, IssueStatus as _IssueStatus
+
+            reject_pending = list(db.scalars(
+                select(Issue).where(
+                    Issue.track_id == track.id,
+                    Issue.workflow_cycle == track.workflow_cycle,
+                    Issue.status == _IssueStatus.PENDING_DISCUSSION,
+                )
+            ).all())
+            for pi in reject_pending:
+                db.delete(pi)
 
     if step.type == "review" and pending_assignment is not None:
         db.flush()
@@ -744,6 +756,19 @@ def execute_transition(
             )
             .values(status="cancelled")
         )
+
+        # Discard internal issues (pending_discussion) that were never published
+        from app.models.issue import Issue, IssueStatus as _IssueStatus
+
+        pending_issues = list(db.scalars(
+            select(Issue).where(
+                Issue.track_id == track.id,
+                Issue.workflow_cycle == track.workflow_cycle,
+                Issue.status == _IssueStatus.PENDING_DISCUSSION,
+            )
+        ).all())
+        for pi in pending_issues:
+            db.delete(pi)
 
     # Producer-direct intake: skip peer review, mark variant accordingly
     if decision == "accept_producer_direct":
