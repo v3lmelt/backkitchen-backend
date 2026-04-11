@@ -377,6 +377,8 @@ def build_comment_read(comment: Comment, db: Session, users_cache: dict[int, Use
         author_id=comment.author_id,
         content=comment.content,
         is_status_note=comment.is_status_note,
+        old_status=comment.old_status,
+        new_status=comment.new_status,
         created_at=comment.created_at,
         author=_user_read(author),
         images=images,
