@@ -737,6 +737,7 @@ class StageAssignmentRead(BaseModel):
     stage_id: str
     user_id: int
     status: str
+    decision: str | None = None
     assigned_at: datetime
     completed_at: datetime | None = None
     user: UserRead | None = None
@@ -749,6 +750,7 @@ class AssignReviewerRequest(BaseModel):
 
 
 class ReassignReviewerRequest(BaseModel):
+    user_ids: list[int] | None = None
     user_id: int | None = None
 
 
