@@ -24,7 +24,7 @@ from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
 from app.schemas.schemas import (
-    CommentRead, CommentUpdate, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead, IssueUpdate,
+    CommentRead, CommentUpdate, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead,
     PresignedCommentAudioResponse, PresignedUploadResponse, RequestCommentAudioUploadParams,
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
@@ -520,14 +520,20 @@ def get_issue(
     return build_issue_detail(issue, db)
 
 
-@router.patch("/api/issues/{issue_id}", response_model=IssueRead)
-def update_issue(
+@router.patch("/api/issues/{issue_id}", response_model=IssueDetail)
+async def update_issue(
     issue_id: int,
-    payload: IssueUpdate,
     background_tasks: BackgroundTasks,
+    status_field: Optional[str] = Form(default=None, alias="status"),
+    title: Optional[str] = Form(default=None),
+    description: Optional[str] = Form(default=None),
+    severity: Optional[str] = Form(default=None),
+    status_note: Optional[str] = Form(default=None),
+    images: list[UploadFile] = File(default=[]),
+    audios: list[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> IssueRead:
+) -> IssueDetail:
     issue = db.get(Issue, issue_id)
     if issue is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
@@ -539,17 +545,105 @@ def update_issue(
     _ensure_issue_visible_to_user(issue, track, current_user)
     _ensure_issue_update_permission(issue, track, album, current_user, db)
 
-    if payload.status is not None:
-        _validate_status_transition(issue, payload.status, track, album, current_user, db)
+    # Filter out sentinel empty UploadFile entries (no real file selected)
+    images = [f for f in images if f.filename]
+    audios = [f for f in audios if f.filename]
+
+    # Validate uploaded files
+    for img_file in images:
+        if img_file.content_type not in ALLOWED_IMAGE_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported image type: {img_file.content_type}.",
+            )
+    if len(audios) > MAX_AUDIOS_PER_COMMENT:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"A status note may contain at most {MAX_AUDIOS_PER_COMMENT} audio files.",
+        )
+    for audio_file in audios:
+        if audio_file.content_type not in ALLOWED_AUDIO_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported audio type: {audio_file.content_type}.",
+            )
+
+    # Parse and validate enum fields
+    new_status_enum: Optional[IssueStatus] = None
+    if status_field:
+        try:
+            new_status_enum = IssueStatus(status_field)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid status: {status_field}")
+        _validate_status_transition(issue, new_status_enum, track, album, current_user, db)
+
+    new_severity_enum = None
+    if severity:
+        try:
+            from app.models.issue import IssueSeverity
+            new_severity_enum = IssueSeverity(severity)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid severity: {severity}")
 
     old_status = issue.status
-    update_data = payload.model_dump(exclude_unset=True, exclude={"status_note"})
-    for field, value in update_data.items():
-        setattr(issue, field, value)
+    update_data: dict = {}
+    if new_status_enum is not None:
+        issue.status = new_status_enum
+        update_data["status"] = new_status_enum
+    if title is not None:
+        issue.title = title
+        update_data["title"] = title
+    if description is not None:
+        issue.description = description
+        update_data["description"] = description
+    if new_severity_enum is not None:
+        issue.severity = new_severity_enum
+        update_data["severity"] = new_severity_enum
 
     new_status = issue.status
-    if payload.status_note and old_status != new_status:
-        db.add(Comment(issue_id=issue.id, author_id=current_user.id, content=payload.status_note, is_status_note=True, old_status=old_status.value, new_status=new_status.value))
+    effective_note = (status_note or "").strip()
+    if (effective_note or images or audios) and old_status != new_status:
+        comment = Comment(
+            issue_id=issue.id,
+            author_id=current_user.id,
+            content=effective_note,
+            is_status_note=True,
+            old_status=old_status.value,
+            new_status=new_status.value,
+        )
+        db.add(comment)
+        db.flush()
+
+        if images:
+            from app.config import MAX_IMAGE_UPLOAD_SIZE
+            comment_images_dir = settings.get_upload_path() / "comment_images"
+            comment_images_dir.mkdir(parents=True, exist_ok=True)
+            for img_file in images:
+                ext = IMAGE_EXT_MAP.get(img_file.content_type or "", ".jpg")
+                filename = f"{uuid.uuid4()}{ext}"
+                file_path = f"comment_images/{filename}"
+                dest = comment_images_dir / filename
+                await stream_upload(img_file, dest, MAX_IMAGE_UPLOAD_SIZE)
+                db.add(CommentImage(comment_id=comment.id, file_path=file_path))
+
+        if audios:
+            from app.config import MAX_AUDIO_UPLOAD_SIZE
+            comment_audios_dir = settings.get_upload_path() / "comment_audios"
+            comment_audios_dir.mkdir(parents=True, exist_ok=True)
+            for audio_file in audios:
+                ext = AUDIO_EXT_MAP.get(audio_file.content_type or "", ".mp3")
+                filename = f"{uuid.uuid4()}{ext}"
+                file_path = f"comment_audios/{filename}"
+                dest = comment_audios_dir / filename
+                await stream_upload(audio_file, dest, MAX_AUDIO_UPLOAD_SIZE)
+                duration = extract_audio_metadata(dest).duration
+                original_filename = audio_file.filename or filename
+                db.add(CommentAudio(
+                    comment_id=comment.id,
+                    file_path=file_path,
+                    original_filename=original_filename,
+                    duration=duration,
+                ))
 
     if old_status != new_status and current_user.id != issue.author_id:
         track = db.get(Track, issue.track_id)
@@ -584,7 +678,7 @@ def update_issue(
     )
     db.commit()
     db.refresh(issue)
-    return build_issue_read(issue, db)
+    return build_issue_detail(issue, db)
 
 
 @router.post(
