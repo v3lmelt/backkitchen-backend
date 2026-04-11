@@ -283,18 +283,12 @@ def _serve_audio(
     so that browsers always revalidate after a new file is uploaded.
     """
     if storage_backend == "r2":
-        from app.services.r2 import generate_download_url
+        from app.services.r2 import public_url
 
-        url = generate_download_url(file_path)
+        url = public_url(file_path)
         if resolve == "json":
-            resp = JSONResponse({"url": url})
-            resp.headers["Cache-Control"] = (
-                f"private, max-age={_AUDIO_CACHE_MAX_AGE}"
-                if immutable
-                else "private, max-age=0, must-revalidate"
-            )
-            return resp
-        return RedirectResponse(url, status_code=307)
+            return JSONResponse({"url": url})
+        return RedirectResponse(url, status_code=302)
     if resolve == "json":
         return {"url": None}
     return _serve_path(file_path, filename_prefix, immutable=immutable)

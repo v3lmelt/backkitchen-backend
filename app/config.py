@@ -35,8 +35,8 @@ class Settings(BaseSettings):
     R2_ACCESS_KEY_ID: str = ""
     R2_SECRET_ACCESS_KEY: str = ""
     R2_BUCKET_NAME: str = ""
+    R2_PUBLIC_URL: str = ""  # e.g. https://data.back-kitchen.net
     R2_PRESIGNED_UPLOAD_EXPIRY: int = 3600    # seconds
-    R2_PRESIGNED_DOWNLOAD_EXPIRY: int = 3600  # seconds
 
     # Auto-cleanup: days to keep old source versions after track completion
     OLD_VERSION_RETENTION_DAYS: int = 7

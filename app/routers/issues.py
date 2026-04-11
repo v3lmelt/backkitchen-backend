@@ -2,10 +2,13 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, RedirectResponse
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.config import settings
 from app.database import get_db
@@ -193,47 +196,93 @@ def _validate_status_transition(issue: Issue, new_status: IssueStatus, track: Tr
 async def create_issue(
     track_id: int,
     background_tasks: BackgroundTasks,
-    title: str = Form(...),
-    description: str = Form(...),
-    severity: str = Form(default="major"),
-    phase: str = Form(...),
-    markers_json: str = Form(default="[]"),
-    master_delivery_id: Optional[int] = Form(default=None),
-    audios: list[UploadFile] = File(default=[]),
-    audio_object_keys: Optional[str] = Form(default=None),
-    audio_original_filenames: Optional[str] = Form(default=None),
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> IssueRead:
     import json as _json
 
-    # Parse markers from JSON string
-    try:
-        markers_raw = _json.loads(markers_json)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid markers JSON.")
-
     from app.schemas.schemas import IssueMarkerCreate
     from app.models.issue import IssueSeverity as _IssueSeverity
 
-    parsed_markers: list[IssueMarkerCreate] = []
-    for m in markers_raw:
-        try:
-            parsed_markers.append(IssueMarkerCreate(**m))
-        except Exception:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid marker data.")
+    issue_title: str
+    issue_description: str
+    issue_phase: str
+    severity_enum: _IssueSeverity
+    parsed_markers: list[IssueMarkerCreate]
+    audios: list[StarletteUploadFile] = []
+    audio_object_keys: str | None = None
+    audio_original_filenames: str | None = None
 
-    try:
-        severity_enum = _IssueSeverity(severity)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid severity: {severity}")
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("application/json"):
+        try:
+            payload = IssueCreate.model_validate(await request.json())
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=jsonable_encoder(exc.errors()),
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid request body.",
+            )
+
+        issue_title = payload.title
+        issue_description = payload.description
+        issue_phase = payload.phase
+        severity_enum = payload.severity
+        parsed_markers = payload.markers
+    else:
+        form = await request.form()
+        title = str(form.get("title") or "").strip()
+        description = str(form.get("description") or "").strip()
+        phase = str(form.get("phase") or "").strip()
+        severity = str(form.get("severity") or "major").strip() or "major"
+        markers_json = str(form.get("markers_json") or "[]")
+
+        if not title or not description or not phase:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="title, description and phase are required.",
+            )
+        issue_title = title
+        issue_description = description
+        issue_phase = phase
+
+        audios = [item for item in form.getlist("audios") if isinstance(item, StarletteUploadFile)]
+        raw_audio_keys = form.get("audio_object_keys")
+        raw_audio_names = form.get("audio_original_filenames")
+        audio_object_keys = str(raw_audio_keys) if raw_audio_keys is not None else None
+        audio_original_filenames = str(raw_audio_names) if raw_audio_names is not None else None
+
+        try:
+            markers_raw = _json.loads(markers_json)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid markers JSON.")
+
+        if not isinstance(markers_raw, list):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="markers must be a JSON array.")
+
+        parsed_markers = []
+        for m in markers_raw:
+            try:
+                parsed_markers.append(IssueMarkerCreate(**m))
+            except Exception:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid marker data.")
+
+        try:
+            severity_enum = _IssueSeverity(severity)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid severity: {severity}")
 
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
     effective_phase = _ensure_custom_issue_permission(
-        track, album, current_user, phase, db,
+        track, album, current_user, issue_phase, db,
     )
 
     for m in parsed_markers:
@@ -290,8 +339,8 @@ async def create_issue(
         workflow_cycle=track.workflow_cycle,
         source_version_id=source_version_id,
         master_delivery_id=_master_delivery_id,
-        title=title,
-        description=description,
+        title=issue_title,
+        description=issue_description,
         severity=severity_enum,
         markers=[
             IssueMarker(
@@ -353,7 +402,7 @@ async def create_issue(
         track,
         current_user,
         "issue_created",
-        payload={"phase": effective_phase, "title": title, "issue_id": issue.id},
+        payload={"phase": effective_phase, "title": issue_title, "issue_id": issue.id},
     )
     if current_user.id != track.submitter_id:
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
@@ -709,12 +758,12 @@ def serve_issue_audio(
     ensure_track_visibility(track, user, db)
 
     if audio.storage_backend == "r2":
-        from app.services.r2 import generate_download_url
+        from app.services.r2 import public_url
 
-        url = generate_download_url(audio.file_path)
+        url = public_url(audio.file_path)
         if resolve == "json":
             return {"url": url}
-        return RedirectResponse(url, status_code=307)
+        return RedirectResponse(url, status_code=302)
 
     if resolve == "json":
         return {"url": None}
@@ -757,12 +806,12 @@ def serve_comment_audio(
     ensure_track_visibility(track, user, db)
 
     if audio.storage_backend == "r2":
-        from app.services.r2 import generate_download_url
+        from app.services.r2 import public_url
 
-        url = generate_download_url(audio.file_path)
+        url = public_url(audio.file_path)
         if resolve == "json":
             return {"url": url}
-        return RedirectResponse(url, status_code=307)
+        return RedirectResponse(url, status_code=302)
 
     if resolve == "json":
         return {"url": None}

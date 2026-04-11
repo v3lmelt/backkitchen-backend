@@ -43,6 +43,19 @@ from app.schemas.schemas import (
 )
 
 
+def _audio_url(audio) -> str:
+    """Return the public URL for an audio attachment.
+
+    For R2-stored files, returns the public CDN URL directly.
+    For local files, returns the ``/uploads/`` path.
+    """
+    if audio.storage_backend == "r2":
+        from app.services.r2 import public_url
+
+        return public_url(audio.file_path)
+    return f"/uploads/{audio.file_path}"
+
+
 def get_album_member_ids(db: Session, album_id: int) -> set[int]:
     rows = db.scalars(select(AlbumMember).where(AlbumMember.album_id == album_id)).all()
     return {row.user_id for row in rows}
@@ -293,11 +306,7 @@ def build_issue_read(
         IssueAudioRead(
             id=audio.id,
             issue_id=audio.issue_id,
-            audio_url=(
-                f"/api/issue-audios/{audio.id}/file"
-                if audio.storage_backend == "r2"
-                else f"/uploads/{audio.file_path}"
-            ),
+            audio_url=_audio_url(audio),
             original_filename=audio.original_filename,
             duration=audio.duration,
             created_at=audio.created_at,
@@ -344,11 +353,7 @@ def build_comment_read(comment: Comment, db: Session, users_cache: dict[int, Use
         CommentAudioRead(
             id=audio.id,
             comment_id=audio.comment_id,
-            audio_url=(
-                f"/api/comment-audios/{audio.id}/file"
-                if audio.storage_backend == "r2"
-                else f"/uploads/{audio.file_path}"
-            ),
+            audio_url=_audio_url(audio),
             original_filename=audio.original_filename,
             duration=audio.duration,
             created_at=audio.created_at,
