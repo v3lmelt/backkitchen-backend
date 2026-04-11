@@ -53,8 +53,15 @@ def collect_track_files(track: Track) -> tuple[list[Path], list[str]]:
     for md in track.master_deliveries:
         _add(md.file_path, md.storage_backend)
 
-    # Issue comment images (always local) and audios (local or r2)
+    # Issue audios plus comment images/audios.
     for issue in track.issues:
+        for audio in issue.audios:
+            if not audio.file_path:
+                continue
+            if audio.storage_backend == "r2":
+                r2_keys.append(audio.file_path)
+            else:
+                local_paths.append(upload_base / audio.file_path)
         for comment in issue.comments:
             for img in comment.images:
                 if img.file_path:

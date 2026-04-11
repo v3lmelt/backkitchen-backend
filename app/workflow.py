@@ -30,6 +30,7 @@ from app.schemas.schemas import (
     CommentRead,
     DiscussionImageRead,
     DiscussionRead,
+    IssueAudioRead,
     IssueDetail,
     IssueMarkerRead,
     IssueRead,
@@ -288,6 +289,21 @@ def build_issue_read(
             source_version = db.get(TrackSourceVersion, issue.source_version_id)
             source_version_number = source_version.version_number if source_version else None
     markers = [IssueMarkerRead.model_validate(m) for m in issue.markers]
+    audios = [
+        IssueAudioRead(
+            id=audio.id,
+            issue_id=audio.issue_id,
+            audio_url=(
+                f"/api/issue-audios/{audio.id}/file"
+                if audio.storage_backend == "r2"
+                else f"/uploads/{audio.file_path}"
+            ),
+            original_filename=audio.original_filename,
+            duration=audio.duration,
+            created_at=audio.created_at,
+        )
+        for audio in issue.audios
+    ]
     return IssueRead(
         id=issue.id,
         track_id=issue.track_id,
@@ -302,6 +318,7 @@ def build_issue_read(
         severity=issue.severity,
         status=issue.status,
         markers=markers,
+        audios=audios,
         created_at=issue.created_at,
         updated_at=issue.updated_at,
         comment_count=len(issue.comments),
@@ -392,6 +409,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         .where(Track.id == track.id)
         .options(
             selectinload(Track.issues).selectinload(Issue.markers),
+            selectinload(Track.issues).selectinload(Issue.audios),
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.images),
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.audios),
             selectinload(Track.workflow_events),

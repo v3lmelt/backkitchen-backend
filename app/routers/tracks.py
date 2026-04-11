@@ -17,11 +17,14 @@ from app.models.master_delivery import MasterDelivery
 from app.models.reopen_request import ReopenRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus, WorkflowVariant
+from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.schemas.schemas import (
     AssignReviewerRequest,
     ReassignReviewerRequest,
+    TrackPlaybackPreferenceRead,
+    TrackPlaybackPreferenceUpdate,
     ConfirmTrackUploadParams,
     ConfirmUploadParams,
     DirectReopenRequest,
@@ -78,6 +81,12 @@ def _broadcast_track_updated(background_tasks: BackgroundTasks, track_id: int) -
 
 # Used only for truly immutable URLs (source-version snapshots addressed by numeric ID).
 _AUDIO_CACHE_MAX_AGE = 86400
+
+
+def _validate_playback_scope(scope: str) -> str:
+    if scope not in {"source", "master"}:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Playback preference scope not found.")
+    return scope
 
 
 
@@ -747,6 +756,76 @@ def get_track(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     return build_track_detail(track, current_user, db)
+
+
+@router.get("/{track_id}/playback-preferences/{scope}", response_model=TrackPlaybackPreferenceRead)
+def get_track_playback_preference(
+    track_id: int,
+    scope: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackPlaybackPreferenceRead:
+    scope = _validate_playback_scope(scope)
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+
+    preference = db.scalar(
+        select(TrackPlaybackPreference).where(
+            TrackPlaybackPreference.track_id == track_id,
+            TrackPlaybackPreference.user_id == current_user.id,
+            TrackPlaybackPreference.scope == scope,
+        )
+    )
+    if preference is None:
+        return TrackPlaybackPreferenceRead(
+            track_id=track_id,
+            user_id=current_user.id,
+            scope=scope,
+            gain_db=0.0,
+            updated_at=None,
+        )
+    return TrackPlaybackPreferenceRead.model_validate(preference)
+
+
+@router.put("/{track_id}/playback-preferences/{scope}", response_model=TrackPlaybackPreferenceRead)
+def upsert_track_playback_preference(
+    track_id: int,
+    scope: str,
+    payload: TrackPlaybackPreferenceUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackPlaybackPreferenceRead:
+    scope = _validate_playback_scope(scope)
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+
+    preference = db.scalar(
+        select(TrackPlaybackPreference).where(
+            TrackPlaybackPreference.track_id == track_id,
+            TrackPlaybackPreference.user_id == current_user.id,
+            TrackPlaybackPreference.scope == scope,
+        )
+    )
+    if preference is None:
+        preference = TrackPlaybackPreference(
+            track_id=track_id,
+            user_id=current_user.id,
+            scope=scope,
+            gain_db=payload.gain_db,
+        )
+        db.add(preference)
+    else:
+        preference.gain_db = payload.gain_db
+
+    db.commit()
+    db.refresh(preference)
+    return TrackPlaybackPreferenceRead.model_validate(preference)
 
 
 @router.patch("/{track_id}/visibility", response_model=TrackRead)

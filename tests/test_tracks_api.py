@@ -6,6 +6,7 @@ from sqlalchemy import select
 from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
+from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.workflow_event import WorkflowEvent
 
@@ -134,6 +135,117 @@ def test_upload_master_delivery_increments_delivery_number(client, db_session, f
         select(MasterDelivery).where(MasterDelivery.track_id == track.id)
     ).all()
     assert sorted(delivery.delivery_number for delivery in deliveries) == [1, 2]
+
+
+def test_track_playback_preference_defaults_to_zero_gain(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    response = client.get(
+        f"/api/tracks/{track.id}/playback-preferences/source",
+        headers=auth_headers(mastering),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "track_id": track.id,
+        "user_id": mastering.id,
+        "scope": "source",
+        "gain_db": 0.0,
+        "updated_at": None,
+    }
+
+
+def test_track_playback_preference_upserts_per_user(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    create_response = client.put(
+        f"/api/tracks/{track.id}/playback-preferences/source",
+        headers=auth_headers(mastering),
+        json={"gain_db": 3.5},
+    )
+    update_response = client.put(
+        f"/api/tracks/{track.id}/playback-preferences/source",
+        headers=auth_headers(mastering),
+        json={"gain_db": -1.5},
+    )
+
+    assert create_response.status_code == 200
+    assert create_response.json()["gain_db"] == 3.5
+    assert update_response.status_code == 200
+    assert update_response.json()["gain_db"] == -1.5
+
+    preferences = db_session.scalars(
+        select(TrackPlaybackPreference).where(TrackPlaybackPreference.track_id == track.id)
+    ).all()
+    assert len(preferences) == 1
+    assert preferences[0].user_id == mastering.id
+    assert preferences[0].scope == "source"
+    assert preferences[0].gain_db == -1.5
+
+
+def test_track_playback_preference_isolated_between_users(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    write_response = client.put(
+        f"/api/tracks/{track.id}/playback-preferences/source",
+        headers=auth_headers(mastering),
+        json={"gain_db": 6.0},
+    )
+    read_other_response = client.get(
+        f"/api/tracks/{track.id}/playback-preferences/source",
+        headers=auth_headers(producer),
+    )
+
+    assert write_response.status_code == 200
+    assert read_other_response.status_code == 200
+    assert read_other_response.json()["user_id"] == producer.id
+    assert read_other_response.json()["gain_db"] == 0.0
+
+
+def test_track_playback_preference_requires_track_visibility(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    outsider = factory.user(username="outsider")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    response = client.get(
+        f"/api/tracks/{track.id}/playback-preferences/source",
+        headers=auth_headers(outsider),
+    )
+
+    assert response.status_code == 403
+
+
+def test_track_playback_preference_accepts_master_scope(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="final_review")
+
+    response = client.put(
+        f"/api/tracks/{track.id}/playback-preferences/master",
+        headers=auth_headers(mastering),
+        json={"gain_db": 2.0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["scope"] == "master"
+    assert response.json()["gain_db"] == 2.0
 
 
 def test_delivery_step_hides_manual_deliver_transition_until_upload_flow_advances(client, factory, auth_headers):

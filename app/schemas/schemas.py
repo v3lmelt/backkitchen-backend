@@ -334,6 +334,20 @@ class TrackListItem(TrackRead):
     album_title: str = ""
 
 
+class TrackPlaybackPreferenceRead(BaseModel):
+    track_id: int
+    user_id: int
+    scope: Literal["source", "master"]
+    gain_db: float = Field(default=0.0, ge=-24, le=24)
+    updated_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TrackPlaybackPreferenceUpdate(BaseModel):
+    gain_db: float = Field(..., ge=-24, le=24)
+
+
 class SetPublicRequest(BaseModel):
     is_public: bool
 
@@ -373,6 +387,17 @@ class IssueUpdate(BaseModel):
     status_note: str | None = None
 
 
+class IssueAudioRead(BaseModel):
+    id: int
+    issue_id: int
+    audio_url: str
+    original_filename: str
+    duration: float | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class IssueRead(IssueBase):
     id: int
     track_id: int
@@ -384,6 +409,7 @@ class IssueRead(IssueBase):
     master_delivery_id: int | None = None
     status: IssueStatus
     markers: list[IssueMarkerRead] = []
+    audios: list[IssueAudioRead] = []
     created_at: datetime
     updated_at: datetime
     comment_count: int = 0

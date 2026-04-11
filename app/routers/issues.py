@@ -13,6 +13,7 @@ from app.models.album import Album
 from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
+from app.models.issue_audio import IssueAudio
 from app.services.audio import extract_audio_metadata
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueStatus, MarkerType
 from app.models.track import Track
@@ -59,6 +60,7 @@ AUDIO_EXT_MAP = {
     "audio/ogg": ".ogg",
 }
 MAX_AUDIOS_PER_COMMENT = 3
+MAX_AUDIOS_PER_ISSUE = 3
 
 router = APIRouter(tags=["issues"])
 
@@ -188,22 +190,53 @@ def _validate_status_transition(issue: Issue, new_status: IssueStatus, track: Tr
     response_model=IssueRead,
     status_code=status.HTTP_201_CREATED,
 )
-def create_issue(
+async def create_issue(
     track_id: int,
-    payload: IssueCreate,
     background_tasks: BackgroundTasks,
+    title: str = Form(...),
+    description: str = Form(...),
+    severity: str = Form(default="major"),
+    phase: str = Form(...),
+    markers_json: str = Form(default="[]"),
+    master_delivery_id: Optional[int] = Form(default=None),
+    audios: list[UploadFile] = File(default=[]),
+    audio_object_keys: Optional[str] = Form(default=None),
+    audio_original_filenames: Optional[str] = Form(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> IssueRead:
+    import json as _json
+
+    # Parse markers from JSON string
+    try:
+        markers_raw = _json.loads(markers_json)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid markers JSON.")
+
+    from app.schemas.schemas import IssueMarkerCreate
+    from app.models.issue import IssueSeverity as _IssueSeverity
+
+    parsed_markers: list[IssueMarkerCreate] = []
+    for m in markers_raw:
+        try:
+            parsed_markers.append(IssueMarkerCreate(**m))
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid marker data.")
+
+    try:
+        severity_enum = _IssueSeverity(severity)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid severity: {severity}")
+
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
     effective_phase = _ensure_custom_issue_permission(
-        track, album, current_user, payload.phase, db,
+        track, album, current_user, phase, db,
     )
 
-    for m in payload.markers:
+    for m in parsed_markers:
         if m.marker_type == MarkerType.RANGE and m.time_end is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -215,8 +248,30 @@ def create_issue(
                 detail="time_end must be greater than time_start.",
             )
 
+    # Validate audio files
+    if len(audios) > MAX_AUDIOS_PER_ISSUE:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"An issue may contain at most {MAX_AUDIOS_PER_ISSUE} audio files.",
+        )
+    for audio_file in audios:
+        if audio_file.content_type not in ALLOWED_AUDIO_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported audio type: {audio_file.content_type}. Allowed: mp3, wav, flac, aac, ogg.",
+            )
+
+    # Parse R2 audio keys if provided
+    r2_audio_keys: list[str] = []
+    r2_audio_names: list[str] = []
+    if audio_object_keys:
+        r2_audio_keys = [k.strip() for k in audio_object_keys.split("\n") if k.strip()]
+        r2_audio_names = [n.strip() for n in (audio_original_filenames or "").split("\n")]
+        while len(r2_audio_names) < len(r2_audio_keys):
+            r2_audio_names.append(Path(r2_audio_keys[len(r2_audio_names)]).name)
+
     source_version_id = None
-    master_delivery_id = None
+    _master_delivery_id = None
     if effective_phase in {IssuePhase.PEER, IssuePhase.PRODUCER, IssuePhase.MASTERING}:
         source_version = current_source_version(track)
         if source_version is None:
@@ -226,7 +281,7 @@ def create_issue(
         delivery = current_master_delivery(track)
         if delivery is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No master delivery available.")
-        master_delivery_id = delivery.id
+        _master_delivery_id = delivery.id
 
     issue = Issue(
         track_id=track_id,
@@ -234,27 +289,71 @@ def create_issue(
         phase=effective_phase,
         workflow_cycle=track.workflow_cycle,
         source_version_id=source_version_id,
-        master_delivery_id=master_delivery_id,
-        title=payload.title,
-        description=payload.description,
-        severity=payload.severity,
+        master_delivery_id=_master_delivery_id,
+        title=title,
+        description=description,
+        severity=severity_enum,
         markers=[
             IssueMarker(
                 marker_type=m.marker_type,
                 time_start=m.time_start,
                 time_end=m.time_end,
             )
-            for m in payload.markers
+            for m in parsed_markers
         ],
     )
     db.add(issue)
     db.flush()  # assign issue.id before logging
+
+    # Handle direct audio uploads
+    if audios:
+        from app.config import MAX_AUDIO_UPLOAD_SIZE
+
+        issue_audios_dir = settings.get_upload_path() / "issue_audios"
+        issue_audios_dir.mkdir(parents=True, exist_ok=True)
+        for audio_file in audios:
+            ext = AUDIO_EXT_MAP.get(audio_file.content_type or "", ".mp3")
+            filename = f"{uuid.uuid4()}{ext}"
+            file_path = f"issue_audios/{filename}"
+            dest = issue_audios_dir / filename
+            await stream_upload(audio_file, dest, MAX_AUDIO_UPLOAD_SIZE)
+            duration = extract_audio_metadata(dest).duration
+            original_filename = audio_file.filename or filename
+            db.add(IssueAudio(
+                issue_id=issue.id,
+                file_path=file_path,
+                original_filename=original_filename,
+                duration=duration,
+            ))
+
+    # Handle R2 audio attachments
+    if r2_audio_keys:
+        from botocore.exceptions import ClientError
+        from app.services.r2 import download_to_temp
+
+        for key, orig_name in zip(r2_audio_keys, r2_audio_names):
+            try:
+                tmp = download_to_temp(key)
+            except ClientError:
+                raise HTTPException(status_code=400, detail=f"R2 object not found: {key}")
+            try:
+                duration = extract_audio_metadata(tmp).duration
+            finally:
+                tmp.unlink(missing_ok=True)
+            db.add(IssueAudio(
+                issue_id=issue.id,
+                file_path=key,
+                storage_backend="r2",
+                original_filename=orig_name,
+                duration=duration,
+            ))
+
     log_track_event(
         db,
         track,
         current_user,
         "issue_created",
-        payload={"phase": effective_phase, "title": payload.title, "issue_id": issue.id},
+        payload={"phase": effective_phase, "title": title, "issue_id": issue.id},
     )
     if current_user.id != track.submitter_id:
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
@@ -281,7 +380,7 @@ def list_issues(
         select(Issue)
         .where(Issue.track_id == track_id)
         .order_by(Issue.created_at)
-        .options(selectinload(Issue.markers))
+        .options(selectinload(Issue.markers), selectinload(Issue.audios))
     ).all())
     # Pre-fetch all issue authors
     author_ids = {i.author_id for i in issues}
@@ -298,7 +397,7 @@ def get_issue(
     issue = db.scalar(
         select(Issue)
         .where(Issue.id == issue_id)
-        .options(selectinload(Issue.markers))
+        .options(selectinload(Issue.markers), selectinload(Issue.audios))
     )
     if issue is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
@@ -582,6 +681,53 @@ def batch_update_issues(
     for issue in issues:
         db.refresh(issue)
     return [build_issue_read(issue, db) for issue in issues]
+
+
+# ── issue audio file serving ─────────────────────────────────────────────────
+
+
+@router.get("/api/issue-audios/{audio_id}/file")
+def serve_issue_audio(
+    audio_id: int,
+    resolve: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    bearer_user: User | None = Depends(get_current_user_optional),
+    token_user: User | None = Depends(get_user_from_token_param),
+):
+    user = bearer_user or token_user
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    audio = db.get(IssueAudio, audio_id)
+    if audio is None:
+        raise HTTPException(status_code=404, detail="Issue audio not found.")
+
+    issue = db.get(Issue, audio.issue_id)
+    track = db.get(Track, issue.track_id) if issue else None
+    if not track:
+        raise HTTPException(status_code=404, detail="Associated track not found.")
+    ensure_track_visibility(track, user, db)
+
+    if audio.storage_backend == "r2":
+        from app.services.r2 import generate_download_url
+
+        url = generate_download_url(audio.file_path)
+        if resolve == "json":
+            return {"url": url}
+        return RedirectResponse(url, status_code=307)
+
+    if resolve == "json":
+        return {"url": None}
+
+    file_path = settings.get_upload_path() / audio.file_path
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Audio file missing from disk.")
+    mime_map = {
+        ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+        ".ogg": "audio/ogg", ".aac": "audio/aac", ".m4a": "audio/mp4",
+    }
+    media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
+    return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)
 
 
 # ── comment audio file serving ───────────────────────────────────────────────
