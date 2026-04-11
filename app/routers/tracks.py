@@ -722,7 +722,13 @@ def list_tracks(
     if album_id is not None:
         stmt = stmt.where(Track.album_id == album_id)
     if search:
-        stmt = stmt.where(Track.title.ilike(f"%{search}%"))
+        pattern = f"%{search}%"
+        stmt = stmt.where(
+            Track.title.ilike(pattern)
+            | Track.artist.ilike(pattern)
+            | Track.original_title.ilike(pattern)
+            | Track.original_artist.ilike(pattern)
+        )
     tracks = list(db.scalars(stmt).all())
 
     results: list[TrackListItem] = []
@@ -1070,22 +1076,48 @@ def reassign_reviewer(
                 detail=f"Users {sorted(invalid_ids)} are not members of this album.",
             )
 
-    # Cancel all pending assignments for this stage
-    db.execute(
-        update(StageAssignment)
-        .where(
-            StageAssignment.track_id == track_id,
-            StageAssignment.stage_id == step.id,
-            StageAssignment.status == "pending",
-        )
-        .values(status="cancelled")
-    )
     track.peer_reviewer_id = None
 
     if deduped_user_ids:
+        # Cancel assignments for users NOT in the new list (any status).
+        # Keep completed assignments for users who ARE in the new list.
+        db.execute(
+            update(StageAssignment)
+            .where(
+                StageAssignment.track_id == track_id,
+                StageAssignment.stage_id == step.id,
+                StageAssignment.status.in_(["pending", "completed"]),
+                StageAssignment.user_id.not_in(deduped_user_ids),
+            )
+            .values(status="cancelled")
+        )
+        # Cancel pending assignments for users who ARE in the new list
+        # (they'll get a fresh pending, or keep completed).
+        db.execute(
+            update(StageAssignment)
+            .where(
+                StageAssignment.track_id == track_id,
+                StageAssignment.stage_id == step.id,
+                StageAssignment.status == "pending",
+                StageAssignment.user_id.in_(deduped_user_ids),
+            )
+            .values(status="cancelled")
+        )
+
         now = datetime.now(timezone.utc)
         track.peer_reviewer_id = deduped_user_ids[0]
+        already_completed = set(db.scalars(
+            select(StageAssignment.user_id).where(
+                StageAssignment.track_id == track_id,
+                StageAssignment.stage_id == step.id,
+                StageAssignment.status == "completed",
+                StageAssignment.user_id.in_(deduped_user_ids),
+            )
+        ).all())
+        newly_assigned: list[int] = []
         for uid in deduped_user_ids:
+            if uid in already_completed:
+                continue
             db.add(StageAssignment(
                 track_id=track_id,
                 stage_id=step.id,
@@ -1093,10 +1125,12 @@ def reassign_reviewer(
                 status="pending",
                 assigned_at=now,
             ))
-        notify(db, deduped_user_ids, "reviewer_assigned", "你被指派为评审人",
-               f"你已被指派评审「{track.title}」",
-               related_track_id=track.id,
-               album_id=track.album_id)
+            newly_assigned.append(uid)
+        if newly_assigned:
+            notify(db, newly_assigned, "reviewer_assigned", "你被指派为评审人",
+                   f"你已被指派评审「{track.title}」",
+                   related_track_id=track.id,
+                   album_id=track.album_id)
     else:
         assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
 

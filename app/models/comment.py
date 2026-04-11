@@ -19,6 +19,7 @@ class Comment(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
 
     issue: Mapped["Issue"] = relationship("Issue", back_populates="comments")  # noqa: F821
     images: Mapped[list["CommentImage"]] = relationship("CommentImage", cascade="all, delete-orphan", back_populates="comment")  # noqa: F821

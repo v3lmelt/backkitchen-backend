@@ -20,6 +20,7 @@ class TrackDiscussion(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
 
     track: Mapped["Track"] = relationship("Track", back_populates="discussions")  # noqa: F821
     author: Mapped["User"] = relationship("User", foreign_keys=[author_id])  # noqa: F821

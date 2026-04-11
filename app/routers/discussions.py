@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -10,10 +11,11 @@ from app.config import settings
 from app.database import get_db
 from app.models.album import Album
 from app.models.discussion import TrackDiscussion, TrackDiscussionImage
+from app.models.edit_history import EditHistory
 from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
-from app.schemas.schemas import DiscussionImageRead, DiscussionRead, DiscussionUpdate, UserRead
+from app.schemas.schemas import DiscussionImageRead, DiscussionRead, DiscussionUpdate, EditHistoryRead, UserRead
 from app.security import get_current_user
 from app.services.upload import stream_upload
 from app.workflow import ensure_track_visibility
@@ -38,6 +40,7 @@ def _build_discussion_read(discussion: TrackDiscussion) -> DiscussionRead:
         author_id=discussion.author_id,
         content=discussion.content,
         created_at=discussion.created_at,
+        edited_at=discussion.edited_at,
         author=UserRead.model_validate(author) if author else None,
         images=images,
     )
@@ -159,7 +162,15 @@ def update_discussion(
     if discussion.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can edit this discussion.")
 
-    discussion.content = payload.content
+    if discussion.content != payload.content:
+        db.add(EditHistory(
+            entity_type="discussion",
+            entity_id=discussion.id,
+            old_content=discussion.content,
+            edited_by_id=current_user.id,
+        ))
+        discussion.content = payload.content
+        discussion.edited_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(discussion)
     return _build_discussion_read(discussion)
@@ -182,3 +193,24 @@ def delete_discussion(
 
     db.delete(discussion)
     db.commit()
+
+
+@router.get("/api/discussions/{discussion_id}/history", response_model=list[EditHistoryRead])
+def get_discussion_history(
+    discussion_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[EditHistoryRead]:
+    discussion = db.get(TrackDiscussion, discussion_id)
+    if discussion is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discussion not found.")
+    track = db.get(Track, discussion.track_id)
+    if track:
+        ensure_track_visibility(track, current_user, db)
+
+    histories = list(db.scalars(
+        select(EditHistory)
+        .where(EditHistory.entity_type == "discussion", EditHistory.entity_id == discussion_id)
+        .order_by(EditHistory.created_at.desc())
+    ).all())
+    return [EditHistoryRead.model_validate(h) for h in histories]

@@ -740,6 +740,7 @@ def execute_transition(
                 to_status=track.status,
                 payload={
                     "step": step.id,
+                    "phase": infer_issue_phase_for_step(step),
                     "decision": decision,
                     "completed_reviews": finished,
                     "required_reviews": needed,

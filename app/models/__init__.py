@@ -6,6 +6,7 @@ from app.models.checklist import ChecklistItem
 from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
 from app.models.discussion import TrackDiscussion, TrackDiscussionImage
+from app.models.edit_history import EditHistory
 from app.models.comment_image import CommentImage
 from app.models.invitation import Invitation
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueSeverity, IssueStatus, MarkerType
@@ -33,6 +34,7 @@ __all__ = [
     "ChecklistItem",
     "Comment",
     "CommentAudio",
+    "EditHistory",
     "CommentImage",
     "Invitation",
     "Issue",

@@ -448,6 +448,7 @@ class CommentRead(BaseModel):
     old_status: str | None = None
     new_status: str | None = None
     created_at: datetime
+    edited_at: datetime | None = None
     author: UserRead | None = None
     images: list[CommentImageRead] = []
     audios: list[CommentAudioRead] = []
@@ -525,6 +526,7 @@ class NotificationRead(BaseModel):
     body: str
     related_track_id: int | None = None
     related_issue_id: int | None = None
+    related_album_id: int | None = None
     is_read: bool
     created_at: datetime
 
@@ -555,6 +557,7 @@ class DiscussionRead(BaseModel):
     author_id: int
     content: str
     created_at: datetime
+    edited_at: datetime | None = None
     author: UserRead | None = None
     images: list[DiscussionImageRead] = []
 
@@ -567,6 +570,18 @@ class DiscussionUpdate(BaseModel):
 
 class CommentUpdate(BaseModel):
     content: str = Field(..., min_length=1, max_length=5000)
+
+
+class EditHistoryRead(BaseModel):
+    id: int
+    entity_type: str
+    entity_id: int
+    old_content: str
+    edited_by_id: int
+    created_at: datetime
+    editor: UserRead | None = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class WebhookConfig(BaseModel):
