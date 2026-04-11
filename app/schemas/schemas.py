@@ -377,6 +377,7 @@ class IssueBase(BaseModel):
 class IssueCreate(IssueBase):
     phase: str
     markers: list[IssueMarkerCreate] = []
+    visibility: str = "public"  # "public" → open, "internal" → pending_discussion
 
 
 class IssueUpdate(BaseModel):
