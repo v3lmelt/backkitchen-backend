@@ -32,6 +32,7 @@ from app.schemas.schemas import (
     DiscussionRead,
     IssueAudioRead,
     IssueDetail,
+    IssueImageRead,
     IssueMarkerRead,
     IssueRead,
     MasterDeliveryRead,
@@ -324,6 +325,15 @@ def build_issue_read(
         )
         for audio in issue.audios
     ]
+    images = [
+        IssueImageRead(
+            id=image.id,
+            issue_id=image.issue_id,
+            image_url=f"/uploads/{image.file_path}",
+            created_at=image.created_at,
+        )
+        for image in issue.images
+    ]
     return IssueRead(
         id=issue.id,
         track_id=issue.track_id,
@@ -339,6 +349,7 @@ def build_issue_read(
         status=issue.status,
         markers=markers,
         audios=audios,
+        images=images,
         created_at=issue.created_at,
         updated_at=issue.updated_at,
         comment_count=len(issue.comments),
@@ -428,6 +439,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         .options(
             selectinload(Track.issues).selectinload(Issue.markers),
             selectinload(Track.issues).selectinload(Issue.audios),
+            selectinload(Track.issues).selectinload(Issue.images),
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.images),
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.audios),
             selectinload(Track.workflow_events),

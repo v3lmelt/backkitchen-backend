@@ -399,6 +399,15 @@ class IssueAudioRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class IssueImageRead(BaseModel):
+    id: int
+    issue_id: int
+    image_url: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class IssueRead(IssueBase):
     id: int
     track_id: int
@@ -411,6 +420,7 @@ class IssueRead(IssueBase):
     status: IssueStatus
     markers: list[IssueMarkerRead] = []
     audios: list[IssueAudioRead] = []
+    images: list[IssueImageRead] = []
     created_at: datetime
     updated_at: datetime
     comment_count: int = 0

@@ -19,6 +19,7 @@ from app.models.comment_audio import CommentAudio
 from app.models.edit_history import EditHistory
 from app.models.comment_image import CommentImage
 from app.models.issue_audio import IssueAudio
+from app.models.issue_image import IssueImage
 from app.services.audio import extract_audio_metadata
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueStatus, MarkerType
 from app.models.stage_assignment import StageAssignment
@@ -67,6 +68,7 @@ AUDIO_EXT_MAP = {
 }
 MAX_AUDIOS_PER_COMMENT = 3
 MAX_AUDIOS_PER_ISSUE = 3
+MAX_IMAGES_PER_ISSUE = 3
 
 router = APIRouter(tags=["issues"])
 
@@ -268,6 +270,7 @@ async def create_issue(
     parsed_markers: list[IssueMarkerCreate]
     issue_visibility: str = "public"
     audios: list[StarletteUploadFile] = []
+    images: list[StarletteUploadFile] = []
     audio_object_keys: str | None = None
     audio_original_filenames: str | None = None
 
@@ -312,6 +315,7 @@ async def create_issue(
         issue_visibility = visibility
 
         audios = [item for item in form.getlist("audios") if isinstance(item, StarletteUploadFile)]
+        images = [item for item in form.getlist("images") if isinstance(item, StarletteUploadFile)]
         raw_audio_keys = form.get("audio_object_keys")
         raw_audio_names = form.get("audio_original_filenames")
         audio_object_keys = str(raw_audio_keys) if raw_audio_keys is not None else None
@@ -369,6 +373,19 @@ async def create_issue(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Unsupported audio type: {audio_file.content_type}. Allowed: mp3, wav, flac, aac, ogg.",
+            )
+
+    # Validate image files
+    if len(images) > MAX_IMAGES_PER_ISSUE:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"An issue may contain at most {MAX_IMAGES_PER_ISSUE} image files.",
+        )
+    for img_file in images:
+        if img_file.content_type not in ALLOWED_IMAGE_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported image type: {img_file.content_type}. Allowed: jpeg, png, gif, webp.",
             )
 
     # Parse R2 audio keys if provided
@@ -459,6 +476,20 @@ async def create_issue(
                 duration=duration,
             ))
 
+    # Handle image uploads
+    if images:
+        from app.config import MAX_IMAGE_UPLOAD_SIZE
+
+        issue_images_dir = settings.get_upload_path() / "issue_images"
+        issue_images_dir.mkdir(parents=True, exist_ok=True)
+        for img_file in images:
+            ext = IMAGE_EXT_MAP.get(img_file.content_type or "", ".jpg")
+            filename = f"{uuid.uuid4()}{ext}"
+            file_path = f"issue_images/{filename}"
+            dest = issue_images_dir / filename
+            await stream_upload(img_file, dest, MAX_IMAGE_UPLOAD_SIZE)
+            db.add(IssueImage(issue_id=issue.id, file_path=file_path))
+
     log_track_event(
         db,
         track,
@@ -491,7 +522,7 @@ def list_issues(
         select(Issue)
         .where(Issue.track_id == track_id)
         .order_by(Issue.created_at)
-        .options(selectinload(Issue.markers), selectinload(Issue.audios))
+        .options(selectinload(Issue.markers), selectinload(Issue.audios), selectinload(Issue.images))
     ).all())
     if current_user.id == track.submitter_id:
         issues = [issue for issue in issues if issue.status != IssueStatus.PENDING_DISCUSSION]
@@ -510,7 +541,7 @@ def get_issue(
     issue = db.scalar(
         select(Issue)
         .where(Issue.id == issue_id)
-        .options(selectinload(Issue.markers), selectinload(Issue.audios))
+        .options(selectinload(Issue.markers), selectinload(Issue.audios), selectinload(Issue.images))
     )
     if issue is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
