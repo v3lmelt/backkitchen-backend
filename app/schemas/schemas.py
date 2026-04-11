@@ -445,6 +445,8 @@ class CommentRead(BaseModel):
     author_id: int
     content: str
     is_status_note: bool = False
+    old_status: str | None = None
+    new_status: str | None = None
     created_at: datetime
     author: UserRead | None = None
     images: list[CommentImageRead] = []

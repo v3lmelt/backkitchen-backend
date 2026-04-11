@@ -549,7 +549,7 @@ def update_issue(
 
     new_status = issue.status
     if payload.status_note and old_status != new_status:
-        db.add(Comment(issue_id=issue.id, author_id=current_user.id, content=payload.status_note, is_status_note=True))
+        db.add(Comment(issue_id=issue.id, author_id=current_user.id, content=payload.status_note, is_status_note=True, old_status=old_status.value, new_status=new_status.value))
 
     if old_status != new_status and current_user.id != issue.author_id:
         track = db.get(Track, issue.track_id)
@@ -808,6 +808,8 @@ def batch_update_issues(
                 author_id=current_user.id,
                 content=payload.status_note,
                 is_status_note=True,
+                old_status=old_status.value,
+                new_status=payload.status.value,
             ))
 
     db.commit()
