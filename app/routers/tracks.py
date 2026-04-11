@@ -43,6 +43,7 @@ from app.schemas.schemas import (
     WorkflowTransitionRequest,
 )
 from app.workflow_engine import (
+    prepare_review_assignments_for_stage_entry,
     execute_transition as engine_execute_transition,
     execute_revision_upload as engine_revision_upload,
     execute_delivery_upload as engine_delivery_upload,
@@ -541,6 +542,13 @@ def confirm_source_version_upload(
     track.storage_backend = "r2"
     track.duration = duration
     track.status = next_status
+    prepare_review_assignments_for_stage_entry(
+        db,
+        album,
+        track,
+        next_status,
+        background_tasks,
+    )
     sv = TrackSourceVersion(
         track_id=track.id,
         workflow_cycle=track.workflow_cycle,
@@ -1036,13 +1044,31 @@ def reassign_reviewer(
     if step is None or step.type != "review":
         raise HTTPException(status_code=409, detail="Track is not in a review stage.")
 
-    if payload.user_id is not None and payload.user_id == track.submitter_id:
+    requested_user_ids: list[int] = []
+    if payload.user_ids is not None:
+        requested_user_ids = payload.user_ids
+    elif payload.user_id is not None:
+        requested_user_ids = [payload.user_id]
+
+    deduped_user_ids: list[int] = []
+    seen: set[int] = set()
+    for uid in requested_user_ids:
+        if uid in seen:
+            continue
+        seen.add(uid)
+        deduped_user_ids.append(uid)
+
+    if track.submitter_id in deduped_user_ids:
         raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
 
-    if payload.user_id is not None:
+    if deduped_user_ids:
         valid_member_ids = get_album_member_ids(db, album.id)
-        if payload.user_id not in valid_member_ids:
-            raise HTTPException(status_code=400, detail="Selected reviewer is not a member of this album.")
+        invalid_ids = [uid for uid in deduped_user_ids if uid not in valid_member_ids]
+        if invalid_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Users {sorted(invalid_ids)} are not members of this album.",
+            )
 
     # Cancel all pending assignments for this stage
     db.execute(
@@ -1056,16 +1082,18 @@ def reassign_reviewer(
     )
     track.peer_reviewer_id = None
 
-    if payload.user_id is not None:
-        track.peer_reviewer_id = payload.user_id
-        db.add(StageAssignment(
-            track_id=track_id,
-            stage_id=step.id,
-            user_id=payload.user_id,
-            status="pending",
-            assigned_at=datetime.now(timezone.utc),
-        ))
-        notify(db, [payload.user_id], "reviewer_assigned", "你被指派为评审人",
+    if deduped_user_ids:
+        now = datetime.now(timezone.utc)
+        track.peer_reviewer_id = deduped_user_ids[0]
+        for uid in deduped_user_ids:
+            db.add(StageAssignment(
+                track_id=track_id,
+                stage_id=step.id,
+                user_id=uid,
+                status="pending",
+                assigned_at=now,
+            ))
+        notify(db, deduped_user_ids, "reviewer_assigned", "你被指派为评审人",
                f"你已被指派评审「{track.title}」",
                related_track_id=track.id,
                album_id=track.album_id)
@@ -1075,7 +1103,7 @@ def reassign_reviewer(
     log_track_event(
         db, track, current_user,
         "reviewer_reassigned",
-        payload={"stage": step.id, "new_reviewer_id": payload.user_id},
+        payload={"stage": step.id, "new_reviewer_ids": deduped_user_ids},
     )
 
     db.commit()
@@ -1235,6 +1263,13 @@ def upload_source_version(
     track.storage_backend = "local"
     track.duration = duration
     track.status = next_status
+    prepare_review_assignments_for_stage_entry(
+        db,
+        album,
+        track,
+        next_status,
+        background_tasks,
+    )
     source_version = _source_version_create(track, current_user, file_path, duration)
     db.add(source_version)
     log_track_event(

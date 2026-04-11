@@ -447,6 +447,46 @@ def assign_peer_reviewer_for_step(
         track.peer_reviewer_id = assigned[0]
 
 
+def prepare_review_assignments_for_stage_entry(
+    db: Session,
+    album: Album,
+    track: Track,
+    stage_id: str,
+    background_tasks: BackgroundTasks | None = None,
+) -> None:
+    """Ensure assignments are ready when a track enters a review stage.
+
+    When a review step is revisited (for example after a revision upload),
+    preserve the original reviewer set by reopening previous assignments.
+    If there is no assignment history yet, fall back to normal assignment.
+    """
+    config = parse_workflow_config(album)
+    step = get_step_by_id(get_steps(config), stage_id)
+    if step is None or step.type != "review":
+        return
+
+    existing_assignments = db.scalars(
+        select(StageAssignment).where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id == step.id,
+        )
+    ).all()
+
+    if not existing_assignments:
+        assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
+        return
+
+    for assignment in existing_assignments:
+        if assignment.status in {"completed", "cancelled"}:
+            assignment.status = "pending"
+            assignment.completed_at = None
+            assignment.decision = None
+
+    if step.assignee_role == "peer_reviewer":
+        first_pending = next((a for a in existing_assignments if a.status == "pending"), None)
+        track.peer_reviewer_id = first_pending.user_id if first_pending else track.peer_reviewer_id
+
+
 # ---------------------------------------------------------------------------
 # Allowed transitions
 # ---------------------------------------------------------------------------
@@ -646,27 +686,40 @@ def execute_transition(
     steps = get_steps(config)
 
     # Multi-review gate rules:
-    # - Any reviewer can force a rollback decision (needs_revision/reject*).
-    # - Pass/approve from review step requires enough completed reviewers.
-    if step.type == "review" and pending_assignment and decision.startswith("reject"):
-        db.execute(
-            update(StageAssignment)
-            .where(
-                StageAssignment.track_id == track.id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.status == "pending",
-            )
-            .values(status="cancelled")
-        )
+    # - Any non-forward review decision immediately rolls back.
+    # - pass/approve only advances once required reviewer count is reached.
+    # - once advancing, remaining pending assignments are cancelled.
+    is_review_forward_decision = step.type == "review" and decision in {"pass", "approve"}
 
-    if step.type == "review" and pending_assignment and decision in {"pass", "approve"}:
-        # Mark current reviewer as completed first, then decide whether we can move on.
+    if step.type == "review" and pending_assignment:
         pending_assignment.status = "completed"
         pending_assignment.decision = decision
         pending_assignment.completed_at = datetime.now(timezone.utc)
 
-        finished = min(total_assignments, completed_assignments + 1)
-        needed = min(required_reviews, total_assignments) if total_assignments > 0 else required_reviews
+        if not is_review_forward_decision:
+            db.execute(
+                update(StageAssignment)
+                .where(
+                    StageAssignment.track_id == track.id,
+                    StageAssignment.stage_id == step.id,
+                    StageAssignment.status == "pending",
+                    StageAssignment.user_id != user.id,
+                )
+                .values(status="cancelled")
+            )
+
+    if step.type == "review" and pending_assignment is not None:
+        db.flush()
+
+    if step.type == "review" and is_review_forward_decision and total_assignments > 0:
+        finished = db.scalar(
+            select(func.count(StageAssignment.id)).where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id == step.id,
+                StageAssignment.status == "completed",
+            )
+        ) or 0
+        needed = min(required_reviews, total_assignments)
         if finished < needed:
             log_track_event(
                 db, track, user,
@@ -681,6 +734,16 @@ def execute_transition(
                 },
             )
             return
+
+        db.execute(
+            update(StageAssignment)
+            .where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id == step.id,
+                StageAssignment.status == "pending",
+            )
+            .values(status="cancelled")
+        )
 
     # Producer-direct intake: skip peer review, mark variant accordingly
     if decision == "accept_producer_direct":
@@ -712,19 +775,13 @@ def execute_transition(
         # Only fall through to fresh assignment if the target step never had
         # an assignment history (edge case, shouldn't happen in practice).
         if decision.startswith("reject_to_") and target_step.type == "review":
-            existing_assignments = db.scalars(
-                select(StageAssignment).where(
-                    StageAssignment.track_id == track.id,
-                    StageAssignment.stage_id == target,
-                )
-            ).all()
-            if existing_assignments:
-                for assignment in existing_assignments:
-                    if assignment.status == "completed":
-                        assignment.status = "pending"
-                        assignment.completed_at = None
-            else:
-                assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks)
+            prepare_review_assignments_for_stage_entry(
+                db,
+                album,
+                track,
+                target,
+                background_tasks,
+            )
         else:
             # Forward: auto-assign reviewers if entering a review step
             assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks)
