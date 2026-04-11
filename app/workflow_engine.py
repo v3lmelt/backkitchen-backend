@@ -447,12 +447,17 @@ def get_allowed_transitions(
         if not _is_delivery_transition_user_visible(step, decision):
             continue
         # Hide transitions whose target step has a lower order than the
-        # current step — this happens when users reorder the workflow
-        # (e.g. peer_review before intake) and the hardcoded transitions
-        # still point back to an already-completed earlier step.
+        # current step when they are not explicit rollback actions. This
+        # guards stale forward transitions after step reordering (e.g.
+        # peer_review before intake) while still allowing configured
+        # ``reject_to_*`` rollback targets.
         if target not in SPECIAL_TARGETS:
             target_step = get_step_by_id(steps, target)
-            if target_step and target_step.order < step.order:
+            if (
+                target_step
+                and target_step.order < step.order
+                and not decision.startswith("reject_to_")
+            ):
                 continue
         label = decision.replace("_", " ").title()
         options.append(TransitionOption(decision=decision, target=target, label=label))
