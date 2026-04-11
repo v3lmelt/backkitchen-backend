@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import BackgroundTasks, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models.album import Album
@@ -244,17 +244,27 @@ def user_matches_role_or_assignment(
 ) -> bool:
     """Like user_matches_role but also checks StageAssignment for review steps."""
     if step.type == "review":
-        # Check if user has an active assignment for this track+stage
-        assignment = db.scalar(
-            select(StageAssignment).where(
-                StageAssignment.track_id == track.id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.user_id == user.id,
-                StageAssignment.status == "pending",
+        has_assignments = bool(
+            db.scalar(
+                select(func.count(StageAssignment.id)).where(
+                    StageAssignment.track_id == track.id,
+                    StageAssignment.stage_id == step.id,
+                )
             )
         )
-        if assignment:
-            return True
+        # When explicit assignments exist for the stage, only pending assignees
+        # may act. This prevents already-finished reviewers from re-triggering
+        # transitions via the legacy role fallback.
+        if has_assignments:
+            assignment = db.scalar(
+                select(StageAssignment.id).where(
+                    StageAssignment.track_id == track.id,
+                    StageAssignment.stage_id == step.id,
+                    StageAssignment.user_id == user.id,
+                    StageAssignment.status == "pending",
+                )
+            )
+            return assignment is not None
     return user_matches_role(user, album, track, step)
 
 
@@ -386,9 +396,27 @@ def assign_peer_reviewer_for_step(
     if step.type != "review":
         return
 
+    # Clear stale assignments for this step before (re)assigning.
+    db.execute(
+        update(StageAssignment)
+        .where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id == step.id,
+            StageAssignment.status == "pending",
+        )
+        .values(status="cancelled")
+    )
+
     # Step-level assignee_user_id override takes precedence over all other modes.
     if step.assignee_user_id:
         track.peer_reviewer_id = step.assignee_user_id
+        db.add(StageAssignment(
+            track_id=track.id,
+            stage_id=step.id,
+            user_id=step.assignee_user_id,
+            status="pending",
+            assigned_at=datetime.now(timezone.utc),
+        ))
         notify(
             db, [step.assignee_user_id],
             "reviewer_assigned", "你被指派为评审人",
@@ -419,6 +447,46 @@ def assign_peer_reviewer_for_step(
         track.peer_reviewer_id = assigned[0]
 
 
+def prepare_review_assignments_for_stage_entry(
+    db: Session,
+    album: Album,
+    track: Track,
+    stage_id: str,
+    background_tasks: BackgroundTasks | None = None,
+) -> None:
+    """Ensure assignments are ready when a track enters a review stage.
+
+    When a review step is revisited (for example after a revision upload),
+    preserve the original reviewer set by reopening previous assignments.
+    If there is no assignment history yet, fall back to normal assignment.
+    """
+    config = parse_workflow_config(album)
+    step = get_step_by_id(get_steps(config), stage_id)
+    if step is None or step.type != "review":
+        return
+
+    existing_assignments = db.scalars(
+        select(StageAssignment).where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id == step.id,
+        )
+    ).all()
+
+    if not existing_assignments:
+        assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
+        return
+
+    for assignment in existing_assignments:
+        if assignment.status in {"completed", "cancelled"}:
+            assignment.status = "pending"
+            assignment.completed_at = None
+            assignment.decision = None
+
+    if step.assignee_role == "peer_reviewer":
+        first_pending = next((a for a in existing_assignments if a.status == "pending"), None)
+        track.peer_reviewer_id = first_pending.user_id if first_pending else track.peer_reviewer_id
+
+
 # ---------------------------------------------------------------------------
 # Allowed transitions
 # ---------------------------------------------------------------------------
@@ -447,12 +515,17 @@ def get_allowed_transitions(
         if not _is_delivery_transition_user_visible(step, decision):
             continue
         # Hide transitions whose target step has a lower order than the
-        # current step — this happens when users reorder the workflow
-        # (e.g. peer_review before intake) and the hardcoded transitions
-        # still point back to an already-completed earlier step.
+        # current step when they are not explicit rollback actions. This
+        # guards stale forward transitions after step reordering (e.g.
+        # peer_review before intake) while still allowing configured
+        # ``reject_to_*`` rollback targets.
         if target not in SPECIAL_TARGETS:
             target_step = get_step_by_id(steps, target)
-            if target_step and target_step.order < step.order:
+            if (
+                target_step
+                and target_step.order < step.order
+                and not decision.startswith("reject_to_")
+            ):
                 continue
         label = decision.replace("_", " ").title()
         options.append(TransitionOption(decision=decision, target=target, label=label))
@@ -580,9 +653,97 @@ def execute_transition(
                 detail="Submit the peer review checklist before finishing the review.",
             )
 
+    pending_assignment = None
+    total_assignments = 0
+    completed_assignments = 0
+    required_reviews = 1
+    if step.type == "review":
+        pending_assignment = db.scalar(
+            select(StageAssignment).where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id == step.id,
+                StageAssignment.user_id == user.id,
+                StageAssignment.status == "pending",
+            )
+        )
+        total_assignments = db.scalar(
+            select(func.count(StageAssignment.id)).where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id == step.id,
+            )
+        ) or 0
+        completed_assignments = db.scalar(
+            select(func.count(StageAssignment.id)).where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id == step.id,
+                StageAssignment.status == "completed",
+            )
+        ) or 0
+        required_reviews = max(1, step.required_reviewer_count or 1)
+
     target = step.transitions[decision]
     previous_status = track.status
     steps = get_steps(config)
+
+    # Multi-review gate rules:
+    # - Any non-forward review decision immediately rolls back.
+    # - pass/approve only advances once required reviewer count is reached.
+    # - once advancing, remaining pending assignments are cancelled.
+    is_review_forward_decision = step.type == "review" and decision in {"pass", "approve"}
+
+    if step.type == "review" and pending_assignment:
+        pending_assignment.status = "completed"
+        pending_assignment.decision = decision
+        pending_assignment.completed_at = datetime.now(timezone.utc)
+
+        if not is_review_forward_decision:
+            db.execute(
+                update(StageAssignment)
+                .where(
+                    StageAssignment.track_id == track.id,
+                    StageAssignment.stage_id == step.id,
+                    StageAssignment.status == "pending",
+                    StageAssignment.user_id != user.id,
+                )
+                .values(status="cancelled")
+            )
+
+    if step.type == "review" and pending_assignment is not None:
+        db.flush()
+
+    if step.type == "review" and is_review_forward_decision and total_assignments > 0:
+        finished = db.scalar(
+            select(func.count(StageAssignment.id)).where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id == step.id,
+                StageAssignment.status == "completed",
+            )
+        ) or 0
+        needed = min(required_reviews, total_assignments)
+        if finished < needed:
+            log_track_event(
+                db, track, user,
+                "workflow_review_progress",
+                from_status=previous_status,
+                to_status=track.status,
+                payload={
+                    "step": step.id,
+                    "decision": decision,
+                    "completed_reviews": finished,
+                    "required_reviews": needed,
+                },
+            )
+            return
+
+        db.execute(
+            update(StageAssignment)
+            .where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id == step.id,
+                StageAssignment.status == "pending",
+            )
+            .values(status="cancelled")
+        )
 
     # Producer-direct intake: skip peer review, mark variant accordingly
     if decision == "accept_producer_direct":
@@ -614,36 +775,22 @@ def execute_transition(
         # Only fall through to fresh assignment if the target step never had
         # an assignment history (edge case, shouldn't happen in practice).
         if decision.startswith("reject_to_") and target_step.type == "review":
-            existing_assignments = db.scalars(
-                select(StageAssignment).where(
-                    StageAssignment.track_id == track.id,
-                    StageAssignment.stage_id == target,
-                )
-            ).all()
-            if existing_assignments:
-                for assignment in existing_assignments:
-                    if assignment.status == "completed":
-                        assignment.status = "pending"
-                        assignment.completed_at = None
-            else:
-                assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks)
+            prepare_review_assignments_for_stage_entry(
+                db,
+                album,
+                track,
+                target,
+                background_tasks,
+            )
         else:
             # Forward: auto-assign reviewers if entering a review step
             assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks)
 
-    # Mark the user's stage assignment as completed (for review steps)
-    if step.type == "review":
-        assignment = db.scalar(
-            select(StageAssignment).where(
-                StageAssignment.track_id == track.id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.user_id == user.id,
-                StageAssignment.status == "pending",
-            )
-        )
-        if assignment:
-            assignment.status = "completed"
-            assignment.completed_at = datetime.now(timezone.utc)
+    # Mark the current user's assignment when it wasn't already handled above.
+    if step.type == "review" and pending_assignment and pending_assignment.status == "pending":
+        pending_assignment.status = "completed"
+        pending_assignment.decision = decision
+        pending_assignment.completed_at = datetime.now(timezone.utc)
 
     log_track_event(
         db, track, user,

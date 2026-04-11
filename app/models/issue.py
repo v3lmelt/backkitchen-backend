@@ -21,6 +21,7 @@ class IssueSeverity(str, enum.Enum):
 
 class IssueStatus(str, enum.Enum):
     OPEN = "open"
+    PENDING_DISCUSSION = "pending_discussion"
     DISAGREED = "disagreed"
     RESOLVED = "resolved"
 
@@ -82,6 +83,10 @@ class Issue(Base):
     markers: Mapped[list["IssueMarker"]] = relationship(
         "IssueMarker", back_populates="issue", cascade="all, delete-orphan",
         order_by="IssueMarker.id",
+    )
+    audios: Mapped[list["IssueAudio"]] = relationship(  # noqa: F821
+        "IssueAudio", back_populates="issue", cascade="all, delete-orphan",
+        order_by="IssueAudio.id",
     )
 
     def __repr__(self) -> str:

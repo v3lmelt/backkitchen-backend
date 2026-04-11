@@ -542,3 +542,136 @@ def test_create_issue_custom_review_step_rejects_unassigned_member(client, db_se
     )
 
     assert response.status_code == 403
+
+
+def test_multi_reviewer_issue_defaults_to_pending_discussion_and_hidden_from_submitter(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer_a = factory.user(username="reviewer_a")
+    reviewer_b = factory.user(username="reviewer_b")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer_a, reviewer_b])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer_a)
+
+    db_session.add_all([
+        StageAssignment(track_id=track.id, stage_id="peer_review", user_id=reviewer_a.id, status="pending"),
+        StageAssignment(track_id=track.id, stage_id="peer_review", user_id=reviewer_b.id, status="pending"),
+    ])
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "peer_review",
+                    "label": "Peer Review",
+                    "type": "review",
+                    "ui_variant": "peer_review",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "producer_gate", "needs_revision": "peer_revision"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 2,
+                    "revision_step": "peer_revision",
+                },
+                {
+                    "id": "peer_revision",
+                    "label": "Peer Revision",
+                    "type": "revision",
+                    "assignee_role": "submitter",
+                    "order": 1,
+                    "return_to": "peer_review",
+                    "transitions": {},
+                },
+                {
+                    "id": "producer_gate",
+                    "label": "Producer Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 2,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    db_session.commit()
+
+    create_response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer_a),
+        json={
+            "title": "Needs discussion",
+            "description": "Reviewer notes",
+            "phase": "peer",
+            "severity": "major",
+            "markers": [],
+        },
+    )
+
+    assert create_response.status_code == 201
+    issue_id = create_response.json()["id"]
+    assert create_response.json()["status"] == IssueStatus.PENDING_DISCUSSION.value
+
+    list_submitter = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
+    assert list_submitter.status_code == 200
+    assert all(item["id"] != issue_id for item in list_submitter.json())
+
+    detail_submitter = client.get(f"/api/issues/{issue_id}", headers=auth_headers(submitter))
+    assert detail_submitter.status_code == 404
+
+    track_detail_submitter = client.get(f"/api/tracks/{track.id}", headers=auth_headers(submitter))
+    assert track_detail_submitter.status_code == 200
+    assert track_detail_submitter.json()["track"]["open_issue_count"] == 0
+
+
+def test_pending_discussion_visible_after_reviewer_moves_to_open(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
+    issue = factory.issue(
+        track=track,
+        author=reviewer,
+        phase=IssuePhase.PEER,
+        status=IssueStatus.PENDING_DISCUSSION,
+        source_version_id=track.source_versions[-1].id,
+    )
+
+    hidden_detail = client.get(f"/api/issues/{issue.id}", headers=auth_headers(submitter))
+    assert hidden_detail.status_code == 404
+
+    update_response = client.patch(
+        f"/api/issues/{issue.id}",
+        headers=auth_headers(reviewer),
+        json={"status": "open"},
+    )
+    assert update_response.status_code == 200
+    assert update_response.json()["status"] == IssueStatus.OPEN.value
+
+    visible_detail = client.get(f"/api/issues/{issue.id}", headers=auth_headers(submitter))
+    assert visible_detail.status_code == 200
+
+
+def test_submitter_cannot_change_pending_discussion_status(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
+    issue = factory.issue(
+        track=track,
+        author=reviewer,
+        phase=IssuePhase.PEER,
+        status=IssueStatus.PENDING_DISCUSSION,
+        source_version_id=track.source_versions[-1].id,
+    )
+
+    response = client.patch(
+        f"/api/issues/{issue.id}",
+        headers=auth_headers(submitter),
+        json={"status": "resolved"},
+    )
+
+    assert response.status_code == 404

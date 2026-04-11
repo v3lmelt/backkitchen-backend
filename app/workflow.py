@@ -30,6 +30,7 @@ from app.schemas.schemas import (
     CommentRead,
     DiscussionImageRead,
     DiscussionRead,
+    IssueAudioRead,
     IssueDetail,
     IssueMarkerRead,
     IssueRead,
@@ -40,6 +41,19 @@ from app.schemas.schemas import (
     UserRead,
     WorkflowEventRead,
 )
+
+
+def _audio_url(audio) -> str:
+    """Return the public URL for an audio attachment.
+
+    For R2-stored files, returns the public CDN URL directly.
+    For local files, returns the ``/uploads/`` path.
+    """
+    if audio.storage_backend == "r2":
+        from app.services.r2 import public_url
+
+        return public_url(audio.file_path)
+    return f"/uploads/{audio.file_path}"
 
 
 def get_album_member_ids(db: Session, album_id: int) -> set[int]:
@@ -196,6 +210,14 @@ def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead
     return MasterDeliveryRead.model_validate(delivery)
 
 
+def _issue_visible_to_user(issue: Issue, track: Track, user: User) -> bool:
+    return not (user.id == track.submitter_id and issue.status == IssueStatus.PENDING_DISCUSSION)
+
+
+def _issue_unresolved(issue: Issue) -> bool:
+    return issue.status != IssueStatus.RESOLVED
+
+
 def build_track_read(track: Track, user: User, album: Album, db: Session | None = None, *, anonymize: bool = False) -> TrackRead:
     from app.workflow_engine import (
         get_allowed_transitions,
@@ -206,7 +228,8 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
 
     current_source = current_source_version(track)
     current_master = current_master_delivery(track)
-    open_issue_count = sum(1 for i in track.issues if i.status == IssueStatus.OPEN)
+    visible_issues = [issue for issue in track.issues if _issue_visible_to_user(issue, track, user)]
+    open_issue_count = sum(1 for issue in visible_issues if _issue_unresolved(issue))
 
     workflow_step = None
     workflow_transitions = None
@@ -243,6 +266,8 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
         artist=None if anonymize else track.artist,
         album_id=track.album_id,
         bpm=track.bpm,
+        original_title=track.original_title,
+        original_artist=track.original_artist,
         track_number=track.track_number,
         file_path=track.file_path,
         duration=track.duration,
@@ -257,7 +282,7 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
         mastering_engineer_id=album.mastering_engineer_id,
         created_at=track.created_at,
         updated_at=track.updated_at,
-        issue_count=len(track.issues),
+        issue_count=len(visible_issues),
         open_issue_count=open_issue_count,
         submitter=None if anonymize else _user_read(track.submitter),
         peer_reviewer=None if anonymize else _user_read(track.peer_reviewer),
@@ -288,6 +313,17 @@ def build_issue_read(
             source_version = db.get(TrackSourceVersion, issue.source_version_id)
             source_version_number = source_version.version_number if source_version else None
     markers = [IssueMarkerRead.model_validate(m) for m in issue.markers]
+    audios = [
+        IssueAudioRead(
+            id=audio.id,
+            issue_id=audio.issue_id,
+            audio_url=_audio_url(audio),
+            original_filename=audio.original_filename,
+            duration=audio.duration,
+            created_at=audio.created_at,
+        )
+        for audio in issue.audios
+    ]
     return IssueRead(
         id=issue.id,
         track_id=issue.track_id,
@@ -302,6 +338,7 @@ def build_issue_read(
         severity=issue.severity,
         status=issue.status,
         markers=markers,
+        audios=audios,
         created_at=issue.created_at,
         updated_at=issue.updated_at,
         comment_count=len(issue.comments),
@@ -327,11 +364,7 @@ def build_comment_read(comment: Comment, db: Session, users_cache: dict[int, Use
         CommentAudioRead(
             id=audio.id,
             comment_id=audio.comment_id,
-            audio_url=(
-                f"/api/comment-audios/{audio.id}/file"
-                if audio.storage_backend == "r2"
-                else f"/uploads/{audio.file_path}"
-            ),
+            audio_url=_audio_url(audio),
             original_filename=audio.original_filename,
             duration=audio.duration,
             created_at=audio.created_at,
@@ -392,6 +425,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         .where(Track.id == track.id)
         .options(
             selectinload(Track.issues).selectinload(Issue.markers),
+            selectinload(Track.issues).selectinload(Issue.audios),
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.images),
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.audios),
             selectinload(Track.workflow_events),
@@ -423,9 +457,10 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         users_by_id = {u.id: u for u in fetched}
 
     source_version_numbers = {version.id: version.version_number for version in track.source_versions}
+    visible_issues = [issue for issue in track.issues if _issue_visible_to_user(issue, track, user)]
     issues = [
         build_issue_read(issue, db, source_version_numbers, users_by_id)
-        for issue in sorted(track.issues, key=lambda row: (row.created_at, row.id))
+        for issue in sorted(visible_issues, key=lambda row: (row.created_at, row.id))
     ]
     current_source = current_source_version(track)
     checklist_items = [

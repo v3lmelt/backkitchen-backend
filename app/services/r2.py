@@ -2,7 +2,6 @@
 
 import logging
 import tempfile
-import time
 import uuid
 from functools import lru_cache
 from pathlib import Path
@@ -14,6 +13,9 @@ from botocore.exceptions import ClientError
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Cache-Control for public R2 objects (30 days)
+_R2_CACHE_CONTROL = "public, max-age=2592000"
 
 
 @lru_cache(maxsize=1)
@@ -29,6 +31,12 @@ def get_r2_client():
     )
 
 
+def public_url(object_key: str) -> str:
+    """Return the public CDN URL for an R2 object."""
+    base = settings.R2_PUBLIC_URL.rstrip("/")
+    return f"{base}/{object_key}"
+
+
 def generate_upload_url(object_key: str, content_type: str) -> str:
     """Generate a presigned PUT URL for direct client upload to R2."""
     client = get_r2_client()
@@ -38,43 +46,10 @@ def generate_upload_url(object_key: str, content_type: str) -> str:
             "Bucket": settings.R2_BUCKET_NAME,
             "Key": object_key,
             "ContentType": content_type,
+            "CacheControl": _R2_CACHE_CONTROL,
         },
         ExpiresIn=settings.R2_PRESIGNED_UPLOAD_EXPIRY,
     )
-
-
-_download_url_cache: dict[str, tuple[str, float]] = {}
-_DOWNLOAD_URL_CACHE_MARGIN = 300  # re-generate 5 min before expiry
-
-
-def generate_download_url(object_key: str, expires_in: int | None = None) -> str:
-    """Generate a presigned GET URL for downloading/streaming from R2.
-
-    Presigned URLs are cached per object key so that the same URL is returned
-    within the validity window.  This allows browser HTTP caching to work
-    because the URL (and therefore the cache key) remains stable.
-    """
-    ttl = expires_in or settings.R2_PRESIGNED_DOWNLOAD_EXPIRY
-    now = time.monotonic()
-
-    cached = _download_url_cache.get(object_key)
-    if cached is not None:
-        url, deadline = cached
-        if now < deadline:
-            return url
-
-    client = get_r2_client()
-    url = client.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": settings.R2_BUCKET_NAME,
-            "Key": object_key,
-            "ResponseCacheControl": f"private, max-age={ttl}, immutable",
-        },
-        ExpiresIn=ttl,
-    )
-    _download_url_cache[object_key] = (url, now + ttl - _DOWNLOAD_URL_CACHE_MARGIN)
-    return url
 
 
 def object_exists(object_key: str) -> bool:

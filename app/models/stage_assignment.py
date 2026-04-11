@@ -20,6 +20,7 @@ class StageAssignment(Base):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending"
     )  # "pending" | "completed"
+    decision: Mapped[str | None] = mapped_column(String(50), nullable=True)
     assigned_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )

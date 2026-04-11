@@ -17,11 +17,14 @@ from app.models.master_delivery import MasterDelivery
 from app.models.reopen_request import ReopenRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus, WorkflowVariant
+from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.schemas.schemas import (
     AssignReviewerRequest,
     ReassignReviewerRequest,
+    TrackPlaybackPreferenceRead,
+    TrackPlaybackPreferenceUpdate,
     ConfirmTrackUploadParams,
     ConfirmUploadParams,
     DirectReopenRequest,
@@ -35,10 +38,12 @@ from app.schemas.schemas import (
     StageAssignmentRead,
     TrackDetailResponse,
     TrackListItem,
+    TrackMetadataUpdate,
     TrackRead,
     WorkflowTransitionRequest,
 )
 from app.workflow_engine import (
+    prepare_review_assignments_for_stage_entry,
     execute_transition as engine_execute_transition,
     execute_revision_upload as engine_revision_upload,
     execute_delivery_upload as engine_delivery_upload,
@@ -77,6 +82,12 @@ def _broadcast_track_updated(background_tasks: BackgroundTasks, track_id: int) -
 
 # Used only for truly immutable URLs (source-version snapshots addressed by numeric ID).
 _AUDIO_CACHE_MAX_AGE = 86400
+
+
+def _validate_playback_scope(scope: str) -> str:
+    if scope not in {"source", "master"}:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Playback preference scope not found.")
+    return scope
 
 
 
@@ -273,18 +284,12 @@ def _serve_audio(
     so that browsers always revalidate after a new file is uploaded.
     """
     if storage_backend == "r2":
-        from app.services.r2 import generate_download_url
+        from app.services.r2 import public_url
 
-        url = generate_download_url(file_path)
+        url = public_url(file_path)
         if resolve == "json":
-            resp = JSONResponse({"url": url})
-            resp.headers["Cache-Control"] = (
-                f"private, max-age={_AUDIO_CACHE_MAX_AGE}"
-                if immutable
-                else "private, max-age=0, must-revalidate"
-            )
-            return resp
-        return RedirectResponse(url, status_code=307)
+            return JSONResponse({"url": url})
+        return RedirectResponse(url, status_code=302)
     if resolve == "json":
         return {"url": None}
     return _serve_path(file_path, filename_prefix, immutable=immutable)
@@ -295,7 +300,9 @@ def create_track(
     title: str = Form(...),
     artist: str = Form(...),
     album_id: int = Form(...),
-    bpm: int | None = Form(default=None),
+    bpm: str | None = Form(default=None),
+    original_title: str | None = Form(default=None),
+    original_artist: str | None = Form(default=None),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -316,7 +323,9 @@ def create_track(
         artist=artist,
         album_id=album_id,
         submitter_id=current_user.id,
-        bpm=bpm,
+        bpm=bpm or None,
+        original_title=original_title or None,
+        original_artist=original_artist or None,
         track_number=max_num + 1,
         file_path=file_path,
         duration=duration,
@@ -440,7 +449,9 @@ def confirm_track_upload(
         artist=params.artist,
         album_id=params.album_id,
         submitter_id=current_user.id,
-        bpm=params.bpm,
+        bpm=params.bpm or None,
+        original_title=params.original_title or None,
+        original_artist=params.original_artist or None,
         track_number=max_num + 1,
         file_path=params.object_key,
         storage_backend="r2",
@@ -531,6 +542,13 @@ def confirm_source_version_upload(
     track.storage_backend = "r2"
     track.duration = duration
     track.status = next_status
+    prepare_review_assignments_for_stage_entry(
+        db,
+        album,
+        track,
+        next_status,
+        background_tasks,
+    )
     sv = TrackSourceVersion(
         track_id=track.id,
         workflow_cycle=track.workflow_cycle,
@@ -742,6 +760,76 @@ def get_track(
     return build_track_detail(track, current_user, db)
 
 
+@router.get("/{track_id}/playback-preferences/{scope}", response_model=TrackPlaybackPreferenceRead)
+def get_track_playback_preference(
+    track_id: int,
+    scope: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackPlaybackPreferenceRead:
+    scope = _validate_playback_scope(scope)
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+
+    preference = db.scalar(
+        select(TrackPlaybackPreference).where(
+            TrackPlaybackPreference.track_id == track_id,
+            TrackPlaybackPreference.user_id == current_user.id,
+            TrackPlaybackPreference.scope == scope,
+        )
+    )
+    if preference is None:
+        return TrackPlaybackPreferenceRead(
+            track_id=track_id,
+            user_id=current_user.id,
+            scope=scope,
+            gain_db=0.0,
+            updated_at=None,
+        )
+    return TrackPlaybackPreferenceRead.model_validate(preference)
+
+
+@router.put("/{track_id}/playback-preferences/{scope}", response_model=TrackPlaybackPreferenceRead)
+def upsert_track_playback_preference(
+    track_id: int,
+    scope: str,
+    payload: TrackPlaybackPreferenceUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackPlaybackPreferenceRead:
+    scope = _validate_playback_scope(scope)
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+
+    preference = db.scalar(
+        select(TrackPlaybackPreference).where(
+            TrackPlaybackPreference.track_id == track_id,
+            TrackPlaybackPreference.user_id == current_user.id,
+            TrackPlaybackPreference.scope == scope,
+        )
+    )
+    if preference is None:
+        preference = TrackPlaybackPreference(
+            track_id=track_id,
+            user_id=current_user.id,
+            scope=scope,
+            gain_db=payload.gain_db,
+        )
+        db.add(preference)
+    else:
+        preference.gain_db = payload.gain_db
+
+    db.commit()
+    db.refresh(preference)
+    return TrackPlaybackPreferenceRead.model_validate(preference)
+
+
 @router.patch("/{track_id}/visibility", response_model=TrackRead)
 def set_track_visibility(
     track_id: int,
@@ -764,6 +852,52 @@ def set_track_visibility(
     track.is_public = payload.is_public
     db.commit()
     db.refresh(track)
+    return build_track_read(track, current_user, album, db=db)
+
+
+@router.patch("/{track_id}/metadata", response_model=TrackRead)
+def update_track_metadata(
+    track_id: int,
+    payload: TrackMetadataUpdate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    """Update track metadata (title, artist, bpm, original_title, original_artist).
+
+    Only the track submitter or the album producer may call this endpoint.
+    """
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = db.get(Album, track.album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    if current_user.id not in {track.submitter_id, album.producer_id}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the track submitter or album producer can edit track metadata.",
+        )
+
+    changes: dict[str, dict[str, str | None]] = {}
+    for field in ("title", "artist", "bpm", "original_title", "original_artist"):
+        new_value = getattr(payload, field)
+        if new_value is not None:
+            old_value = getattr(track, field)
+            if new_value != old_value:
+                changes[field] = {"old": old_value, "new": new_value}
+                setattr(track, field, new_value)
+
+    if not changes:
+        return build_track_read(track, current_user, album, db=db)
+
+    log_track_event(
+        db, track, current_user, "metadata_updated",
+        payload={"changes": changes},
+    )
+    db.commit()
+    db.refresh(track)
+    _broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
@@ -910,13 +1044,31 @@ def reassign_reviewer(
     if step is None or step.type != "review":
         raise HTTPException(status_code=409, detail="Track is not in a review stage.")
 
-    if payload.user_id is not None and payload.user_id == track.submitter_id:
+    requested_user_ids: list[int] = []
+    if payload.user_ids is not None:
+        requested_user_ids = payload.user_ids
+    elif payload.user_id is not None:
+        requested_user_ids = [payload.user_id]
+
+    deduped_user_ids: list[int] = []
+    seen: set[int] = set()
+    for uid in requested_user_ids:
+        if uid in seen:
+            continue
+        seen.add(uid)
+        deduped_user_ids.append(uid)
+
+    if track.submitter_id in deduped_user_ids:
         raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
 
-    if payload.user_id is not None:
+    if deduped_user_ids:
         valid_member_ids = get_album_member_ids(db, album.id)
-        if payload.user_id not in valid_member_ids:
-            raise HTTPException(status_code=400, detail="Selected reviewer is not a member of this album.")
+        invalid_ids = [uid for uid in deduped_user_ids if uid not in valid_member_ids]
+        if invalid_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Users {sorted(invalid_ids)} are not members of this album.",
+            )
 
     # Cancel all pending assignments for this stage
     db.execute(
@@ -930,16 +1082,18 @@ def reassign_reviewer(
     )
     track.peer_reviewer_id = None
 
-    if payload.user_id is not None:
-        track.peer_reviewer_id = payload.user_id
-        db.add(StageAssignment(
-            track_id=track_id,
-            stage_id=step.id,
-            user_id=payload.user_id,
-            status="pending",
-            assigned_at=datetime.now(timezone.utc),
-        ))
-        notify(db, [payload.user_id], "reviewer_assigned", "你被指派为评审人",
+    if deduped_user_ids:
+        now = datetime.now(timezone.utc)
+        track.peer_reviewer_id = deduped_user_ids[0]
+        for uid in deduped_user_ids:
+            db.add(StageAssignment(
+                track_id=track_id,
+                stage_id=step.id,
+                user_id=uid,
+                status="pending",
+                assigned_at=now,
+            ))
+        notify(db, deduped_user_ids, "reviewer_assigned", "你被指派为评审人",
                f"你已被指派评审「{track.title}」",
                related_track_id=track.id,
                album_id=track.album_id)
@@ -949,7 +1103,7 @@ def reassign_reviewer(
     log_track_event(
         db, track, current_user,
         "reviewer_reassigned",
-        payload={"stage": step.id, "new_reviewer_id": payload.user_id},
+        payload={"stage": step.id, "new_reviewer_ids": deduped_user_ids},
     )
 
     db.commit()
@@ -1109,6 +1263,13 @@ def upload_source_version(
     track.storage_backend = "local"
     track.duration = duration
     track.status = next_status
+    prepare_review_assignments_for_stage_entry(
+        db,
+        album,
+        track,
+        next_status,
+        background_tasks,
+    )
     source_version = _source_version_create(track, current_user, file_path, duration)
     db.add(source_version)
     log_track_event(

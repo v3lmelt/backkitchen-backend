@@ -2,10 +2,13 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, RedirectResponse
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.config import settings
 from app.database import get_db
@@ -13,8 +16,10 @@ from app.models.album import Album
 from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
+from app.models.issue_audio import IssueAudio
 from app.services.audio import extract_audio_metadata
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueStatus, MarkerType
+from app.models.stage_assignment import StageAssignment
 from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
@@ -59,6 +64,7 @@ AUDIO_EXT_MAP = {
     "audio/ogg": ".ogg",
 }
 MAX_AUDIOS_PER_COMMENT = 3
+MAX_AUDIOS_PER_ISSUE = 3
 
 router = APIRouter(tags=["issues"])
 
@@ -132,7 +138,7 @@ def _effective_issue_phase(issue: Issue, track: Track, album: Album) -> str:
 
 
 def _phase_reviewer_id(issue: Issue, track: Track, album: Album) -> int | None:
-    """Return the reviewer user-id for the issue's phase."""
+    """Return a fallback reviewer user-id for the issue's phase."""
     phase = _effective_issue_phase(issue, track, album)
 
     config = parse_workflow_config(album)
@@ -149,35 +155,84 @@ def _phase_reviewer_id(issue: Issue, track: Track, album: Album) -> int | None:
     return None
 
 
-def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User) -> None:
-    reviewer_id = _phase_reviewer_id(issue, track, album)
-    allowed = {track.submitter_id, reviewer_id, issue.author_id} - {None}
+def _phase_reviewer_ids(issue: Issue, track: Track, album: Album, db: Session) -> set[int]:
+    """Return all reviewer user IDs for the issue's phase.
+
+    For active review steps with StageAssignment records, include every assigned
+    reviewer (pending/completed). Otherwise fall back to role-based resolution.
+    """
+    phase = _effective_issue_phase(issue, track, album)
+    config = parse_workflow_config(album)
+    step = get_current_step(config, track)
+    if step and infer_issue_phase_for_step(step) == phase and step.type == "review":
+        reviewer_ids = set(
+            db.scalars(
+                select(StageAssignment.user_id).where(
+                    StageAssignment.track_id == track.id,
+                    StageAssignment.stage_id == step.id,
+                    StageAssignment.status.in_(["pending", "completed"]),
+                )
+            ).all()
+        )
+        if reviewer_ids:
+            return reviewer_ids
+
+    fallback = _phase_reviewer_id(issue, track, album)
+    return {fallback} if fallback is not None else set()
+
+
+def _ensure_issue_visible_to_user(issue: Issue, track: Track, user: User) -> None:
+    # Pending-discussion issues are hidden from submitters until discussion ends.
+    if user.id == track.submitter_id and issue.status == IssueStatus.PENDING_DISCUSSION:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
+
+
+def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User, db: Session) -> None:
+    reviewer_ids = _phase_reviewer_ids(issue, track, album, db)
+    allowed = {track.submitter_id, issue.author_id} | reviewer_ids
+    allowed.discard(None)
     if user.id not in allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to update this issue.")
 
 
-def _validate_status_transition(issue: Issue, new_status: IssueStatus, track: Track, album: Album, user: User) -> None:
+def _validate_status_transition(
+    issue: Issue,
+    new_status: IssueStatus,
+    track: Track,
+    album: Album,
+    user: User,
+    db: Session,
+) -> None:
     """Enforce role-based status transition rules.
 
-    Submitter may:  open → resolved, open → disagreed
-    Reviewer may:   open → resolved, resolved → open, disagreed → open
+    Submitter may:  open → resolved|disagreed, disagreed → resolved
+    Reviewer may:   open → resolved|pending_discussion
+                   pending_discussion → open|resolved
+                   resolved|disagreed → open
+                   disagreed → resolved|pending_discussion
     """
     old = issue.status
     if old == new_status:
         return
 
     is_submitter = user.id == track.submitter_id
-    reviewer_id = _phase_reviewer_id(issue, track, album)
-    is_reviewer = user.id in {reviewer_id, issue.author_id}
+    reviewer_ids = _phase_reviewer_ids(issue, track, album, db)
+    is_reviewer = user.id in reviewer_ids or user.id == issue.author_id
 
-    # Submitter: open → resolved | disagreed
+    # Submitter actions
     if is_submitter and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.DISAGREED):
         return
-    # Reviewer: open → resolved
-    if is_reviewer and old == IssueStatus.OPEN and new_status == IssueStatus.RESOLVED:
+    if is_submitter and old == IssueStatus.DISAGREED and new_status == IssueStatus.RESOLVED:
         return
-    # Reviewer: reopen from resolved or disagreed
+
+    # Reviewer actions
+    if is_reviewer and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
+        return
+    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status in (IssueStatus.OPEN, IssueStatus.RESOLVED):
+        return
     if is_reviewer and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
+        return
+    if is_reviewer and old == IssueStatus.DISAGREED and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
         return
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot perform this status transition.")
@@ -188,22 +243,109 @@ def _validate_status_transition(issue: Issue, new_status: IssueStatus, track: Tr
     response_model=IssueRead,
     status_code=status.HTTP_201_CREATED,
 )
-def create_issue(
+async def create_issue(
     track_id: int,
-    payload: IssueCreate,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> IssueRead:
+    import json as _json
+
+    from app.schemas.schemas import IssueMarkerCreate
+    from app.models.issue import IssueSeverity as _IssueSeverity
+
+    issue_title: str
+    issue_description: str
+    issue_phase: str
+    severity_enum: _IssueSeverity
+    parsed_markers: list[IssueMarkerCreate]
+    audios: list[StarletteUploadFile] = []
+    audio_object_keys: str | None = None
+    audio_original_filenames: str | None = None
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("application/json"):
+        try:
+            payload = IssueCreate.model_validate(await request.json())
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=jsonable_encoder(exc.errors()),
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid request body.",
+            )
+
+        issue_title = payload.title
+        issue_description = payload.description
+        issue_phase = payload.phase
+        severity_enum = payload.severity
+        parsed_markers = payload.markers
+    else:
+        form = await request.form()
+        title = str(form.get("title") or "").strip()
+        description = str(form.get("description") or "").strip()
+        phase = str(form.get("phase") or "").strip()
+        severity = str(form.get("severity") or "major").strip() or "major"
+        markers_json = str(form.get("markers_json") or "[]")
+
+        if not title or not description or not phase:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="title, description and phase are required.",
+            )
+        issue_title = title
+        issue_description = description
+        issue_phase = phase
+
+        audios = [item for item in form.getlist("audios") if isinstance(item, StarletteUploadFile)]
+        raw_audio_keys = form.get("audio_object_keys")
+        raw_audio_names = form.get("audio_original_filenames")
+        audio_object_keys = str(raw_audio_keys) if raw_audio_keys is not None else None
+        audio_original_filenames = str(raw_audio_names) if raw_audio_names is not None else None
+
+        try:
+            markers_raw = _json.loads(markers_json)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid markers JSON.")
+
+        if not isinstance(markers_raw, list):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="markers must be a JSON array.")
+
+        parsed_markers = []
+        for m in markers_raw:
+            try:
+                parsed_markers.append(IssueMarkerCreate(**m))
+            except Exception:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid marker data.")
+
+        try:
+            severity_enum = _IssueSeverity(severity)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid severity: {severity}")
+
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
     effective_phase = _ensure_custom_issue_permission(
-        track, album, current_user, payload.phase, db,
+        track, album, current_user, issue_phase, db,
     )
+    config = parse_workflow_config(album)
+    current_step = get_current_step(config, track)
+    initial_status = IssueStatus.OPEN
+    if (
+        current_step
+        and current_step.type == "review"
+        and infer_issue_phase_for_step(current_step) == effective_phase
+        and (current_step.required_reviewer_count or 1) > 1
+    ):
+        initial_status = IssueStatus.PENDING_DISCUSSION
 
-    for m in payload.markers:
+    for m in parsed_markers:
         if m.marker_type == MarkerType.RANGE and m.time_end is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -215,8 +357,30 @@ def create_issue(
                 detail="time_end must be greater than time_start.",
             )
 
+    # Validate audio files
+    if len(audios) > MAX_AUDIOS_PER_ISSUE:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"An issue may contain at most {MAX_AUDIOS_PER_ISSUE} audio files.",
+        )
+    for audio_file in audios:
+        if audio_file.content_type not in ALLOWED_AUDIO_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported audio type: {audio_file.content_type}. Allowed: mp3, wav, flac, aac, ogg.",
+            )
+
+    # Parse R2 audio keys if provided
+    r2_audio_keys: list[str] = []
+    r2_audio_names: list[str] = []
+    if audio_object_keys:
+        r2_audio_keys = [k.strip() for k in audio_object_keys.split("\n") if k.strip()]
+        r2_audio_names = [n.strip() for n in (audio_original_filenames or "").split("\n")]
+        while len(r2_audio_names) < len(r2_audio_keys):
+            r2_audio_names.append(Path(r2_audio_keys[len(r2_audio_names)]).name)
+
     source_version_id = None
-    master_delivery_id = None
+    _master_delivery_id = None
     if effective_phase in {IssuePhase.PEER, IssuePhase.PRODUCER, IssuePhase.MASTERING}:
         source_version = current_source_version(track)
         if source_version is None:
@@ -226,7 +390,7 @@ def create_issue(
         delivery = current_master_delivery(track)
         if delivery is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No master delivery available.")
-        master_delivery_id = delivery.id
+        _master_delivery_id = delivery.id
 
     issue = Issue(
         track_id=track_id,
@@ -234,29 +398,74 @@ def create_issue(
         phase=effective_phase,
         workflow_cycle=track.workflow_cycle,
         source_version_id=source_version_id,
-        master_delivery_id=master_delivery_id,
-        title=payload.title,
-        description=payload.description,
-        severity=payload.severity,
+        master_delivery_id=_master_delivery_id,
+        title=issue_title,
+        description=issue_description,
+        severity=severity_enum,
+        status=initial_status,
         markers=[
             IssueMarker(
                 marker_type=m.marker_type,
                 time_start=m.time_start,
                 time_end=m.time_end,
             )
-            for m in payload.markers
+            for m in parsed_markers
         ],
     )
     db.add(issue)
     db.flush()  # assign issue.id before logging
+
+    # Handle direct audio uploads
+    if audios:
+        from app.config import MAX_AUDIO_UPLOAD_SIZE
+
+        issue_audios_dir = settings.get_upload_path() / "issue_audios"
+        issue_audios_dir.mkdir(parents=True, exist_ok=True)
+        for audio_file in audios:
+            ext = AUDIO_EXT_MAP.get(audio_file.content_type or "", ".mp3")
+            filename = f"{uuid.uuid4()}{ext}"
+            file_path = f"issue_audios/{filename}"
+            dest = issue_audios_dir / filename
+            await stream_upload(audio_file, dest, MAX_AUDIO_UPLOAD_SIZE)
+            duration = extract_audio_metadata(dest).duration
+            original_filename = audio_file.filename or filename
+            db.add(IssueAudio(
+                issue_id=issue.id,
+                file_path=file_path,
+                original_filename=original_filename,
+                duration=duration,
+            ))
+
+    # Handle R2 audio attachments
+    if r2_audio_keys:
+        from botocore.exceptions import ClientError
+        from app.services.r2 import download_to_temp
+
+        for key, orig_name in zip(r2_audio_keys, r2_audio_names):
+            try:
+                tmp = download_to_temp(key)
+            except ClientError:
+                raise HTTPException(status_code=400, detail=f"R2 object not found: {key}")
+            try:
+                duration = extract_audio_metadata(tmp).duration
+            finally:
+                tmp.unlink(missing_ok=True)
+            db.add(IssueAudio(
+                issue_id=issue.id,
+                file_path=key,
+                storage_backend="r2",
+                original_filename=orig_name,
+                duration=duration,
+            ))
+
     log_track_event(
         db,
         track,
         current_user,
         "issue_created",
-        payload={"phase": effective_phase, "title": payload.title, "issue_id": issue.id},
+        payload={"phase": effective_phase, "title": issue_title, "issue_id": issue.id},
     )
-    if current_user.id != track.submitter_id:
+    if current_user.id != track.submitter_id and issue.status != IssueStatus.PENDING_DISCUSSION:
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
                related_track_id=track.id, related_issue_id=issue.id,
@@ -281,8 +490,10 @@ def list_issues(
         select(Issue)
         .where(Issue.track_id == track_id)
         .order_by(Issue.created_at)
-        .options(selectinload(Issue.markers))
+        .options(selectinload(Issue.markers), selectinload(Issue.audios))
     ).all())
+    if current_user.id == track.submitter_id:
+        issues = [issue for issue in issues if issue.status != IssueStatus.PENDING_DISCUSSION]
     # Pre-fetch all issue authors
     author_ids = {i.author_id for i in issues}
     users_cache = {u.id: u for u in db.scalars(select(User).where(User.id.in_(author_ids))).all()} if author_ids else {}
@@ -298,7 +509,7 @@ def get_issue(
     issue = db.scalar(
         select(Issue)
         .where(Issue.id == issue_id)
-        .options(selectinload(Issue.markers))
+        .options(selectinload(Issue.markers), selectinload(Issue.audios))
     )
     if issue is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
@@ -306,6 +517,7 @@ def get_issue(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
+    _ensure_issue_visible_to_user(issue, track, current_user)
     return build_issue_detail(issue, db)
 
 
@@ -325,10 +537,11 @@ def update_issue(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = _album_for_track(track, db)
     ensure_track_visibility(track, current_user, db)
-    _ensure_issue_update_permission(issue, track, album, current_user)
+    _ensure_issue_visible_to_user(issue, track, current_user)
+    _ensure_issue_update_permission(issue, track, album, current_user, db)
 
     if payload.status is not None:
-        _validate_status_transition(issue, payload.status, track, album, current_user)
+        _validate_status_transition(issue, payload.status, track, album, current_user, db)
 
     old_status = issue.status
     update_data = payload.model_dump(exclude_unset=True, exclude={"status_note"})
@@ -345,6 +558,23 @@ def update_issue(
                f"「{issue.title}」被标记为 {new_status.value}",
                related_issue_id=issue.id,
                background_tasks=background_tasks, album_id=track.album_id if track else None)
+
+    if (
+        old_status == IssueStatus.PENDING_DISCUSSION
+        and new_status != IssueStatus.PENDING_DISCUSSION
+        and current_user.id != track.submitter_id
+    ):
+        notify(
+            db,
+            [track.submitter_id],
+            "new_issue",
+            f"新问题：{issue.title}",
+            f"「{track.title}」上有新的审核问题",
+            related_track_id=track.id,
+            related_issue_id=issue.id,
+            background_tasks=background_tasks,
+            album_id=track.album_id,
+        )
 
     log_track_event(
         db,
@@ -394,6 +624,7 @@ async def add_comment(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
+    _ensure_issue_visible_to_user(issue, track, current_user)
 
     if not effective_content and not images and not audios and not r2_audio_keys:
         raise HTTPException(
@@ -520,6 +751,7 @@ def request_comment_audio_upload(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
+    _ensure_issue_visible_to_user(issue, track, current_user)
 
     if len(params.files) > MAX_AUDIOS_PER_COMMENT:
         raise HTTPException(status_code=422, detail=f"A comment may contain at most {MAX_AUDIOS_PER_COMMENT} audio files.")
@@ -566,8 +798,9 @@ def batch_update_issues(
     ).all())
 
     for issue in issues:
-        _ensure_issue_update_permission(issue, track, album, current_user)
-        _validate_status_transition(issue, payload.status, track, album, current_user)
+        _ensure_issue_visible_to_user(issue, track, current_user)
+        _ensure_issue_update_permission(issue, track, album, current_user, db)
+        _validate_status_transition(issue, payload.status, track, album, current_user, db)
         old_status = issue.status
         issue.status = payload.status
         if payload.status_note and old_status != payload.status:
@@ -582,6 +815,54 @@ def batch_update_issues(
     for issue in issues:
         db.refresh(issue)
     return [build_issue_read(issue, db) for issue in issues]
+
+
+# ── issue audio file serving ─────────────────────────────────────────────────
+
+
+@router.get("/api/issue-audios/{audio_id}/file")
+def serve_issue_audio(
+    audio_id: int,
+    resolve: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    bearer_user: User | None = Depends(get_current_user_optional),
+    token_user: User | None = Depends(get_user_from_token_param),
+):
+    user = bearer_user or token_user
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    audio = db.get(IssueAudio, audio_id)
+    if audio is None:
+        raise HTTPException(status_code=404, detail="Issue audio not found.")
+
+    issue = db.get(Issue, audio.issue_id)
+    track = db.get(Track, issue.track_id) if issue else None
+    if not track:
+        raise HTTPException(status_code=404, detail="Associated track not found.")
+    ensure_track_visibility(track, user, db)
+    _ensure_issue_visible_to_user(issue, track, user)
+
+    if audio.storage_backend == "r2":
+        from app.services.r2 import public_url
+
+        url = public_url(audio.file_path)
+        if resolve == "json":
+            return {"url": url}
+        return RedirectResponse(url, status_code=302)
+
+    if resolve == "json":
+        return {"url": None}
+
+    file_path = settings.get_upload_path() / audio.file_path
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Audio file missing from disk.")
+    mime_map = {
+        ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+        ".ogg": "audio/ogg", ".aac": "audio/aac", ".m4a": "audio/mp4",
+    }
+    media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
+    return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)
 
 
 # ── comment audio file serving ───────────────────────────────────────────────
@@ -609,14 +890,15 @@ def serve_comment_audio(
     if not track:
         raise HTTPException(status_code=404, detail="Associated track not found.")
     ensure_track_visibility(track, user, db)
+    _ensure_issue_visible_to_user(issue, track, user)
 
     if audio.storage_backend == "r2":
-        from app.services.r2 import generate_download_url
+        from app.services.r2 import public_url
 
-        url = generate_download_url(audio.file_path)
+        url = public_url(audio.file_path)
         if resolve == "json":
             return {"url": url}
-        return RedirectResponse(url, status_code=307)
+        return RedirectResponse(url, status_code=302)
 
     if resolve == "json":
         return {"url": None}
