@@ -11,6 +11,7 @@ from app.models.comment_image import CommentImage
 from app.models.invitation import Invitation
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.issue_audio import IssueAudio
+from app.models.issue_image import IssueImage
 from app.models.master_delivery import MasterDelivery
 from app.models.notification import Notification
 from app.models.password_reset import PasswordResetToken
@@ -42,6 +43,7 @@ __all__ = [
     "IssueSeverity",
     "IssueStatus",
     "IssueAudio",
+    "IssueImage",
     "IssueMarker",
     "MarkerType",
     "MasterDelivery",

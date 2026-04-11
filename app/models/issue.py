@@ -88,6 +88,10 @@ class Issue(Base):
         "IssueAudio", back_populates="issue", cascade="all, delete-orphan",
         order_by="IssueAudio.id",
     )
+    images: Mapped[list["IssueImage"]] = relationship(  # noqa: F821
+        "IssueImage", back_populates="issue", cascade="all, delete-orphan",
+        order_by="IssueImage.id",
+    )
 
     def __repr__(self) -> str:
         return f"<Issue(id={self.id}, title='{self.title}', status='{self.status}')>"
