@@ -52,6 +52,7 @@ def notify(
             body=body,
             related_track_id=related_track_id,
             related_issue_id=related_issue_id,
+            related_album_id=album_id,
         ))
 
     # Dispatch webhook if configured for this album

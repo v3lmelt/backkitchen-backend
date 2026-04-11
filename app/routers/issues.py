@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,7 @@ from app.database import get_db
 from app.models.album import Album
 from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
+from app.models.edit_history import EditHistory
 from app.models.comment_image import CommentImage
 from app.models.issue_audio import IssueAudio
 from app.services.audio import extract_audio_metadata
@@ -24,7 +26,7 @@ from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
 from app.schemas.schemas import (
-    CommentRead, CommentUpdate, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead,
+    CommentRead, CommentUpdate, EditHistoryRead, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead,
     PresignedCommentAudioResponse, PresignedUploadResponse, RequestCommentAudioUploadParams,
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
@@ -1028,7 +1030,15 @@ def update_comment(
     if comment.is_status_note:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Status notes cannot be edited.")
 
-    comment.content = payload.content
+    if comment.content != payload.content:
+        db.add(EditHistory(
+            entity_type="comment",
+            entity_id=comment.id,
+            old_content=comment.content,
+            edited_by_id=current_user.id,
+        ))
+        comment.content = payload.content
+        comment.edited_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(comment)
     return build_comment_read(comment, db)
@@ -1050,3 +1060,26 @@ def delete_comment(
 
     db.delete(comment)
     db.commit()
+
+
+@router.get("/api/comments/{comment_id}/history", response_model=list[EditHistoryRead])
+def get_comment_history(
+    comment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[EditHistoryRead]:
+    comment = db.get(Comment, comment_id)
+    if comment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
+    issue = db.get(Issue, comment.issue_id)
+    if issue:
+        track = db.get(Track, issue.track_id)
+        if track:
+            ensure_track_visibility(track, current_user, db)
+
+    histories = list(db.scalars(
+        select(EditHistory)
+        .where(EditHistory.entity_type == "comment", EditHistory.entity_id == comment_id)
+        .order_by(EditHistory.created_at.desc())
+    ).all())
+    return [EditHistoryRead.model_validate(h) for h in histories]

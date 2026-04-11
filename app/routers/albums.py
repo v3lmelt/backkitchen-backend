@@ -23,7 +23,7 @@ from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.notifications import notify
-from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema
+from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema, WorkflowEventRead
 from app.security import get_current_user, require_producer
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
@@ -125,6 +125,7 @@ def create_album(
 def list_albums(
     include_archived: bool = Query(False),
     archived_only: bool = Query(False),
+    search: str | None = Query(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[AlbumRead]:
@@ -133,6 +134,9 @@ def list_albums(
         stmt = stmt.where(Album.archived_at.isnot(None))
     elif not include_archived:
         stmt = stmt.where(Album.archived_at.is_(None))
+    if search:
+        pattern = f"%{search}%"
+        stmt = stmt.where(Album.title.ilike(pattern) | Album.description.ilike(pattern))
     albums = list(db.scalars(stmt).all())
     members_by_album = get_all_album_member_ids(db)
     visible: list[AlbumRead] = []
@@ -217,6 +221,68 @@ def update_album_team(
     db.commit()
     db.refresh(album)
     return _album_to_read(album, db)
+
+
+@router.delete("/{album_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_album_member(
+    album_id: int,
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    if current_user.id != album.producer_id:
+        raise HTTPException(status_code=403, detail="Only the album producer can remove members.")
+    if user_id == album.producer_id:
+        raise HTTPException(status_code=400, detail="Cannot remove the album producer.")
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot remove yourself. Use the leave endpoint instead.")
+
+    member = db.execute(
+        select(AlbumMember).where(
+            AlbumMember.album_id == album_id,
+            AlbumMember.user_id == user_id,
+        )
+    ).scalar_one_or_none()
+    if member is None:
+        raise HTTPException(status_code=404, detail="Member not found in this album.")
+
+    if album.mastering_engineer_id == user_id:
+        album.mastering_engineer_id = None
+    db.delete(member)
+    db.commit()
+
+
+@router.post("/{album_id}/leave", status_code=status.HTTP_204_NO_CONTENT)
+def leave_album(
+    album_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    if current_user.id == album.producer_id:
+        raise HTTPException(
+            status_code=400,
+            detail="The album producer cannot leave. Transfer ownership or archive the album instead.",
+        )
+
+    member = db.execute(
+        select(AlbumMember).where(
+            AlbumMember.album_id == album_id,
+            AlbumMember.user_id == current_user.id,
+        )
+    ).scalar_one_or_none()
+    if member is None:
+        raise HTTPException(status_code=404, detail="You are not a member of this album.")
+
+    if album.mastering_engineer_id == current_user.id:
+        album.mastering_engineer_id = None
+    db.delete(member)
+    db.commit()
 
 
 @router.patch("/{album_id}/deadlines", response_model=AlbumRead)
@@ -382,6 +448,34 @@ def get_album_stats(
         deadline=album.deadline,
         overdue_track_count=overdue_count,
     )
+
+
+@router.get("/{album_id}/activity", response_model=list[WorkflowEventRead])
+def get_album_activity(
+    album_id: int,
+    event_type: str | None = Query(default=None),
+    limit: int = Query(default=30, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[WorkflowEventRead]:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    ensure_album_visibility(album, current_user, db)
+
+    stmt = select(WorkflowEvent).where(WorkflowEvent.album_id == album_id)
+    if event_type:
+        stmt = stmt.where(WorkflowEvent.event_type == event_type)
+    stmt = stmt.order_by(WorkflowEvent.created_at.desc()).offset(offset).limit(limit)
+
+    events = list(db.scalars(stmt).all())
+    actor_ids = {e.actor_user_id for e in events if e.actor_user_id}
+    actors_by_id: dict[int, User] = {}
+    if actor_ids:
+        actors_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(actor_ids))).all()}
+
+    return [build_event_read(e, db, users_cache=actors_by_id) for e in events]
 
 
 @router.get("/{album_id}/tracks", response_model=list[TrackRead])

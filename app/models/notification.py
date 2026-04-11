@@ -16,6 +16,7 @@ class Notification(Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     related_track_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tracks.id", ondelete="SET NULL"), nullable=True)
     related_issue_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("issues.id", ondelete="SET NULL"), nullable=True)
+    related_album_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("albums.id", ondelete="SET NULL"), nullable=True)
     is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc), nullable=False)
 
