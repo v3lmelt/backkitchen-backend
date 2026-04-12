@@ -623,8 +623,15 @@ def get_allowed_action_names(
     transitions = get_allowed_transitions(config, track, user, album, db=db)
     actions = [t.decision for t in transitions]
 
-    # For revision steps, add the implicit "upload_revision" action
     step = get_current_step(config, track)
+
+    # Review steps without active assignments → producer should assign reviewers
+    if step and step.type == "review" and db is not None:
+        review_assignments = _review_active_assignments(db, track.id, step.id)
+        if not review_assignments and user.id == album.producer_id:
+            actions.append("assign_reviewer")
+
+    # For revision steps, add the implicit "upload_revision" action
     if step and step.type == "revision":
         is_submitter = track.submitter_id == user.id
         # For mastering engineer revision steps
@@ -650,6 +657,18 @@ def get_allowed_action_names(
                 )
                 if unconfirmed:
                     actions.append("confirm_delivery")
+
+    # Final review: add approve_final for producer/submitter who haven't approved yet
+    if step and step.ui_variant == "final_review" and db is not None:
+        from app.workflow import current_master_delivery
+        delivery = current_master_delivery(track)
+        if delivery:
+            is_producer = user.id == album.producer_id
+            is_submitter = user.id == track.submitter_id
+            if (is_producer and not delivery.producer_approved_at) or (
+                is_submitter and not delivery.submitter_approved_at
+            ):
+                actions.append("approve_final")
 
     # For rejected + resubmittable tracks
     if (
