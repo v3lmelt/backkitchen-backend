@@ -377,7 +377,7 @@ class IssueBase(BaseModel):
 class IssueCreate(IssueBase):
     phase: str
     markers: list[IssueMarkerCreate] = []
-    visibility: str = "public"  # "public" → open, "internal" → pending_discussion
+    visibility: str = "public"  # "public" → open, "internal" → pending_discussion (reviewer-only)
 
 
 class IssueUpdate(BaseModel):
@@ -454,6 +454,7 @@ class CommentRead(BaseModel):
     issue_id: int
     author_id: int
     content: str
+    visibility: str = "public"
     is_status_note: bool = False
     old_status: str | None = None
     new_status: str | None = None
@@ -565,6 +566,7 @@ class DiscussionRead(BaseModel):
     id: int
     track_id: int
     author_id: int
+    visibility: str = "public"
     content: str
     created_at: datetime
     edited_at: datetime | None = None

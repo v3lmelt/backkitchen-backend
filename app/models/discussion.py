@@ -16,6 +16,7 @@ class TrackDiscussion(Base):
     author_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("users.id"), nullable=False
     )
+    visibility: Mapped[str] = mapped_column(String(20), nullable=False, default="public", server_default="public")
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False

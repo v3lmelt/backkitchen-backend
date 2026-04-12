@@ -35,12 +35,13 @@ from app.security import get_current_user, get_current_user_optional, get_user_f
 from app.services.upload import stream_upload
 from app.workflow import (
     build_comment_read,
-    build_issue_detail,
+    build_issue_detail_for_user,
     build_issue_read,
     current_master_delivery,
     current_source_version,
     ensure_track_visibility,
     log_track_event,
+    peer_identity_anonymize_user_ids_for_viewer,
 )
 from app.workflow_engine import (
     get_steps,
@@ -73,6 +74,21 @@ MAX_AUDIOS_PER_ISSUE = 3
 MAX_IMAGES_PER_ISSUE = 3
 
 router = APIRouter(tags=["issues"])
+
+
+def _is_submitter_hidden_issue_status(status_value: IssueStatus) -> bool:
+    return status_value in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}
+
+
+def _peer_anonymize_user_ids(
+    db: Session,
+    track: Track,
+    viewer: User,
+) -> set[int]:
+    album = db.get(Album, track.album_id)
+    if album is None:
+        return set()
+    return peer_identity_anonymize_user_ids_for_viewer(db, track, album, viewer)
 
 
 def _album_for_track(track: Track, db: Session) -> Album:
@@ -206,8 +222,16 @@ def _phase_reviewer_ids(issue: Issue, track: Track, album: Album, db: Session) -
 
 def _ensure_issue_visible_to_user(issue: Issue, track: Track, user: User) -> None:
     # Pending-discussion issues are hidden from submitters until discussion ends.
-    if user.id == track.submitter_id and issue.status == IssueStatus.PENDING_DISCUSSION:
+    if user.id == track.submitter_id and _is_submitter_hidden_issue_status(issue.status):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
+
+
+def _ensure_comment_visible_to_user(comment: Comment, track: Track, user: User, db: Session) -> None:
+    album = db.get(Album, track.album_id)
+    if album and user.id == track.submitter_id and user.id == album.producer_id:
+        return
+    if comment.visibility == "internal" and user.id == track.submitter_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
 
 
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User, db: Session) -> None:
@@ -230,9 +254,10 @@ def _validate_status_transition(
 
     Submitter may:  open → resolved|disagreed, disagreed → resolved
     Reviewer may:   open → resolved|pending_discussion
-                   pending_discussion → open|resolved
+                   pending_discussion → open|resolved|internal_resolved
+                   internal_resolved → open|resolved
                    resolved|disagreed → open
-                   disagreed → resolved|pending_discussion
+                   disagreed → resolved|pending_discussion|internal_resolved
     """
     old = issue.status
     if old == new_status:
@@ -251,18 +276,34 @@ def _validate_status_transition(
     # Reviewer actions
     if is_reviewer and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
         return
-    # Only the issue creator can publish an internal issue (pending_discussion → open)
+    # Only the issue creator can publish an internal issue (internal state -> open)
     is_creator = user.id == issue.author_id
-    if is_creator and old == IssueStatus.PENDING_DISCUSSION and new_status in (IssueStatus.OPEN, IssueStatus.RESOLVED):
+    if is_creator and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status in (
+        IssueStatus.OPEN,
+        IssueStatus.RESOLVED,
+        IssueStatus.INTERNAL_RESOLVED,
+    ):
         return
-    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.RESOLVED:
+    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status in (IssueStatus.RESOLVED, IssueStatus.INTERNAL_RESOLVED):
+        return
+    if is_reviewer and old == IssueStatus.INTERNAL_RESOLVED and new_status == IssueStatus.RESOLVED:
         return
     if is_reviewer and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
         return
-    if is_reviewer and old == IssueStatus.DISAGREED and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
+    if is_reviewer and old == IssueStatus.DISAGREED and new_status in (
+        IssueStatus.RESOLVED,
+        IssueStatus.PENDING_DISCUSSION,
+        IssueStatus.INTERNAL_RESOLVED,
+    ):
         return
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot perform this status transition.")
+
+
+def _status_note_visibility(old_status: IssueStatus, new_status: IssueStatus) -> str:
+    if _is_submitter_hidden_issue_status(old_status) or _is_submitter_hidden_issue_status(new_status):
+        return "internal"
+    return "public"
 
 
 @router.post(
@@ -364,6 +405,9 @@ async def create_issue(
         except ValueError:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid severity: {severity}")
 
+    if issue_visibility not in {"public", "internal"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="visibility must be 'public' or 'internal'.")
+
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
@@ -382,15 +426,16 @@ async def create_issue(
                 StageAssignment.status.in_(["pending", "completed"]),
             )
         ) or 0
-    defaults_to_internal = (
+    reviewer_scope_count = max(current_step.required_reviewer_count or 1, active_assignment_count) if current_step else 1
+    multi_reviewer_context = (
         current_step is not None
         and current_step.type == "review"
         and infer_issue_phase_for_step(current_step) == effective_phase
-        and max(current_step.required_reviewer_count or 1, active_assignment_count) > 1
+        and reviewer_scope_count > 1
     )
     initial_status = (
         IssueStatus.PENDING_DISCUSSION
-        if issue_visibility == "internal" or (defaults_to_internal and not visibility_provided)
+        if multi_reviewer_context and (issue_visibility == "internal" or not visibility_provided)
         else IssueStatus.OPEN
     )
 
@@ -541,7 +586,7 @@ async def create_issue(
         "issue_created",
         payload={"phase": effective_phase, "title": issue_title, "issue_id": issue.id},
     )
-    if current_user.id != track.submitter_id and issue.status != IssueStatus.PENDING_DISCUSSION:
+    if current_user.id != track.submitter_id and not _is_submitter_hidden_issue_status(issue.status):
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
                related_track_id=track.id, related_issue_id=issue.id,
@@ -549,7 +594,14 @@ async def create_issue(
     db.commit()
     db.refresh(issue)
     broadcast_track_updated(background_tasks, track.id)
-    return build_issue_read(issue, db)
+    anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    return build_issue_read(
+        issue,
+        db,
+        anonymize_user_ids=anonymize_user_ids,
+        viewer_user=current_user,
+        viewer_track=track,
+    )
 
 
 @router.get("/api/tracks/{track_id}/issues", response_model=list[IssueRead])
@@ -570,11 +622,22 @@ def list_issues(
         .options(selectinload(Issue.markers), selectinload(Issue.audios), selectinload(Issue.images))
     ).all())
     if current_user.id == track.submitter_id:
-        issues = [issue for issue in issues if issue.status != IssueStatus.PENDING_DISCUSSION]
+        issues = [issue for issue in issues if not _is_submitter_hidden_issue_status(issue.status)]
     # Pre-fetch all issue authors
     author_ids = {i.author_id for i in issues}
     users_cache = {u.id: u for u in db.scalars(select(User).where(User.id.in_(author_ids))).all()} if author_ids else {}
-    return [build_issue_read(issue, db, users_cache=users_cache) for issue in issues]
+    anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    return [
+        build_issue_read(
+            issue,
+            db,
+            users_cache=users_cache,
+            anonymize_user_ids=anonymize_user_ids,
+            viewer_user=current_user,
+            viewer_track=track,
+        )
+        for issue in issues
+    ]
 
 
 @router.get("/api/issues/{issue_id}", response_model=IssueDetail)
@@ -595,7 +658,7 @@ def get_issue(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
     _ensure_issue_visible_to_user(issue, track, current_user)
-    return build_issue_detail(issue, db)
+    return build_issue_detail_for_user(issue, track, current_user, db)
 
 
 @router.patch("/api/issues/{issue_id}", response_model=IssueDetail)
@@ -723,6 +786,7 @@ async def update_issue(
             issue_id=issue.id,
             author_id=current_user.id,
             content=effective_note,
+            visibility=_status_note_visibility(old_status, new_status),
             is_status_note=True,
             old_status=old_status.value,
             new_status=new_status.value,
@@ -769,8 +833,8 @@ async def update_issue(
                background_tasks=background_tasks, album_id=track.album_id if track else None)
 
     if (
-        old_status == IssueStatus.PENDING_DISCUSSION
-        and new_status != IssueStatus.PENDING_DISCUSSION
+        _is_submitter_hidden_issue_status(old_status)
+        and not _is_submitter_hidden_issue_status(new_status)
         and current_user.id != track.submitter_id
     ):
         notify(
@@ -795,7 +859,7 @@ async def update_issue(
     db.commit()
     db.refresh(issue)
     broadcast_track_updated(background_tasks, track.id)
-    return build_issue_detail(issue, db)
+    return build_issue_detail_for_user(issue, track, current_user, db)
 
 
 @router.post(
@@ -861,7 +925,8 @@ async def add_comment(
                 detail=f"Unsupported audio type: {audio_file.content_type}. Allowed: mp3, wav, flac, aac, ogg.",
             )
 
-    comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content or '')
+    comment_visibility = "internal" if _is_submitter_hidden_issue_status(issue.status) else "public"
+    comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content or '', visibility=comment_visibility)
     db.add(comment)
     db.flush()
 
@@ -938,7 +1003,11 @@ async def add_comment(
     db.commit()
     db.refresh(comment)
     broadcast_track_updated(background_tasks, track.id)
-    return build_comment_read(comment, db)
+    album = db.get(Album, track.album_id)
+    anonymize_user_ids: set[int] = set()
+    if album is not None:
+        anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+    return build_comment_read(comment, db, anonymize_user_ids=anonymize_user_ids)
 
 
 # ── R2 presigned upload for comment audio ────────────────────────────────────
@@ -1020,6 +1089,7 @@ def batch_update_issues(
                 issue_id=issue.id,
                 author_id=current_user.id,
                 content=payload.status_note,
+                visibility=_status_note_visibility(old_status, payload.status),
                 is_status_note=True,
                 old_status=old_status.value,
                 new_status=payload.status.value,
@@ -1029,7 +1099,17 @@ def batch_update_issues(
     broadcast_track_updated(background_tasks, track.id)
     for issue in issues:
         db.refresh(issue)
-    return [build_issue_read(issue, db) for issue in issues]
+    anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    return [
+        build_issue_read(
+            issue,
+            db,
+            anonymize_user_ids=anonymize_user_ids,
+            viewer_user=current_user,
+            viewer_track=track,
+        )
+        for issue in issues
+    ]
 
 
 # ── issue audio file serving ─────────────────────────────────────────────────
@@ -1106,6 +1186,7 @@ def serve_comment_audio(
         raise HTTPException(status_code=404, detail="Associated track not found.")
     ensure_track_visibility(track, user, db)
     _ensure_issue_visible_to_user(issue, track, user)
+    _ensure_comment_visible_to_user(comment, track, user, db)
 
     if audio.storage_backend == "r2":
         from app.services.r2 import public_url
@@ -1144,6 +1225,12 @@ def update_comment(
     comment = db.get(Comment, comment_id)
     if comment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
+    issue = db.get(Issue, comment.issue_id)
+    track = db.get(Track, issue.track_id) if issue else None
+    if track is not None:
+        ensure_track_visibility(track, current_user, db)
+        _ensure_issue_visible_to_user(issue, track, current_user)
+        _ensure_comment_visible_to_user(comment, track, current_user, db)
     if comment.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can edit this comment.")
     if comment.is_status_note:
@@ -1163,7 +1250,10 @@ def update_comment(
     issue = db.get(Issue, comment.issue_id)
     if issue is not None:
         broadcast_track_updated(background_tasks, issue.track_id)
-    return build_comment_read(comment, db)
+    anonymize_user_ids: set[int] = set()
+    if track is not None:
+        anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    return build_comment_read(comment, db, anonymize_user_ids=anonymize_user_ids)
 
 
 @router.delete("/api/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1176,6 +1266,12 @@ def delete_comment(
     comment = db.get(Comment, comment_id)
     if comment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
+    issue = db.get(Issue, comment.issue_id)
+    track = db.get(Track, issue.track_id) if issue else None
+    if track is not None:
+        ensure_track_visibility(track, current_user, db)
+        _ensure_issue_visible_to_user(issue, track, current_user)
+        _ensure_comment_visible_to_user(comment, track, current_user, db)
     if comment.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can delete this comment.")
     if comment.is_status_note:
@@ -1203,6 +1299,8 @@ def get_comment_history(
         track = db.get(Track, issue.track_id)
         if track:
             ensure_track_visibility(track, current_user, db)
+            _ensure_issue_visible_to_user(issue, track, current_user)
+            _ensure_comment_visible_to_user(comment, track, current_user, db)
 
     histories = list(db.scalars(
         select(EditHistory)

@@ -131,6 +131,102 @@ def should_anonymize_track(track: Track, user: User, album: Album) -> bool:
     return True
 
 
+def _is_identity_privileged_viewer(user: User, album: Album) -> bool:
+    return user.id in (album.producer_id, album.mastering_engineer_id)
+
+
+def _hash_user_id(user_id: int) -> str:
+    h = 2166136261
+    for char in str(user_id):
+        h ^= ord(char)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return f"{h:08X}"[:6]
+
+
+def _masked_user_read(user_read: UserRead) -> UserRead:
+    token = _hash_user_id(user_read.id)
+    return user_read.model_copy(
+        update={
+            "username": f"anon_{token.lower()}",
+            "display_name": f"#{token}",
+            "email": None,
+        }
+    )
+
+
+def _is_peer_identity_anonymous_phase(track: Track, album: Album) -> bool:
+    if track.status in {"peer_review", "peer_revision"}:
+        return True
+
+    try:
+        from app.workflow_engine import (
+            get_current_step,
+            get_step_by_id,
+            get_steps,
+            infer_issue_phase_for_step,
+            parse_workflow_config,
+        )
+
+        config = parse_workflow_config(album)
+        step = get_current_step(config, track)
+        if step is None:
+            return False
+        if infer_issue_phase_for_step(step) == "peer":
+            return True
+        if step.type == "revision" and step.return_to:
+            return_to = get_step_by_id(get_steps(config), step.return_to)
+            return bool(return_to and infer_issue_phase_for_step(return_to) == "peer")
+    except Exception:
+        return False
+
+    return False
+
+
+def _peer_identity_user_ids(db: Session, track: Track, album: Album) -> set[int]:
+    user_ids = {track.submitter_id, track.peer_reviewer_id}
+
+    stage_ids: list[str] = []
+    try:
+        from app.workflow_engine import get_steps, infer_issue_phase_for_step, parse_workflow_config
+
+        config = parse_workflow_config(album)
+        stage_ids = [
+            step.id
+            for step in get_steps(config)
+            if step.type == "review" and infer_issue_phase_for_step(step) == "peer"
+        ]
+    except Exception:
+        stage_ids = []
+
+    if not stage_ids:
+        stage_ids = ["peer_review"]
+
+    reviewer_ids = db.scalars(
+        select(StageAssignment.user_id).where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id.in_(stage_ids),
+        )
+    ).all()
+    user_ids.update(reviewer_ids)
+    user_ids.discard(None)
+    return {uid for uid in user_ids if uid is not None}
+
+
+def peer_identity_anonymize_user_ids_for_viewer(
+    db: Session,
+    track: Track,
+    album: Album,
+    viewer: User,
+) -> set[int]:
+    if _is_identity_privileged_viewer(viewer, album):
+        return set()
+    if not _is_peer_identity_anonymous_phase(track, album):
+        return set()
+    user_ids = _peer_identity_user_ids(db, track, album)
+    user_ids.discard(viewer.id)
+    return user_ids
+
+
 def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
     album = db.get(Album, track.album_id)
     if album is None:
@@ -199,6 +295,24 @@ def _user_read(user: User | None) -> UserRead | None:
     return UserRead.model_validate(user)
 
 
+def _mask_user_read_if_needed(
+    user_read: UserRead | None,
+    anonymize_user_ids: set[int] | None,
+) -> UserRead | None:
+    if user_read is None:
+        return None
+    if anonymize_user_ids and user_read.id in anonymize_user_ids:
+        return _masked_user_read(user_read)
+    return user_read
+
+
+def mask_user_read_if_needed(
+    user_read: UserRead | None,
+    anonymize_user_ids: set[int] | None,
+) -> UserRead | None:
+    return _mask_user_read_if_needed(user_read, anonymize_user_ids)
+
+
 def _source_version_read(version: TrackSourceVersion | None) -> TrackSourceVersionRead | None:
     if version is None:
         return None
@@ -212,14 +326,38 @@ def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead
 
 
 def _issue_visible_to_user(issue: Issue, track: Track, user: User) -> bool:
-    return not (user.id == track.submitter_id and issue.status == IssueStatus.PENDING_DISCUSSION)
+    return not (
+        user.id == track.submitter_id
+        and issue.status in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}
+    )
+
+
+def _comment_visible_to_user(comment: Comment, issue: Issue, track: Track, user: User) -> bool:
+    album = track.album
+    if album is not None and user.id == track.submitter_id and user.id == album.producer_id:
+        return _issue_visible_to_user(issue, track, user)
+    if comment.visibility == "internal" and user.id == track.submitter_id:
+        return False
+    return _issue_visible_to_user(issue, track, user)
 
 
 def _issue_unresolved(issue: Issue) -> bool:
-    return issue.status != IssueStatus.RESOLVED
+    return issue.status in {
+        IssueStatus.OPEN,
+        IssueStatus.PENDING_DISCUSSION,
+        IssueStatus.DISAGREED,
+    }
 
 
-def build_track_read(track: Track, user: User, album: Album, db: Session | None = None, *, anonymize: bool = False) -> TrackRead:
+def build_track_read(
+    track: Track,
+    user: User,
+    album: Album,
+    db: Session | None = None,
+    *,
+    anonymize: bool = False,
+    anonymize_user_ids: set[int] | None = None,
+) -> TrackRead:
     from app.workflow_engine import (
         get_allowed_transitions,
         get_current_step,
@@ -229,6 +367,8 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
 
     current_source = current_source_version(track)
     current_master = current_master_delivery(track)
+    if anonymize_user_ids is None and db is not None:
+        anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, user)
     visible_issues = [issue for issue in track.issues if _issue_visible_to_user(issue, track, user)]
     open_issue_count = sum(1 for issue in visible_issues if _issue_unresolved(issue))
 
@@ -285,8 +425,16 @@ def build_track_read(track: Track, user: User, album: Album, db: Session | None 
         updated_at=track.updated_at,
         issue_count=len(visible_issues),
         open_issue_count=open_issue_count,
-        submitter=None if anonymize else _user_read(track.submitter),
-        peer_reviewer=None if anonymize else _user_read(track.peer_reviewer),
+        submitter=(
+            None
+            if anonymize
+            else _mask_user_read_if_needed(_user_read(track.submitter), anonymize_user_ids)
+        ),
+        peer_reviewer=(
+            None
+            if anonymize
+            else _mask_user_read_if_needed(_user_read(track.peer_reviewer), anonymize_user_ids)
+        ),
         current_source_version=_source_version_read(current_source),
         current_master_delivery=_master_delivery_read(current_master),
         allowed_actions=track_allowed_actions(track, user, album, _wf_config=wf_config, db=db),
@@ -301,6 +449,10 @@ def build_issue_read(
     db: Session,
     source_version_numbers: dict[int, int] | None = None,
     users_cache: dict[int, User] | None = None,
+    anonymize_user_ids: set[int] | None = None,
+    *,
+    viewer_user: User | None = None,
+    viewer_track: Track | None = None,
 ) -> IssueRead:
     if users_cache is not None:
         author = users_cache.get(issue.author_id) or db.get(User, issue.author_id)
@@ -334,6 +486,15 @@ def build_issue_read(
         )
         for image in issue.images
     ]
+    if viewer_user is not None and viewer_track is not None:
+        visible_comment_count = sum(
+            1
+            for comment in issue.comments
+            if _comment_visible_to_user(comment, issue, viewer_track, viewer_user)
+        )
+    else:
+        visible_comment_count = len(issue.comments)
+
     return IssueRead(
         id=issue.id,
         track_id=issue.track_id,
@@ -352,12 +513,17 @@ def build_issue_read(
         images=images,
         created_at=issue.created_at,
         updated_at=issue.updated_at,
-        comment_count=len(issue.comments),
-        author=_user_read(author),
+        comment_count=visible_comment_count,
+        author=_mask_user_read_if_needed(_user_read(author), anonymize_user_ids),
     )
 
 
-def build_comment_read(comment: Comment, db: Session, users_cache: dict[int, User] | None = None) -> CommentRead:
+def build_comment_read(
+    comment: Comment,
+    db: Session,
+    users_cache: dict[int, User] | None = None,
+    anonymize_user_ids: set[int] | None = None,
+) -> CommentRead:
     if users_cache and comment.author_id in users_cache:
         author = users_cache[comment.author_id]
     else:
@@ -387,22 +553,70 @@ def build_comment_read(comment: Comment, db: Session, users_cache: dict[int, Use
         issue_id=comment.issue_id,
         author_id=comment.author_id,
         content=comment.content,
+        visibility=comment.visibility,
         is_status_note=comment.is_status_note,
         old_status=comment.old_status,
         new_status=comment.new_status,
         created_at=comment.created_at,
-        author=_user_read(author),
+        author=_mask_user_read_if_needed(_user_read(author), anonymize_user_ids),
         images=images,
         audios=audios,
     )
 
 
-def build_issue_detail(issue: Issue, db: Session) -> IssueDetail:
+def build_issue_detail(
+    issue: Issue,
+    db: Session,
+    *,
+    anonymize_user_ids: set[int] | None = None,
+) -> IssueDetail:
     # Pre-fetch users for this issue's comments
     user_ids = {issue.author_id} | {c.author_id for c in issue.comments}
     users_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(user_ids))).all()}
-    issue_read = build_issue_read(issue, db, users_cache=users_by_id)
-    comments = [build_comment_read(comment, db, users_cache=users_by_id) for comment in issue.comments]
+    issue_read = build_issue_read(
+        issue,
+        db,
+        users_cache=users_by_id,
+        anonymize_user_ids=anonymize_user_ids,
+    )
+    comments = [
+        build_comment_read(
+            comment,
+            db,
+            users_cache=users_by_id,
+            anonymize_user_ids=anonymize_user_ids,
+        )
+        for comment in issue.comments
+    ]
+    return IssueDetail(**issue_read.model_dump(), comments=comments)
+
+
+def build_issue_detail_for_user(issue: Issue, track: Track, user: User, db: Session) -> IssueDetail:
+    album = db.get(Album, track.album_id)
+    anonymize_user_ids: set[int] = set()
+    if album is not None:
+        anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, user)
+
+    user_ids = {issue.author_id} | {c.author_id for c in issue.comments}
+    users_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(user_ids))).all()}
+    issue_read = build_issue_read(
+        issue,
+        db,
+        users_cache=users_by_id,
+        anonymize_user_ids=anonymize_user_ids,
+        viewer_user=user,
+        viewer_track=track,
+    )
+    comments = [
+        build_comment_read(
+            comment,
+            db,
+            users_cache=users_by_id,
+            anonymize_user_ids=anonymize_user_ids,
+        )
+        for comment in issue.comments
+        if _comment_visible_to_user(comment, issue, track, user)
+    ]
     return IssueDetail(**issue_read.model_dump(), comments=comments)
 
 
@@ -410,7 +624,12 @@ def build_checklist_read(item: ChecklistItem) -> ChecklistItemRead:
     return ChecklistItemRead.model_validate(item)
 
 
-def build_event_read(event: WorkflowEvent, db: Session, users_cache: dict[int, User] | None = None) -> WorkflowEventRead:
+def build_event_read(
+    event: WorkflowEvent,
+    db: Session,
+    users_cache: dict[int, User] | None = None,
+    anonymize_user_ids: set[int] | None = None,
+) -> WorkflowEventRead:
     if users_cache and event.actor_user_id and event.actor_user_id in users_cache:
         actor = users_cache[event.actor_user_id]
     elif event.actor_user_id:
@@ -425,7 +644,7 @@ def build_event_read(event: WorkflowEvent, db: Session, users_cache: dict[int, U
         to_status=event.to_status,
         payload=payload,
         created_at=event.created_at,
-        actor=_user_read(actor),
+        actor=_mask_user_read_if_needed(_user_read(actor), anonymize_user_ids),
     )
 
 
@@ -471,9 +690,18 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         users_by_id = {u.id: u for u in fetched}
 
     source_version_numbers = {version.id: version.version_number for version in track.source_versions}
+    anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, user)
     visible_issues = [issue for issue in track.issues if _issue_visible_to_user(issue, track, user)]
     issues = [
-        build_issue_read(issue, db, source_version_numbers, users_by_id)
+        build_issue_read(
+            issue,
+            db,
+            source_version_numbers,
+            users_by_id,
+            anonymize_user_ids,
+            viewer_user=user,
+            viewer_track=track,
+        )
         for issue in sorted(visible_issues, key=lambda row: (row.created_at, row.id))
     ]
     current_source = current_source_version(track)
@@ -482,15 +710,27 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         for item in track.checklist_items
         if current_source is None or item.source_version_id == current_source.id
     ]
-    events = [build_event_read(event, db, users_by_id) for event in track.workflow_events]
+    events = [
+        build_event_read(
+            event,
+            db,
+            users_by_id,
+            anonymize_user_ids,
+        )
+        for event in track.workflow_events
+    ]
     discussions = [
         DiscussionRead(
             id=d.id,
             track_id=d.track_id,
             author_id=d.author_id,
+            visibility=d.visibility,
             content=d.content,
             created_at=d.created_at,
-            author=_user_read(users_by_id.get(d.author_id) or d.author),
+            author=_mask_user_read_if_needed(
+                _user_read(users_by_id.get(d.author_id) or d.author),
+                anonymize_user_ids,
+            ),
             images=[
                 DiscussionImageRead(
                     id=img.id,
@@ -502,6 +742,11 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             ],
         )
         for d in track.discussions
+        if not (
+            d.visibility == "internal"
+            and user.id == track.submitter_id
+            and user.id != album.producer_id
+        )
     ]
     # Mirror the defensive try/except used in `_album_to_read`: a stored
     # config that no longer passes the current validator must not crash the
@@ -521,7 +766,14 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
 
     anonymize = should_anonymize_track(track, user, album)
     return TrackDetailResponse(
-        track=build_track_read(track, user, album, db=db, anonymize=anonymize),
+        track=build_track_read(
+            track,
+            user,
+            album,
+            db=db,
+            anonymize=anonymize,
+            anonymize_user_ids=anonymize_user_ids,
+        ),
         issues=issues,
         checklist_items=checklist_items,
         events=events,
