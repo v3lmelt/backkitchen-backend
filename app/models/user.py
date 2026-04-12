@@ -22,6 +22,7 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
+    feishu_contact: Mapped[str | None] = mapped_column(String(100), nullable=True, default=None)
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, default=None, index=True
     )

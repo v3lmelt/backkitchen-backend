@@ -17,13 +17,23 @@ async def _deliver_webhook_background(
     payload: dict,
     album_id: int,
     event_type: str,
+    webhook_type: str = "generic",
+    webhook_secret: str = "",
+    feishu_app_id: str = "",
+    feishu_app_secret: str = "",
+    mention_users: list[dict] | None = None,
 ) -> None:
     """Background-task wrapper that opens its own DB session for logging."""
     from app.database import SessionLocal
 
     db = SessionLocal()
     try:
-        await post_webhook(url, payload, db=db, album_id=album_id, event_type=event_type)
+        await post_webhook(
+            url, payload, db=db, album_id=album_id, event_type=event_type,
+            webhook_type=webhook_type, webhook_secret=webhook_secret,
+            feishu_app_id=feishu_app_id, feishu_app_secret=feishu_app_secret,
+            mention_users=mention_users,
+        )
     finally:
         db.close()
 
@@ -39,6 +49,7 @@ def notify(
     *,
     background_tasks: BackgroundTasks | None = None,
     album_id: int | None = None,
+    webhook_context: dict | None = None,
 ) -> None:
     """Create in-app notifications and optionally dispatch webhook."""
     seen: set[int] = set()
@@ -63,7 +74,8 @@ def notify(
     if background_tasks and album_id:
         _try_dispatch_webhook(
             db, background_tasks, album_id, type, title, body,
-            related_track_id, related_issue_id,
+            related_track_id, related_issue_id, list(seen),
+            webhook_context=webhook_context,
         )
 
 
@@ -76,6 +88,8 @@ def _try_dispatch_webhook(
     body: str,
     track_id: int | None,
     issue_id: int | None,
+    notified_user_ids: list[int] | None = None,
+    webhook_context: dict | None = None,
 ) -> None:
     album = db.get(Album, album_id)
     if not album or not album.webhook_config:
@@ -91,9 +105,62 @@ def _try_dispatch_webhook(
     if allowed_events and event_type not in allowed_events:
         return
 
+    # Build the set of *involved* users (notified + actor) for filter checks
+    ctx = dict(webhook_context) if webhook_context else {}
+    involved_ids: set[int] = set(notified_user_ids or [])
+    actor_id = ctx.get("actor_id")
+    if actor_id:
+        involved_ids.add(actor_id)
+
+    # User filter: only dispatch if event involves at least one watched user
+    filter_uids = config.get("filter_user_ids")
+    if filter_uids:
+        if not involved_ids or not (involved_ids & set(filter_uids)):
+            return
+
+    # Enrich context with data we can look up here
+    ctx.setdefault("album_title", album.title)
+    if track_id:
+        from app.models.track import Track
+        track = db.get(Track, track_id)
+        if track:
+            ctx.setdefault("track_title", track.title)
+            from app.config import settings
+            ctx.setdefault("track_url", f"{settings.FRONTEND_URL}/tracks/{track_id}")
+
+    # Look up notified user display names for action_required_by
+    if notified_user_ids and "action_required_by" not in ctx:
+        from app.models.user import User
+        users = db.query(User.display_name).filter(User.id.in_(notified_user_ids)).all()
+        if users:
+            ctx["action_required_by"] = "、".join(u.display_name for u in users)
+
     payload = build_webhook_payload(
         event_type, title, body,
         track_id=track_id, album_id=album_id, issue_id=issue_id,
+        context=ctx,
     )
     url = config["url"]
-    background_tasks.add_task(_deliver_webhook_background, url, payload, album_id, event_type)
+    wh_type = config.get("type", "generic")
+    wh_secret = config.get("secret", "")
+
+    # Collect Feishu contact info for @mentions
+    mention_users: list[dict] = []
+    if wh_type == "feishu" and notified_user_ids:
+        from app.models.user import User
+        feishu_users = db.query(User).filter(
+            User.id.in_(notified_user_ids),
+            User.feishu_contact.isnot(None),
+        ).all()
+        mention_users = [
+            {"name": u.display_name, "feishu_contact": u.feishu_contact}
+            for u in feishu_users
+        ]
+
+    background_tasks.add_task(
+        _deliver_webhook_background, url, payload, album_id, event_type,
+        webhook_type=wh_type, webhook_secret=wh_secret,
+        feishu_app_id=config.get("app_id", ""),
+        feishu_app_secret=config.get("app_secret", ""),
+        mention_users=mention_users,
+    )

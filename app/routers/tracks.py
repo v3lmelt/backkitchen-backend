@@ -22,6 +22,8 @@ from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.schemas.schemas import (
     AssignReviewerRequest,
+    AuthorNotesUpdate,
+    MasteringNotesUpdate,
     ReassignReviewerRequest,
     TrackPlaybackPreferenceRead,
     TrackPlaybackPreferenceUpdate,
@@ -126,7 +128,10 @@ def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float 
     return str(dest), meta.duration
 
 
-def _source_version_create(track: Track, user: User, file_path: str, duration: float | None) -> TrackSourceVersion:
+def _source_version_create(
+    track: Track, user: User, file_path: str, duration: float | None,
+    *, revision_notes: str | None = None,
+) -> TrackSourceVersion:
     return TrackSourceVersion(
         track_id=track.id,
         workflow_cycle=track.workflow_cycle,
@@ -134,6 +139,7 @@ def _source_version_create(track: Track, user: User, file_path: str, duration: f
         file_path=file_path,
         duration=duration,
         uploaded_by_id=user.id,
+        revision_notes=revision_notes,
     )
 
 
@@ -164,7 +170,8 @@ def _handle_delivery_status(
                "母带文件待确认",
                f"「{track.title}」的母带文件已上传，请确认后继续流程",
                related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
+               background_tasks=background_tasks, album_id=track.album_id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
         return
     track.status = next_status
     log_track_event(
@@ -174,7 +181,8 @@ def _handle_delivery_status(
     )
     notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "母带文件已上传",
            f"「{track.title}」母带文件已上传，等待审核", related_track_id=track.id,
-           background_tasks=background_tasks, album_id=track.album_id)
+           background_tasks=background_tasks, album_id=track.album_id,
+           webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
 
 def _track_list_item(
@@ -373,6 +381,7 @@ def create_track(
     bpm: str | None = Form(default=None),
     original_title: str | None = Form(default=None),
     original_artist: str | None = Form(default=None),
+    author_notes: str | None = Form(default=None),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -396,6 +405,7 @@ def create_track(
         bpm=bpm or None,
         original_title=original_title or None,
         original_artist=original_artist or None,
+        author_notes=author_notes or None,
         track_number=max_num + 1,
         file_path=file_path,
         duration=duration,
@@ -522,6 +532,7 @@ def confirm_track_upload(
         bpm=params.bpm or None,
         original_title=params.original_title or None,
         original_artist=params.original_artist or None,
+        author_notes=params.author_notes or None,
         track_number=max_num + 1,
         file_path=params.object_key,
         storage_backend="r2",
@@ -627,6 +638,7 @@ def confirm_source_version_upload(
         storage_backend="r2",
         duration=duration,
         uploaded_by_id=current_user.id,
+        revision_notes=params.revision_notes or None,
     )
     db.add(sv)
     log_track_event(
@@ -739,7 +751,8 @@ def confirm_delivery(
     )
     notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "母带文件已确认",
            f"「{track.title}」母带文件已确认，等待审核", related_track_id=track.id,
-           background_tasks=background_tasks, album_id=track.album_id)
+           background_tasks=background_tasks, album_id=track.album_id,
+           webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
     db.commit()
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)
@@ -989,6 +1002,56 @@ def update_track_metadata(
     return build_track_read(track, current_user, album, db=db)
 
 
+@router.patch("/{track_id}/author-notes", response_model=TrackRead)
+def update_author_notes(
+    track_id: int,
+    payload: AuthorNotesUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    """Update the author's submission notes. Only the track submitter may call this."""
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = db.get(Album, track.album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    if track.submitter_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the track author can update author notes.",
+        )
+    track.author_notes = payload.author_notes
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album, db=db)
+
+
+@router.patch("/{track_id}/mastering-notes", response_model=TrackRead)
+def update_mastering_notes(
+    track_id: int,
+    payload: MasteringNotesUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    """Update the mastering notes. Only the track submitter may call this."""
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = db.get(Album, track.album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    if track.submitter_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the track author can update mastering notes.",
+        )
+    track.mastering_notes = payload.mastering_notes
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album, db=db)
+
+
 @router.post("/{track_id}/workflow/transition", response_model=TrackRead)
 def workflow_transition(
     track_id: int,
@@ -1016,6 +1079,7 @@ def workflow_transition(
 def assign_reviewer(
     track_id: int,
     payload: AssignReviewerRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[StageAssignmentRead]:
@@ -1078,7 +1142,9 @@ def assign_reviewer(
         notify(db, [sa.user_id], "reviewer_assigned", "你被指派为评审人",
                f"你已被指派评审「{track.title}」",
                related_track_id=track.id,
-               album_id=track.album_id)
+               background_tasks=background_tasks,
+               album_id=track.album_id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
     db.commit()
     for sa in created:
@@ -1216,7 +1282,9 @@ def reassign_reviewer(
             notify(db, newly_assigned, "reviewer_assigned", "你被指派为评审人",
                    f"你已被指派评审「{track.title}」",
                    related_track_id=track.id,
-                   album_id=track.album_id)
+                   background_tasks=background_tasks,
+                   album_id=track.album_id,
+                   webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
     else:
         assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
 
@@ -1267,12 +1335,14 @@ def create_reopen_request(
         requested_by_id=current_user.id,
         target_stage_id=payload.target_stage_id,
         reason=payload.reason,
+        mastering_notes=payload.mastering_notes or None,
         status="pending",
     )
     db.add(req)
     notify(db, [album.producer_id], "reopen_request", "请求重新开启曲目",
            f"{current_user.display_name} 请求将「{track.title}」重新开启。",
-           related_track_id=track.id, background_tasks=background_tasks, album_id=track.album_id)
+           related_track_id=track.id, background_tasks=background_tasks, album_id=track.album_id,
+           webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
     db.commit()
     db.refresh(req)
     return ReopenRequestRead.model_validate(req)
@@ -1333,14 +1403,18 @@ def decide_reopen_request(
     req.decided_at = datetime.now(timezone.utc)
 
     if payload.decision == "approve":
+        if req.mastering_notes:
+            track.mastering_notes = req.mastering_notes
         execute_reopen(db, album, track, current_user, req.target_stage_id, background_tasks)
         notify(db, [req.requested_by_id], "reopen_approved", "重新开启已批准",
                f"「{track.title}」的重新开启请求已获批准。",
-               related_track_id=track.id, background_tasks=background_tasks, album_id=track.album_id)
+               related_track_id=track.id, background_tasks=background_tasks, album_id=track.album_id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
     else:
         notify(db, [req.requested_by_id], "reopen_rejected", "重新开启已拒绝",
                f"「{track.title}」的重新开启请求已被拒绝。",
-               related_track_id=track.id, background_tasks=background_tasks, album_id=track.album_id)
+               related_track_id=track.id, background_tasks=background_tasks, album_id=track.album_id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
     db.commit()
     db.refresh(req)
@@ -1352,6 +1426,7 @@ def upload_source_version(
     track_id: int,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    revision_notes: str | None = Form(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -1390,7 +1465,7 @@ def upload_source_version(
         next_status,
         background_tasks,
     )
-    source_version = _source_version_create(track, current_user, file_path, duration)
+    source_version = _source_version_create(track, current_user, file_path, duration, revision_notes=revision_notes or None)
     db.add(source_version)
     log_track_event(
         db,
@@ -1487,7 +1562,8 @@ def approve_final_review(
     if track.status == TrackStatus.COMPLETED:
         notify(db, [track.submitter_id, album.mastering_engineer_id], "track_status_changed",
                "曲目已完成！", f"「{track.title}」已完成所有审核流程！", related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id)
+               background_tasks=background_tasks, album_id=track.album_id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name, "to_step": "已完成"})
         # Schedule old source versions for cleanup
         expiry = now + timedelta(days=settings.OLD_VERSION_RETENTION_DAYS)
         for sv in track.source_versions:
@@ -1521,7 +1597,8 @@ def archive_track(
     log_track_event(db, track, current_user, "track_archived", payload={"previous_status": track.status})
     notify(db, [track.submitter_id], "track_archived", "曲目已归档",
            f"「{track.title}」已被制作人归档", related_track_id=track.id,
-           background_tasks=background_tasks, album_id=track.album_id)
+           background_tasks=background_tasks, album_id=track.album_id,
+           webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
@@ -1546,7 +1623,8 @@ def restore_track(
     log_track_event(db, track, current_user, "track_restored")
     notify(db, [track.submitter_id], "track_restored", "曲目已恢复",
            f"「{track.title}」已被制作人恢复", related_track_id=track.id,
-           background_tasks=background_tasks, album_id=track.album_id)
+           background_tasks=background_tasks, album_id=track.album_id,
+           webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)

@@ -33,6 +33,7 @@ class UserRead(UserBase):
     email: str | None = None
     email_verified: bool = False
     is_admin: bool = False
+    feishu_contact: str | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -47,6 +48,7 @@ class AdminUserUpdate(BaseModel):
 class UserUpdateProfile(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=100)
     email: str | None = Field(default=None, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    feishu_contact: str | None = Field(default=None, max_length=100)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -257,6 +259,7 @@ class TrackSourceVersionRead(BaseModel):
     file_path: str
     duration: float | None = None
     uploaded_by_id: int | None = None
+    revision_notes: str | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -283,6 +286,7 @@ class TrackBase(BaseModel):
     bpm: str | None = Field(default=None, max_length=100)
     original_title: str | None = Field(default=None, max_length=200)
     original_artist: str | None = Field(default=None, max_length=200)
+    author_notes: str | None = Field(default=None, max_length=5000)
 
 
 class TrackMetadataUpdate(BaseModel):
@@ -291,6 +295,14 @@ class TrackMetadataUpdate(BaseModel):
     bpm: str | None = Field(default=None, max_length=100)
     original_title: str | None = Field(default=None, max_length=200)
     original_artist: str | None = Field(default=None, max_length=200)
+
+
+class AuthorNotesUpdate(BaseModel):
+    author_notes: str | None = Field(default=None, max_length=5000)
+
+
+class MasteringNotesUpdate(BaseModel):
+    mastering_notes: str | None = Field(default=None, max_length=5000)
 
 
 class TrackOrderUpdate(BaseModel):
@@ -313,6 +325,8 @@ class TrackRead(TrackBase):
     peer_reviewer_id: int | None = None
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
+    author_notes: str | None = None
+    mastering_notes: str | None = None
     is_public: bool = False
     created_at: datetime
     updated_at: datetime
@@ -600,6 +614,11 @@ class WebhookConfig(BaseModel):
     url: str = ""
     enabled: bool = False
     events: list[str] = []
+    type: str = "generic"
+    secret: str = ""
+    app_id: str = ""
+    app_secret: str = ""
+    filter_user_ids: list[int] = []
 
 
 class WebhookDeliveryRead(BaseModel):
@@ -791,6 +810,7 @@ class ReassignReviewerRequest(BaseModel):
 class ReopenRequestCreate(BaseModel):
     target_stage_id: str = Field(..., min_length=1, max_length=50)
     reason: str = Field(..., min_length=1, max_length=2000)
+    mastering_notes: str | None = Field(default=None, max_length=5000)
 
 
 class DirectReopenRequest(BaseModel):
@@ -807,6 +827,7 @@ class ReopenRequestRead(BaseModel):
     requested_by_id: int
     target_stage_id: str
     reason: str
+    mastering_notes: str | None = None
     status: str
     decided_by_id: int | None = None
     created_at: datetime
@@ -862,6 +883,7 @@ class RequestTrackUploadParams(RequestUploadParams):
     bpm: str | None = None
     original_title: str | None = None
     original_artist: str | None = None
+    author_notes: str | None = Field(default=None, max_length=5000)
 
 
 class PresignedUploadResponse(BaseModel):
@@ -875,6 +897,7 @@ class ConfirmUploadParams(BaseModel):
     upload_id: str
     object_key: str
     duration: float | None = None
+    revision_notes: str | None = Field(default=None, max_length=5000)
 
 
 class ConfirmTrackUploadParams(ConfirmUploadParams):
@@ -884,6 +907,7 @@ class ConfirmTrackUploadParams(ConfirmUploadParams):
     bpm: str | None = None
     original_title: str | None = None
     original_artist: str | None = None
+    author_notes: str | None = Field(default=None, max_length=5000)
 
 
 class RequestCommentAudioUploadParams(BaseModel):

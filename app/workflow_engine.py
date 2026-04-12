@@ -919,7 +919,7 @@ def execute_transition(
         payload={"step": step.id, "decision": decision, "target": target},
     )
 
-    _notify_transition(db, album, track, step, target, steps, background_tasks)
+    _notify_transition(db, album, track, step, target, steps, background_tasks, actor=user)
 
 
 def execute_revision_upload(
@@ -1199,6 +1199,7 @@ def execute_reopen(
             related_track_id=track.id,
             background_tasks=background_tasks,
             album_id=track.album_id,
+            webhook_context={"actor_id": actor.id, "actor_name": actor.display_name, "to_step": target_label},
         )
 
 
@@ -1239,9 +1240,19 @@ def _notify_transition(
     target: str,
     steps: list[StepDef],
     background_tasks: BackgroundTasks,
+    actor: "User | None" = None,
 ) -> None:
     """Send a notification when a track transitions between steps."""
+    from_label = _step_label_zh(from_step)
+    actor_name = actor.display_name if actor else None
+    actor_id = actor.id if actor else None
+
     if target in SPECIAL_TARGETS:
+        target_labels = {
+            "__completed": "已完成",
+            "__rejected": "已拒绝",
+            "__rejected_resubmittable": "已退回",
+        }
         target_title, target_body = {
             "__completed": ("曲目已完成", f"「{track.title}」已通过所有审核。"),
             "__rejected": ("曲目已被拒绝", f"「{track.title}」已被拒绝。"),
@@ -1259,6 +1270,12 @@ def _notify_transition(
             related_track_id=track.id,
             background_tasks=background_tasks,
             album_id=track.album_id,
+            webhook_context={
+                "actor_id": actor_id,
+                "actor_name": actor_name,
+                "from_step": from_label,
+                "to_step": target_labels.get(target, target),
+            },
         )
         return
 
@@ -1271,8 +1288,8 @@ def _notify_transition(
         target_step.assignee_user_id
         or resolve_assignee(album, track, target_step.assignee_role)
     )
+    target_label = _step_label_zh(target_step)
     if assignee_id:
-        target_label = _step_label_zh(target_step)
         notify(
             db,
             [assignee_id],
@@ -1282,4 +1299,10 @@ def _notify_transition(
             related_track_id=track.id,
             background_tasks=background_tasks,
             album_id=track.album_id,
+            webhook_context={
+                "actor_id": actor_id,
+                "actor_name": actor_name,
+                "from_step": from_label,
+                "to_step": target_label,
+            },
         )
