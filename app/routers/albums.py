@@ -627,7 +627,13 @@ async def test_webhook(
     if not config.get("url"):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No webhook URL configured.")
     payload = build_webhook_payload("test", "Webhook Test", f"Test from album: {album.title}", album_id=album.id)
-    success = await post_webhook(config["url"], payload, db=db, album_id=album.id, event_type="test")
+    success = await post_webhook(
+        config["url"], payload, db=db, album_id=album.id, event_type="test",
+        webhook_type=config.get("type", "generic"),
+        webhook_secret=config.get("secret", ""),
+        feishu_app_id=config.get("app_id", ""),
+        feishu_app_secret=config.get("app_secret", ""),
+    )
     return {"success": success}
 
 

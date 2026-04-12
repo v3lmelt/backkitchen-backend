@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 import httpx
 from sqlalchemy.orm import Session
 
+from app.services.webhook_adapters import adapt_payload
+
 logger = logging.getLogger(__name__)
 
 _BLOCKED_NETWORKS = [
@@ -50,11 +52,21 @@ async def post_webhook(
     db: Session | None = None,
     album_id: int | None = None,
     event_type: str = "unknown",
+    webhook_type: str = "generic",
+    webhook_secret: str = "",
+    feishu_app_id: str = "",
+    feishu_app_secret: str = "",
+    mention_users: list[dict] | None = None,
 ) -> bool:
     """Send webhook and optionally persist a delivery record.
 
     Pass ``db`` and ``album_id`` to record the delivery. Omitting them keeps
     the old behaviour (no persistence).
+
+    ``webhook_type`` selects the payload adapter (e.g. "generic", "feishu").
+    ``webhook_secret`` is forwarded to the adapter for signing if needed.
+    ``mention_users`` is a list of ``{"name": ..., "feishu_contact": ...}``
+    dicts; contacts are resolved to open_ids for the Feishu adapter.
     """
     status_code: int | None = None
     error_detail: str | None = None
@@ -68,11 +80,30 @@ async def post_webhook(
         _persist_delivery(db, album_id, event_type, url, success, status_code, error_detail)
         return False
 
+    # Resolve Feishu @mentions
+    resolved_mentions: list[dict] = []
+    if webhook_type == "feishu" and mention_users and feishu_app_id and feishu_app_secret:
+        from app.services.feishu import resolve_open_ids
+
+        contacts = [u["feishu_contact"] for u in mention_users if u.get("feishu_contact")]
+        if contacts:
+            mapping = await resolve_open_ids(feishu_app_id, feishu_app_secret, contacts)
+            resolved_mentions = [
+                {"name": u["name"], "open_id": mapping[u["feishu_contact"]]}
+                for u in mention_users
+                if u.get("feishu_contact") and u["feishu_contact"] in mapping
+            ]
+
+    adapted = adapt_payload(
+        payload, webhook_type=webhook_type, secret=webhook_secret,
+        resolved_mentions=resolved_mentions,
+    )
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 url,
-                json=payload,
+                json=adapted,
                 headers={"Content-Type": "application/json"},
             )
             status_code = resp.status_code
@@ -141,8 +172,9 @@ def build_webhook_payload(
     track_id: int | None = None,
     album_id: int | None = None,
     issue_id: int | None = None,
+    context: dict | None = None,
 ) -> dict:
-    return {
+    payload: dict = {
         "event": event,
         "title": title,
         "body": body,
@@ -151,3 +183,6 @@ def build_webhook_payload(
         "issue_id": issue_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if context:
+        payload["context"] = context
+    return payload

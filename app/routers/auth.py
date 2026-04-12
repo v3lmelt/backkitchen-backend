@@ -248,6 +248,9 @@ def update_me(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email is already registered.")
         current_user.email = payload.email
         changed = True
+    if payload.feishu_contact is not None:
+        current_user.feishu_contact = payload.feishu_contact or None
+        changed = True
     if changed:
         db.commit()
         db.refresh(current_user)
