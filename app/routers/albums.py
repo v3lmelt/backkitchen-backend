@@ -27,7 +27,7 @@ from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataU
 from app.security import get_current_user, require_producer
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
-from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed
+from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed, peer_identity_anonymize_user_ids_for_viewer
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
@@ -418,6 +418,12 @@ def get_album_stats(
     if actor_ids:
         actors_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(actor_ids))).all()}
 
+    anonymize_user_ids: set[int] = set()
+    for track in db.scalars(select(Track).where(Track.album_id == album_id)).all():
+        anonymize_user_ids.update(
+            peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+        )
+
     overdue_count = 0
     if album.phase_deadlines:
         deadlines = json.loads(album.phase_deadlines)
@@ -444,7 +450,15 @@ def get_album_stats(
         total_tracks=total_tracks,
         by_status=by_status,
         open_issues=open_issues,
-        recent_events=[build_event_read(e, db, users_cache=actors_by_id) for e in recent_events],
+        recent_events=[
+            build_event_read(
+                e,
+                db,
+                users_cache=actors_by_id,
+                anonymize_user_ids=anonymize_user_ids,
+            )
+            for e in recent_events
+        ],
         deadline=album.deadline,
         overdue_track_count=overdue_count,
     )
@@ -475,7 +489,21 @@ def get_album_activity(
     if actor_ids:
         actors_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(actor_ids))).all()}
 
-    return [build_event_read(e, db, users_cache=actors_by_id) for e in events]
+    anonymize_user_ids: set[int] = set()
+    for track in db.scalars(select(Track).where(Track.album_id == album_id)).all():
+        anonymize_user_ids.update(
+            peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+        )
+
+    return [
+        build_event_read(
+            e,
+            db,
+            users_cache=actors_by_id,
+            anonymize_user_ids=anonymize_user_ids,
+        )
+        for e in events
+    ]
 
 
 @router.get("/{album_id}/tracks", response_model=list[TrackRead])
@@ -504,7 +532,7 @@ def list_album_tracks(
         select(Track).where(*filters)
         .order_by(Track.track_number.asc().nulls_last(), Track.id)
     ).all())
-    return [build_track_read(track, current_user, album) for track in tracks]
+    return [build_track_read(track, current_user, album, db=db) for track in tracks]
 
 
 @router.get("/{album_id}/archived-tracks", response_model=list[TrackRead])
@@ -527,7 +555,7 @@ def list_archived_tracks(
         )
         .order_by(Track.archived_at.desc())
     ).all())
-    return [build_track_read(track, current_user, album) for track in tracks]
+    return [build_track_read(track, current_user, album, db=db) for track in tracks]
 
 
 @router.patch("/{album_id}/track-order", response_model=list[TrackRead])
@@ -552,7 +580,7 @@ def reorder_tracks(
     for t in tracks:
         db.refresh(t)
     ordered = sorted(tracks, key=lambda x: (x.track_number is None, x.track_number or 0, x.id))
-    return [build_track_read(t, current_user, album) for t in ordered]
+    return [build_track_read(t, current_user, album, db=db) for t in ordered]
 
 
 @router.get("/{album_id}/webhook", response_model=WebhookConfig)

@@ -67,6 +67,8 @@ from app.workflow import (
     get_all_album_member_ids,
     get_album_member_ids,
     log_track_event,
+    mask_user_read_if_needed,
+    peer_identity_anonymize_user_ids_for_viewer,
     should_anonymize_track,
 )
 
@@ -184,7 +186,13 @@ def _track_list_item(
     anonymize: bool = False,
 ) -> TrackListItem:
     return TrackListItem(
-        **build_track_read(track, user, album, db=db, anonymize=anonymize).model_dump(),
+        **_track_read_with_identity_mask(
+            track,
+            user,
+            album,
+            db,
+            anonymize=anonymize,
+        ).model_dump(),
         album_title=album.title,
     )
 
@@ -198,6 +206,25 @@ def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
         seen.add(uid)
         deduped.append(uid)
     return deduped
+
+
+def _track_read_with_identity_mask(
+    track: Track,
+    viewer: User,
+    album: Album,
+    db: Session,
+    *,
+    anonymize: bool = False,
+) -> TrackRead:
+    anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, viewer)
+    return build_track_read(
+        track,
+        viewer,
+        album,
+        db=db,
+        anonymize=anonymize,
+        anonymize_user_ids=anonymize_user_ids,
+    )
 
 
 def _validate_manual_reviewer_selection(
@@ -610,7 +637,7 @@ def confirm_source_version_upload(
     db.commit()
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.post("/{track_id}/master-deliveries/request-upload", response_model=PresignedUploadResponse)
@@ -1075,7 +1102,17 @@ def list_assignments(
         .options(selectinload(StageAssignment.user))
         .order_by(StageAssignment.assigned_at.desc())
     ).all()
-    return [StageAssignmentRead.model_validate(a) for a in assignments]
+    album = db.get(Album, track.album_id)
+    anonymize_user_ids: set[int] = set()
+    if album is not None:
+        anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+
+    result: list[StageAssignmentRead] = []
+    for assignment in assignments:
+        item = StageAssignmentRead.model_validate(assignment)
+        item.user = mask_user_read_if_needed(item.user, anonymize_user_ids)
+        result.append(item)
+    return result
 
 
 @router.post("/{track_id}/reassign-reviewer", response_model=TrackRead)
@@ -1367,7 +1404,7 @@ def upload_source_version(
     db.commit()
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.post("/{track_id}/master-deliveries", response_model=TrackRead)
@@ -1459,7 +1496,7 @@ def approve_final_review(
     db.commit()
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
+    return build_track_read(track, current_user, album, db=db)
 
 
 from app.services.cleanup import cleanup_files, collect_track_files
@@ -1487,7 +1524,7 @@ def archive_track(
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
-    return build_track_read(track, current_user, album)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.post("/{track_id}/restore", response_model=TrackRead)
@@ -1512,7 +1549,7 @@ def restore_track(
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
-    return build_track_read(track, current_user, album)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.delete("/{track_id}", status_code=status.HTTP_204_NO_CONTENT)
