@@ -83,6 +83,8 @@ class Track(Base):
     )
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None, index=True)
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    author_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mastering_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     album: Mapped["Album"] = relationship("Album", back_populates="tracks")  # noqa: F821
     submitter: Mapped["User | None"] = relationship(  # noqa: F821
