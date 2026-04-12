@@ -254,8 +254,8 @@ def _validate_status_transition(
 
     Submitter may:  open → resolved|disagreed, disagreed → resolved
     Reviewer may:   open → resolved|pending_discussion
-                   pending_discussion → open|resolved|internal_resolved
-                   internal_resolved → open|resolved
+                   pending_discussion → open|internal_resolved
+                   internal_resolved → open
                    resolved|disagreed → open
                    disagreed → resolved|pending_discussion|internal_resolved
     """
@@ -280,13 +280,12 @@ def _validate_status_transition(
     is_creator = user.id == issue.author_id
     if is_creator and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status in (
         IssueStatus.OPEN,
-        IssueStatus.RESOLVED,
         IssueStatus.INTERNAL_RESOLVED,
     ):
         return
-    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status in (IssueStatus.RESOLVED, IssueStatus.INTERNAL_RESOLVED):
+    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.INTERNAL_RESOLVED:
         return
-    if is_reviewer and old == IssueStatus.INTERNAL_RESOLVED and new_status == IssueStatus.RESOLVED:
+    if is_reviewer and old == IssueStatus.INTERNAL_RESOLVED and new_status == IssueStatus.OPEN:
         return
     if is_reviewer and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
         return
