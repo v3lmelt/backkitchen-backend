@@ -11,12 +11,14 @@ import time
 
 # Event type → Feishu card header color
 _FEISHU_COLOR_MAP: dict[str, str] = {
+    "track_submitted": "green",
     "track_status_changed": "orange",
     "new_issue": "red",
     "issue_status_changed": "yellow",
     "new_comment": "blue",
     "new_discussion": "blue",
     "reviewer_assigned": "turquoise",
+    "reviewer_reassigned": "turquoise",
     "track_archived": "grey",
     "track_restored": "green",
     "track_reopened": "violet",
