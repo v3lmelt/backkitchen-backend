@@ -175,8 +175,55 @@ def _handle_delivery_status(
            background_tasks=background_tasks, album_id=track.album_id)
 
 
-def _track_list_item(track: Track, user: User, album: Album, *, anonymize: bool = False) -> TrackListItem:
-    return TrackListItem(**build_track_read(track, user, album, anonymize=anonymize).model_dump(), album_title=album.title)
+def _track_list_item(
+    track: Track,
+    user: User,
+    album: Album,
+    db: Session,
+    *,
+    anonymize: bool = False,
+) -> TrackListItem:
+    return TrackListItem(
+        **build_track_read(track, user, album, db=db, anonymize=anonymize).model_dump(),
+        album_title=album.title,
+    )
+
+
+def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
+    deduped: list[int] = []
+    seen: set[int] = set()
+    for uid in user_ids:
+        if uid in seen:
+            continue
+        seen.add(uid)
+        deduped.append(uid)
+    return deduped
+
+
+def _validate_manual_reviewer_selection(
+    *,
+    user_ids: list[int],
+    track: Track,
+    album: Album,
+    db: Session,
+    reviewer_limit: int,
+) -> None:
+    if track.submitter_id in user_ids:
+        raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
+
+    valid_member_ids = get_album_member_ids(db, album.id)
+    invalid_user_ids = [uid for uid in user_ids if uid not in valid_member_ids]
+    if invalid_user_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Users {sorted(invalid_user_ids)} are not members of this album.",
+        )
+
+    if len(user_ids) > reviewer_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At most {reviewer_limit} reviewer(s) can be assigned for this stage.",
+        )
 
 
 def _ensure_revision_upload_permission(track: Track, album: Album, current_user: User) -> None:
@@ -727,6 +774,17 @@ def list_tracks(
         )
     tracks = list(db.scalars(stmt).all())
 
+    track_ids = [track.id for track in tracks]
+    assigned_track_ids = set(
+        db.scalars(
+            select(StageAssignment.track_id).where(
+                StageAssignment.track_id.in_(track_ids),
+                StageAssignment.user_id == current_user.id,
+                StageAssignment.status.in_(["pending", "completed"]),
+            )
+        ).all()
+    ) if track_ids else set()
+
     results: list[TrackListItem] = []
     for track in tracks:
         alb = albums_by_id.get(track.album_id)
@@ -735,18 +793,19 @@ def list_tracks(
         is_privileged = current_user.id in (alb.producer_id, alb.mastering_engineer_id)
         is_submitter = track.submitter_id == current_user.id
         is_reviewer = track.peer_reviewer_id == current_user.id
+        is_assigned_reviewer = track.id in assigned_track_ids
         if track.album_id not in visible_album_ids:
             # Not a member of this album: only own tracks are accessible
-            if not is_submitter and not is_reviewer:
+            if not is_submitter and not is_reviewer and not is_assigned_reviewer:
                 continue
         else:
             # Album member: privileged roles and direct participants see all tracks;
             # regular members only see completed or public tracks
-            if not is_privileged and not is_submitter and not is_reviewer:
+            if not is_privileged and not is_submitter and not is_reviewer and not is_assigned_reviewer:
                 if track.status != TrackStatus.COMPLETED and not track.is_public:
                     continue
         anonymize = should_anonymize_track(track, current_user, alb)
-        results.append(_track_list_item(track, current_user, alb, anonymize=anonymize))
+        results.append(_track_list_item(track, current_user, alb, db, anonymize=anonymize))
     return results
 
 
@@ -947,30 +1006,29 @@ def assign_reviewer(
     if step is None or step.type != "review":
         raise HTTPException(status_code=409, detail="Track is not in a review stage.")
 
-    if track.submitter_id in payload.user_ids:
-        raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
-
-    valid_member_ids = get_album_member_ids(db, album.id)
-    invalid_user_ids = [uid for uid in payload.user_ids if uid not in valid_member_ids]
-    if invalid_user_ids:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Users {sorted(invalid_user_ids)} are not members of this album.",
-        )
+    selected_user_ids = _dedupe_user_ids(payload.user_ids)
+    reviewer_limit = max(1, step.required_reviewer_count or 1)
+    _validate_manual_reviewer_selection(
+        user_ids=selected_user_ids,
+        track=track,
+        album=album,
+        db=db,
+        reviewer_limit=reviewer_limit,
+    )
 
     # Batch-fetch existing pending assignments to avoid N+1
     already_assigned = set(db.scalars(
         select(StageAssignment.user_id).where(
             StageAssignment.track_id == track_id,
             StageAssignment.stage_id == step.id,
-            StageAssignment.user_id.in_(payload.user_ids),
+            StageAssignment.user_id.in_(selected_user_ids),
             StageAssignment.status == "pending",
         )
     ).all())
 
     now = datetime.now(timezone.utc)
     created: list[StageAssignment] = []
-    for uid in payload.user_ids:
+    for uid in selected_user_ids:
         if uid in already_assigned:
             continue
         sa = StageAssignment(
@@ -1054,25 +1112,17 @@ def reassign_reviewer(
     elif payload.user_id is not None:
         requested_user_ids = [payload.user_id]
 
-    deduped_user_ids: list[int] = []
-    seen: set[int] = set()
-    for uid in requested_user_ids:
-        if uid in seen:
-            continue
-        seen.add(uid)
-        deduped_user_ids.append(uid)
-
-    if track.submitter_id in deduped_user_ids:
-        raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
+    deduped_user_ids = _dedupe_user_ids(requested_user_ids)
+    reviewer_limit = max(1, step.required_reviewer_count or 1)
 
     if deduped_user_ids:
-        valid_member_ids = get_album_member_ids(db, album.id)
-        invalid_ids = [uid for uid in deduped_user_ids if uid not in valid_member_ids]
-        if invalid_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Users {sorted(invalid_ids)} are not members of this album.",
-            )
+        _validate_manual_reviewer_selection(
+            user_ids=deduped_user_ids,
+            track=track,
+            album=album,
+            db=db,
+            reviewer_limit=reviewer_limit,
+        )
 
     track.peer_reviewer_id = None
 
