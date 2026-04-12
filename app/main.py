@@ -8,7 +8,8 @@ from pathlib import Path
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from app.ws_manager import manager
+from app.ws_manager import manager as track_manager
+from app.ws_manager import notification_manager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, select, text
@@ -621,7 +622,7 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
     finally:
         db.close()
 
-    connected = await manager.connect(track_id, websocket)
+    connected = await track_manager.connect(track_id, websocket)
     if not connected:
         return
     try:
@@ -632,6 +633,37 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
             except json.JSONDecodeError:
                 message = {"type": "message", "content": data}
             message["track_id"] = track_id
-            await manager.broadcast(track_id, message)
+            await track_manager.broadcast(track_id, message)
     except WebSocketDisconnect:
-        manager.disconnect(track_id, websocket)
+        track_manager.disconnect(track_id, websocket)
+
+
+@app.websocket("/ws/notifications")
+async def websocket_notifications(websocket: WebSocket, token: str | None = None) -> None:
+    if token is None:
+        await websocket.close(code=4001)
+        return
+    try:
+        payload = _decode_token(token)
+    except HTTPException:
+        await websocket.close(code=4001)
+        return
+
+    user_id = int(payload["sub"])
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+        if user is None or user.deleted_at is not None:
+            await websocket.close(code=4001)
+            return
+    finally:
+        db.close()
+
+    connected = await notification_manager.connect(user_id, websocket)
+    if not connected:
+        return
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        notification_manager.disconnect(user_id, websocket)

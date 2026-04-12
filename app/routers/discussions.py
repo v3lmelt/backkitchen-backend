@@ -12,9 +12,11 @@ from app.database import get_db
 from app.models.album import Album
 from app.models.discussion import TrackDiscussion, TrackDiscussionImage
 from app.models.edit_history import EditHistory
+from app.models.stage_assignment import StageAssignment
 from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
+from app.realtime import broadcast_track_updated
 from app.schemas.schemas import DiscussionImageRead, DiscussionRead, DiscussionUpdate, EditHistoryRead, UserRead
 from app.security import get_current_user
 from app.services.upload import stream_upload
@@ -125,7 +127,15 @@ async def create_discussion(
             )
 
     # Notify track participants
-    participant_ids = {track.submitter_id, track.peer_reviewer_id, album.producer_id}
+    reviewer_ids = set(
+        db.scalars(
+            select(StageAssignment.user_id).where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.status.in_(["pending", "completed"]),
+            )
+        ).all()
+    )
+    participant_ids = {track.submitter_id, track.peer_reviewer_id, album.producer_id, *reviewer_ids}
     if album.mastering_engineer_id:
         participant_ids.add(album.mastering_engineer_id)
     participant_ids.discard(current_user.id)
@@ -143,6 +153,7 @@ async def create_discussion(
 
     db.commit()
     db.refresh(discussion)
+    broadcast_track_updated(background_tasks, track.id)
     return _build_discussion_read(discussion)
 
 
@@ -153,6 +164,7 @@ async def create_discussion(
 def update_discussion(
     discussion_id: int,
     payload: DiscussionUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> DiscussionRead:
@@ -173,6 +185,7 @@ def update_discussion(
         discussion.edited_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(discussion)
+    broadcast_track_updated(background_tasks, discussion.track_id)
     return _build_discussion_read(discussion)
 
 
@@ -182,6 +195,7 @@ def update_discussion(
 )
 def delete_discussion(
     discussion_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
@@ -191,8 +205,10 @@ def delete_discussion(
     if discussion.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can delete this discussion.")
 
+    track_id = discussion.track_id
     db.delete(discussion)
     db.commit()
+    broadcast_track_updated(background_tasks, track_id)
 
 
 @router.get("/api/discussions/{discussion_id}/history", response_model=list[EditHistoryRead])

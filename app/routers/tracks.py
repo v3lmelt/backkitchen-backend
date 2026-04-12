@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, func as sqlfunc, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
 from app.database import get_db
@@ -53,8 +53,8 @@ from app.workflow_engine import (
     resolve_assignee as engine_resolve_assignee,
 )
 from app.notifications import notify
+from app.realtime import broadcast_track_updated
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
-from app.ws_manager import manager as ws_manager
 from app.services.audio import extract_audio_metadata
 from app.services.upload import stream_upload_sync
 from app.workflow import (
@@ -75,10 +75,6 @@ router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 # Resolved once at startup to avoid a mkdir syscall on every file-serve request.
 _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
 
-
-def _broadcast_track_updated(background_tasks: BackgroundTasks, track_id: int) -> None:
-    """Schedule a WebSocket broadcast notifying subscribers that a track changed."""
-    background_tasks.add_task(ws_manager.broadcast, track_id, {"type": "track_updated", "track_id": track_id})
 
 # Used only for truly immutable URLs (source-version snapshots addressed by numeric ID).
 _AUDIO_CACHE_MAX_AGE = 86400
@@ -566,7 +562,7 @@ def confirm_source_version_upload(
     )
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
@@ -672,7 +668,7 @@ def confirm_delivery(
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
@@ -903,7 +899,7 @@ def update_track_metadata(
     )
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
@@ -923,7 +919,7 @@ def workflow_transition(
     engine_execute_transition(db, album, track, current_user, payload.decision, background_tasks)
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
@@ -982,6 +978,7 @@ def assign_reviewer(
             stage_id=step.id,
             user_id=uid,
             status="pending",
+            cancellation_reason=None,
             assigned_at=now,
         )
         db.add(sa)
@@ -1017,6 +1014,7 @@ def list_assignments(
     assignments = db.scalars(
         select(StageAssignment)
         .where(StageAssignment.track_id == track_id)
+        .options(selectinload(StageAssignment.user))
         .order_by(StageAssignment.assigned_at.desc())
     ).all()
     return [StageAssignmentRead.model_validate(a) for a in assignments]
@@ -1034,7 +1032,7 @@ def reassign_reviewer(
 
     Cancels all pending stage assignments, resets peer_reviewer_id, then
     either assigns the specified user (if payload.user_id is set) or
-    re-runs the normal assignment logic (auto pool or random fallback).
+    re-runs the normal assignment logic for the current stage.
     """
     from app.workflow_engine import assign_peer_reviewer_for_step, get_current_step, parse_workflow_config
 
@@ -1089,7 +1087,7 @@ def reassign_reviewer(
                 StageAssignment.status.in_(["pending", "completed"]),
                 StageAssignment.user_id.not_in(deduped_user_ids),
             )
-            .values(status="cancelled")
+            .values(status="cancelled", cancellation_reason="reassigned")
         )
         # Cancel pending assignments for users who ARE in the new list
         # (they'll get a fresh pending, or keep completed).
@@ -1101,7 +1099,7 @@ def reassign_reviewer(
                 StageAssignment.status == "pending",
                 StageAssignment.user_id.in_(deduped_user_ids),
             )
-            .values(status="cancelled")
+            .values(status="cancelled", cancellation_reason="reassigned")
         )
 
         now = datetime.now(timezone.utc)
@@ -1123,6 +1121,7 @@ def reassign_reviewer(
                 stage_id=step.id,
                 user_id=uid,
                 status="pending",
+                cancellation_reason=None,
                 assigned_at=now,
             ))
             newly_assigned.append(uid)
@@ -1317,7 +1316,7 @@ def upload_source_version(
     )
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
@@ -1409,7 +1408,7 @@ def approve_final_review(
                 sv.expires_at = expiry
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album)
 
 
