@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session, selectinload
 from app.config import settings
 from app.database import get_db
 from app.models.album import Album
-from app.models.issue import Issue, IssueStatus
 from app.models.discussion import TrackDiscussion, TrackDiscussionImage
 from app.models.edit_history import EditHistory
 from app.models.stage_assignment import StageAssignment
@@ -25,21 +24,6 @@ from app.workflow import ensure_track_visibility
 from app.workflow import mask_user_read_if_needed, peer_identity_anonymize_user_ids_for_viewer
 
 router = APIRouter(tags=["discussions"])
-
-
-def _track_has_internal_only_issue(track: Track, db: Session) -> bool:
-    pending_internal_issue = db.scalar(
-        select(Issue.id).where(
-            Issue.track_id == track.id,
-            Issue.status.in_([IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED]),
-        )
-    )
-    return pending_internal_issue is not None
-
-
-def _ensure_discussion_visible_to_user(track: Track, discussion: TrackDiscussion, user: User) -> None:
-    if discussion.visibility == "internal" and user.id == track.submitter_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discussion not found.")
 
 
 def _build_discussion_read(
@@ -93,8 +77,6 @@ def list_discussions(
             .options(selectinload(TrackDiscussion.images), selectinload(TrackDiscussion.author))
         ).all()
     )
-    if current_user.id == track.submitter_id:
-        discussions = [discussion for discussion in discussions if discussion.visibility != "internal"]
     album = db.get(Album, track.album_id)
     anonymize_user_ids: set[int] = set()
     if album is not None:
@@ -120,13 +102,10 @@ async def create_discussion(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
     anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
-    has_pending_internal_issue = _track_has_internal_only_issue(track, db)
-    visibility = "internal" if has_pending_internal_issue and current_user.id != track.submitter_id else "public"
 
     discussion = TrackDiscussion(
         track_id=track_id,
         author_id=current_user.id,
-        visibility=visibility,
         content=content,
     )
     db.add(discussion)
@@ -172,8 +151,6 @@ async def create_discussion(
     participant_ids = {track.submitter_id, track.peer_reviewer_id, album.producer_id, *reviewer_ids}
     if album.mastering_engineer_id:
         participant_ids.add(album.mastering_engineer_id)
-    if visibility == "internal":
-        participant_ids.discard(track.submitter_id)
     participant_ids.discard(current_user.id)
     participant_ids.discard(None)
     notify(
@@ -215,7 +192,6 @@ def update_discussion(
     anonymize_user_ids: set[int] = set()
     if album is not None:
         anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
-    _ensure_discussion_visible_to_user(track, discussion, current_user)
     if discussion.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can edit this discussion.")
 
@@ -251,7 +227,6 @@ def delete_discussion(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
-    _ensure_discussion_visible_to_user(track, discussion, current_user)
     if discussion.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can delete this discussion.")
 
@@ -273,7 +248,6 @@ def get_discussion_history(
     track = db.get(Track, discussion.track_id)
     if track:
         ensure_track_visibility(track, current_user, db)
-        _ensure_discussion_visible_to_user(track, discussion, current_user)
 
     histories = list(db.scalars(
         select(EditHistory)
