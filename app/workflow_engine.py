@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import BackgroundTasks, HTTPException, status
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.models.album import Album
@@ -848,6 +848,33 @@ def execute_transition(
         # Only fall through to fresh assignment if the target step never had
         # an assignment history (edge case, shouldn't happen in practice).
         if decision.startswith("reject_to_") and target_step.type == "review":
+            # Clear stale checklist items so reviewers start fresh.
+            source = current_source_version(track)
+            if source is not None:
+                db.execute(
+                    delete(ChecklistItem).where(
+                        ChecklistItem.track_id == track.id,
+                        ChecklistItem.source_version_id == source.id,
+                    )
+                )
+            # Force-reset all assignments for the target review step via
+            # bulk SQL UPDATE so reviewers must re-review from scratch.
+            db.execute(
+                update(StageAssignment)
+                .where(
+                    StageAssignment.track_id == track.id,
+                    StageAssignment.stage_id == target,
+                    StageAssignment.status.in_(("completed", "cancelled")),
+                )
+                .values(
+                    status="pending",
+                    completed_at=None,
+                    decision=None,
+                    cancellation_reason=None,
+                )
+            )
+            # Expire cached ORM state so subsequent reads see the reset.
+            db.expire_all()
             prepare_review_assignments_for_stage_entry(
                 db,
                 album,
