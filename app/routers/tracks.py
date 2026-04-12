@@ -383,6 +383,7 @@ def create_track(
     original_artist: str | None = Form(default=None),
     author_notes: str | None = Form(default=None),
     file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -417,6 +418,16 @@ def create_track(
     db.flush()
     db.add(_source_version_create(track, current_user, file_path, duration))
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
+
+    # Notify the album producer about the new submission
+    if album.producer_id and album.producer_id != current_user.id:
+        notify(db, [album.producer_id], "track_submitted", "新曲目已提交",
+               f"「{track.title}」已提交至专辑「{album.title}」",
+               related_track_id=track.id,
+               background_tasks=background_tasks,
+               album_id=album.id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
+
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
@@ -505,6 +516,7 @@ def request_track_upload(
 @router.post("/confirm-upload", response_model=TrackRead)
 def confirm_track_upload(
     params: ConfirmTrackUploadParams,
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -554,6 +566,16 @@ def confirm_track_upload(
     )
     db.add(sv)
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
+
+    # Notify the album producer about the new submission
+    if album.producer_id and album.producer_id != current_user.id:
+        notify(db, [album.producer_id], "track_submitted", "新曲目已提交",
+               f"「{track.title}」已提交至专辑「{album.title}」",
+               related_track_id=track.id,
+               background_tasks=background_tasks,
+               album_id=album.id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
+
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
@@ -1227,6 +1249,15 @@ def reassign_reviewer(
             reviewer_limit=reviewer_limit,
         )
 
+    # Capture old pending reviewer IDs before cancellation (for removal notification)
+    old_pending_reviewer_ids = set(db.scalars(
+        select(StageAssignment.user_id).where(
+            StageAssignment.track_id == track_id,
+            StageAssignment.stage_id == step.id,
+            StageAssignment.status == "pending",
+        )
+    ).all())
+
     track.peer_reviewer_id = None
 
     if deduped_user_ids:
@@ -1287,6 +1318,16 @@ def reassign_reviewer(
                    webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
     else:
         assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
+
+    # Notify removed reviewers
+    removed_ids = list(old_pending_reviewer_ids - set(deduped_user_ids))
+    if removed_ids:
+        notify(db, removed_ids, "reviewer_reassigned", "评审任务已移除",
+               f"你不再负责评审「{track.title}」",
+               related_track_id=track.id,
+               background_tasks=background_tasks,
+               album_id=track.album_id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
     log_track_event(
         db, track, current_user,
