@@ -252,12 +252,11 @@ def _validate_status_transition(
 ) -> None:
     """Enforce role-based status transition rules.
 
-    Submitter may:  open → resolved|disagreed, disagreed → resolved
+    Submitter may:  open → resolved|disagreed
     Reviewer may:   open → resolved|pending_discussion
                    pending_discussion → open|internal_resolved
                    internal_resolved → open
                    resolved|disagreed → open
-                   disagreed → resolved|pending_discussion|internal_resolved
     """
     old = issue.status
     if old == new_status:
@@ -269,8 +268,6 @@ def _validate_status_transition(
 
     # Submitter actions
     if is_submitter and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.DISAGREED):
-        return
-    if is_submitter and old == IssueStatus.DISAGREED and new_status == IssueStatus.RESOLVED:
         return
 
     # Reviewer actions
@@ -288,12 +285,6 @@ def _validate_status_transition(
     if is_reviewer and old == IssueStatus.INTERNAL_RESOLVED and new_status == IssueStatus.OPEN:
         return
     if is_reviewer and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
-        return
-    if is_reviewer and old == IssueStatus.DISAGREED and new_status in (
-        IssueStatus.RESOLVED,
-        IssueStatus.PENDING_DISCUSSION,
-        IssueStatus.INTERNAL_RESOLVED,
-    ):
         return
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot perform this status transition.")

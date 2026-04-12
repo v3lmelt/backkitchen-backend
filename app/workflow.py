@@ -345,7 +345,6 @@ def _issue_unresolved(issue: Issue) -> bool:
     return issue.status in {
         IssueStatus.OPEN,
         IssueStatus.PENDING_DISCUSSION,
-        IssueStatus.DISAGREED,
     }
 
 
