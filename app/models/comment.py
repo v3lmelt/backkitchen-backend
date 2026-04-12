@@ -13,6 +13,7 @@ class Comment(Base):
     issue_id: Mapped[int] = mapped_column(Integer, ForeignKey("issues.id"), nullable=False, index=True)
     author_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    visibility: Mapped[str] = mapped_column(String(20), nullable=False, default="public", server_default="public")
     is_status_note: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     old_status: Mapped[str | None] = mapped_column(String(30), nullable=True, default=None)
     new_status: Mapped[str | None] = mapped_column(String(30), nullable=True, default=None)

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
+from app.realtime import broadcast_notifications_updated
 from app.models.album import Album
 from app.models.notification import Notification
 from app.services.webhook import build_webhook_payload, post_webhook
@@ -54,6 +55,9 @@ def notify(
             related_issue_id=related_issue_id,
             related_album_id=album_id,
         ))
+
+    if background_tasks and seen:
+        broadcast_notifications_updated(background_tasks, list(seen))
 
     # Dispatch webhook if configured for this album
     if background_tasks and album_id:

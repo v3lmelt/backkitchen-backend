@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, func as sqlfunc, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
 from app.database import get_db
@@ -53,8 +53,8 @@ from app.workflow_engine import (
     resolve_assignee as engine_resolve_assignee,
 )
 from app.notifications import notify
+from app.realtime import broadcast_track_updated
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
-from app.ws_manager import manager as ws_manager
 from app.services.audio import extract_audio_metadata
 from app.services.upload import stream_upload_sync
 from app.workflow import (
@@ -67,6 +67,8 @@ from app.workflow import (
     get_all_album_member_ids,
     get_album_member_ids,
     log_track_event,
+    mask_user_read_if_needed,
+    peer_identity_anonymize_user_ids_for_viewer,
     should_anonymize_track,
 )
 
@@ -75,10 +77,6 @@ router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 # Resolved once at startup to avoid a mkdir syscall on every file-serve request.
 _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
 
-
-def _broadcast_track_updated(background_tasks: BackgroundTasks, track_id: int) -> None:
-    """Schedule a WebSocket broadcast notifying subscribers that a track changed."""
-    background_tasks.add_task(ws_manager.broadcast, track_id, {"type": "track_updated", "track_id": track_id})
 
 # Used only for truly immutable URLs (source-version snapshots addressed by numeric ID).
 _AUDIO_CACHE_MAX_AGE = 86400
@@ -179,8 +177,80 @@ def _handle_delivery_status(
            background_tasks=background_tasks, album_id=track.album_id)
 
 
-def _track_list_item(track: Track, user: User, album: Album, *, anonymize: bool = False) -> TrackListItem:
-    return TrackListItem(**build_track_read(track, user, album, anonymize=anonymize).model_dump(), album_title=album.title)
+def _track_list_item(
+    track: Track,
+    user: User,
+    album: Album,
+    db: Session,
+    *,
+    anonymize: bool = False,
+) -> TrackListItem:
+    return TrackListItem(
+        **_track_read_with_identity_mask(
+            track,
+            user,
+            album,
+            db,
+            anonymize=anonymize,
+        ).model_dump(),
+        album_title=album.title,
+    )
+
+
+def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
+    deduped: list[int] = []
+    seen: set[int] = set()
+    for uid in user_ids:
+        if uid in seen:
+            continue
+        seen.add(uid)
+        deduped.append(uid)
+    return deduped
+
+
+def _track_read_with_identity_mask(
+    track: Track,
+    viewer: User,
+    album: Album,
+    db: Session,
+    *,
+    anonymize: bool = False,
+) -> TrackRead:
+    anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, viewer)
+    return build_track_read(
+        track,
+        viewer,
+        album,
+        db=db,
+        anonymize=anonymize,
+        anonymize_user_ids=anonymize_user_ids,
+    )
+
+
+def _validate_manual_reviewer_selection(
+    *,
+    user_ids: list[int],
+    track: Track,
+    album: Album,
+    db: Session,
+    reviewer_limit: int,
+) -> None:
+    if track.submitter_id in user_ids:
+        raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
+
+    valid_member_ids = get_album_member_ids(db, album.id)
+    invalid_user_ids = [uid for uid in user_ids if uid not in valid_member_ids]
+    if invalid_user_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Users {sorted(invalid_user_ids)} are not members of this album.",
+        )
+
+    if len(user_ids) > reviewer_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At most {reviewer_limit} reviewer(s) can be assigned for this stage.",
+        )
 
 
 def _ensure_revision_upload_permission(track: Track, album: Album, current_user: User) -> None:
@@ -566,8 +636,8 @@ def confirm_source_version_upload(
     )
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
+    broadcast_track_updated(background_tasks, track_id)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.post("/{track_id}/master-deliveries/request-upload", response_model=PresignedUploadResponse)
@@ -672,7 +742,7 @@ def confirm_delivery(
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
@@ -731,6 +801,17 @@ def list_tracks(
         )
     tracks = list(db.scalars(stmt).all())
 
+    track_ids = [track.id for track in tracks]
+    assigned_track_ids = set(
+        db.scalars(
+            select(StageAssignment.track_id).where(
+                StageAssignment.track_id.in_(track_ids),
+                StageAssignment.user_id == current_user.id,
+                StageAssignment.status.in_(["pending", "completed"]),
+            )
+        ).all()
+    ) if track_ids else set()
+
     results: list[TrackListItem] = []
     for track in tracks:
         alb = albums_by_id.get(track.album_id)
@@ -739,18 +820,19 @@ def list_tracks(
         is_privileged = current_user.id in (alb.producer_id, alb.mastering_engineer_id)
         is_submitter = track.submitter_id == current_user.id
         is_reviewer = track.peer_reviewer_id == current_user.id
+        is_assigned_reviewer = track.id in assigned_track_ids
         if track.album_id not in visible_album_ids:
             # Not a member of this album: only own tracks are accessible
-            if not is_submitter and not is_reviewer:
+            if not is_submitter and not is_reviewer and not is_assigned_reviewer:
                 continue
         else:
             # Album member: privileged roles and direct participants see all tracks;
             # regular members only see completed or public tracks
-            if not is_privileged and not is_submitter and not is_reviewer:
+            if not is_privileged and not is_submitter and not is_reviewer and not is_assigned_reviewer:
                 if track.status != TrackStatus.COMPLETED and not track.is_public:
                     continue
         anonymize = should_anonymize_track(track, current_user, alb)
-        results.append(_track_list_item(track, current_user, alb, anonymize=anonymize))
+        results.append(_track_list_item(track, current_user, alb, db, anonymize=anonymize))
     return results
 
 
@@ -903,7 +985,7 @@ def update_track_metadata(
     )
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
@@ -923,7 +1005,7 @@ def workflow_transition(
     engine_execute_transition(db, album, track, current_user, payload.decision, background_tasks)
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
@@ -951,30 +1033,29 @@ def assign_reviewer(
     if step is None or step.type != "review":
         raise HTTPException(status_code=409, detail="Track is not in a review stage.")
 
-    if track.submitter_id in payload.user_ids:
-        raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
-
-    valid_member_ids = get_album_member_ids(db, album.id)
-    invalid_user_ids = [uid for uid in payload.user_ids if uid not in valid_member_ids]
-    if invalid_user_ids:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Users {sorted(invalid_user_ids)} are not members of this album.",
-        )
+    selected_user_ids = _dedupe_user_ids(payload.user_ids)
+    reviewer_limit = max(1, step.required_reviewer_count or 1)
+    _validate_manual_reviewer_selection(
+        user_ids=selected_user_ids,
+        track=track,
+        album=album,
+        db=db,
+        reviewer_limit=reviewer_limit,
+    )
 
     # Batch-fetch existing pending assignments to avoid N+1
     already_assigned = set(db.scalars(
         select(StageAssignment.user_id).where(
             StageAssignment.track_id == track_id,
             StageAssignment.stage_id == step.id,
-            StageAssignment.user_id.in_(payload.user_ids),
+            StageAssignment.user_id.in_(selected_user_ids),
             StageAssignment.status == "pending",
         )
     ).all())
 
     now = datetime.now(timezone.utc)
     created: list[StageAssignment] = []
-    for uid in payload.user_ids:
+    for uid in selected_user_ids:
         if uid in already_assigned:
             continue
         sa = StageAssignment(
@@ -982,6 +1063,7 @@ def assign_reviewer(
             stage_id=step.id,
             user_id=uid,
             status="pending",
+            cancellation_reason=None,
             assigned_at=now,
         )
         db.add(sa)
@@ -1017,9 +1099,20 @@ def list_assignments(
     assignments = db.scalars(
         select(StageAssignment)
         .where(StageAssignment.track_id == track_id)
+        .options(selectinload(StageAssignment.user))
         .order_by(StageAssignment.assigned_at.desc())
     ).all()
-    return [StageAssignmentRead.model_validate(a) for a in assignments]
+    album = db.get(Album, track.album_id)
+    anonymize_user_ids: set[int] = set()
+    if album is not None:
+        anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+
+    result: list[StageAssignmentRead] = []
+    for assignment in assignments:
+        item = StageAssignmentRead.model_validate(assignment)
+        item.user = mask_user_read_if_needed(item.user, anonymize_user_ids)
+        result.append(item)
+    return result
 
 
 @router.post("/{track_id}/reassign-reviewer", response_model=TrackRead)
@@ -1034,7 +1127,7 @@ def reassign_reviewer(
 
     Cancels all pending stage assignments, resets peer_reviewer_id, then
     either assigns the specified user (if payload.user_id is set) or
-    re-runs the normal assignment logic (auto pool or random fallback).
+    re-runs the normal assignment logic for the current stage.
     """
     from app.workflow_engine import assign_peer_reviewer_for_step, get_current_step, parse_workflow_config
 
@@ -1056,25 +1149,17 @@ def reassign_reviewer(
     elif payload.user_id is not None:
         requested_user_ids = [payload.user_id]
 
-    deduped_user_ids: list[int] = []
-    seen: set[int] = set()
-    for uid in requested_user_ids:
-        if uid in seen:
-            continue
-        seen.add(uid)
-        deduped_user_ids.append(uid)
-
-    if track.submitter_id in deduped_user_ids:
-        raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
+    deduped_user_ids = _dedupe_user_ids(requested_user_ids)
+    reviewer_limit = max(1, step.required_reviewer_count or 1)
 
     if deduped_user_ids:
-        valid_member_ids = get_album_member_ids(db, album.id)
-        invalid_ids = [uid for uid in deduped_user_ids if uid not in valid_member_ids]
-        if invalid_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Users {sorted(invalid_ids)} are not members of this album.",
-            )
+        _validate_manual_reviewer_selection(
+            user_ids=deduped_user_ids,
+            track=track,
+            album=album,
+            db=db,
+            reviewer_limit=reviewer_limit,
+        )
 
     track.peer_reviewer_id = None
 
@@ -1089,7 +1174,7 @@ def reassign_reviewer(
                 StageAssignment.status.in_(["pending", "completed"]),
                 StageAssignment.user_id.not_in(deduped_user_ids),
             )
-            .values(status="cancelled")
+            .values(status="cancelled", cancellation_reason="reassigned")
         )
         # Cancel pending assignments for users who ARE in the new list
         # (they'll get a fresh pending, or keep completed).
@@ -1101,7 +1186,7 @@ def reassign_reviewer(
                 StageAssignment.status == "pending",
                 StageAssignment.user_id.in_(deduped_user_ids),
             )
-            .values(status="cancelled")
+            .values(status="cancelled", cancellation_reason="reassigned")
         )
 
         now = datetime.now(timezone.utc)
@@ -1123,6 +1208,7 @@ def reassign_reviewer(
                 stage_id=step.id,
                 user_id=uid,
                 status="pending",
+                cancellation_reason=None,
                 assigned_at=now,
             ))
             newly_assigned.append(uid)
@@ -1317,8 +1403,8 @@ def upload_source_version(
     )
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
+    broadcast_track_updated(background_tasks, track_id)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.post("/{track_id}/master-deliveries", response_model=TrackRead)
@@ -1409,8 +1495,8 @@ def approve_final_review(
                 sv.expires_at = expiry
     db.commit()
     db.refresh(track)
-    _broadcast_track_updated(background_tasks, track_id)
-    return build_track_read(track, current_user, album)
+    broadcast_track_updated(background_tasks, track_id)
+    return build_track_read(track, current_user, album, db=db)
 
 
 from app.services.cleanup import cleanup_files, collect_track_files
@@ -1438,7 +1524,7 @@ def archive_track(
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
-    return build_track_read(track, current_user, album)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.post("/{track_id}/restore", response_model=TrackRead)
@@ -1463,7 +1549,7 @@ def restore_track(
            background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(track)
-    return build_track_read(track, current_user, album)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.delete("/{track_id}", status_code=status.HTTP_204_NO_CONTENT)

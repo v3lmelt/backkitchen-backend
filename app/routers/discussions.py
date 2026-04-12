@@ -12,18 +12,24 @@ from app.database import get_db
 from app.models.album import Album
 from app.models.discussion import TrackDiscussion, TrackDiscussionImage
 from app.models.edit_history import EditHistory
+from app.models.stage_assignment import StageAssignment
 from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
+from app.realtime import broadcast_track_updated
 from app.schemas.schemas import DiscussionImageRead, DiscussionRead, DiscussionUpdate, EditHistoryRead, UserRead
 from app.security import get_current_user
 from app.services.upload import stream_upload
 from app.workflow import ensure_track_visibility
+from app.workflow import mask_user_read_if_needed, peer_identity_anonymize_user_ids_for_viewer
 
 router = APIRouter(tags=["discussions"])
 
 
-def _build_discussion_read(discussion: TrackDiscussion) -> DiscussionRead:
+def _build_discussion_read(
+    discussion: TrackDiscussion,
+    anonymize_user_ids: set[int] | None = None,
+) -> DiscussionRead:
     author = discussion.author
     images = [
         DiscussionImageRead(
@@ -38,10 +44,14 @@ def _build_discussion_read(discussion: TrackDiscussion) -> DiscussionRead:
         id=discussion.id,
         track_id=discussion.track_id,
         author_id=discussion.author_id,
+        visibility=discussion.visibility,
         content=discussion.content,
         created_at=discussion.created_at,
         edited_at=discussion.edited_at,
-        author=UserRead.model_validate(author) if author else None,
+        author=mask_user_read_if_needed(
+            UserRead.model_validate(author) if author else None,
+            anonymize_user_ids,
+        ),
         images=images,
     )
 
@@ -67,7 +77,11 @@ def list_discussions(
             .options(selectinload(TrackDiscussion.images), selectinload(TrackDiscussion.author))
         ).all()
     )
-    return [_build_discussion_read(d) for d in discussions]
+    album = db.get(Album, track.album_id)
+    anonymize_user_ids: set[int] = set()
+    if album is not None:
+        anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+    return [_build_discussion_read(d, anonymize_user_ids) for d in discussions]
 
 
 @router.post(
@@ -87,6 +101,7 @@ async def create_discussion(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
+    anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
 
     discussion = TrackDiscussion(
         track_id=track_id,
@@ -125,7 +140,15 @@ async def create_discussion(
             )
 
     # Notify track participants
-    participant_ids = {track.submitter_id, track.peer_reviewer_id, album.producer_id}
+    reviewer_ids = set(
+        db.scalars(
+            select(StageAssignment.user_id).where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.status.in_(["pending", "completed"]),
+            )
+        ).all()
+    )
+    participant_ids = {track.submitter_id, track.peer_reviewer_id, album.producer_id, *reviewer_ids}
     if album.mastering_engineer_id:
         participant_ids.add(album.mastering_engineer_id)
     participant_ids.discard(current_user.id)
@@ -143,7 +166,8 @@ async def create_discussion(
 
     db.commit()
     db.refresh(discussion)
-    return _build_discussion_read(discussion)
+    broadcast_track_updated(background_tasks, track.id)
+    return _build_discussion_read(discussion, anonymize_user_ids)
 
 
 @router.patch(
@@ -153,12 +177,21 @@ async def create_discussion(
 def update_discussion(
     discussion_id: int,
     payload: DiscussionUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> DiscussionRead:
     discussion = db.get(TrackDiscussion, discussion_id)
     if discussion is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discussion not found.")
+    track = db.get(Track, discussion.track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
+    album = db.get(Album, track.album_id)
+    anonymize_user_ids: set[int] = set()
+    if album is not None:
+        anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
     if discussion.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can edit this discussion.")
 
@@ -173,7 +206,8 @@ def update_discussion(
         discussion.edited_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(discussion)
-    return _build_discussion_read(discussion)
+    broadcast_track_updated(background_tasks, discussion.track_id)
+    return _build_discussion_read(discussion, anonymize_user_ids)
 
 
 @router.delete(
@@ -182,17 +216,24 @@ def update_discussion(
 )
 def delete_discussion(
     discussion_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
     discussion = db.get(TrackDiscussion, discussion_id)
     if discussion is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discussion not found.")
+    track = db.get(Track, discussion.track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    ensure_track_visibility(track, current_user, db)
     if discussion.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can delete this discussion.")
 
+    track_id = discussion.track_id
     db.delete(discussion)
     db.commit()
+    broadcast_track_updated(background_tasks, track_id)
 
 
 @router.get("/api/discussions/{discussion_id}/history", response_model=list[EditHistoryRead])

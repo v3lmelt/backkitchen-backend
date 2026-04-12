@@ -20,6 +20,31 @@ def test_list_notifications_only_shows_own(client, factory, auth_headers):
     assert response.json()[0]["title"] == "For u1"
 
 
+def test_list_notifications_supports_limit_and_offset(client, factory, auth_headers):
+    user = factory.user()
+    titles = [f"Notif {idx}" for idx in range(4)]
+    for title in titles:
+        factory.notification(user=user, title=title)
+
+    first_page = client.get(
+        "/api/notifications",
+        headers=auth_headers(user),
+        params={"limit": 2, "offset": 0},
+    )
+    second_page = client.get(
+        "/api/notifications",
+        headers=auth_headers(user),
+        params={"limit": 2, "offset": 2},
+    )
+
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+    assert len(first_page.json()) == 2
+    assert len(second_page.json()) == 2
+    assert first_page.json()[0]["id"] > first_page.json()[1]["id"]
+    assert first_page.json()[1]["id"] > second_page.json()[0]["id"]
+
+
 def test_mark_all_read(client, factory, auth_headers):
     user = factory.user()
     factory.notification(user=user, is_read=False)

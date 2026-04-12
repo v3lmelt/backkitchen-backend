@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -26,22 +26,25 @@ from app.models.stage_assignment import StageAssignment
 from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
+from app.realtime import broadcast_track_updated
 from app.schemas.schemas import (
-    CommentRead, CommentUpdate, EditHistoryRead, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead,
+    CommentRead, CommentUpdate, EditHistoryRead, IssueBatchUpdate, IssueCreate, IssueDetail, IssueRead, IssueUpdate,
     PresignedCommentAudioResponse, PresignedUploadResponse, RequestCommentAudioUploadParams,
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.upload import stream_upload
 from app.workflow import (
     build_comment_read,
-    build_issue_detail,
+    build_issue_detail_for_user,
     build_issue_read,
     current_master_delivery,
     current_source_version,
     ensure_track_visibility,
     log_track_event,
+    peer_identity_anonymize_user_ids_for_viewer,
 )
 from app.workflow_engine import (
+    get_steps,
     get_current_step,
     infer_issue_phase_for_step,
     parse_workflow_config,
@@ -71,6 +74,21 @@ MAX_AUDIOS_PER_ISSUE = 3
 MAX_IMAGES_PER_ISSUE = 3
 
 router = APIRouter(tags=["issues"])
+
+
+def _is_submitter_hidden_issue_status(status_value: IssueStatus) -> bool:
+    return status_value in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}
+
+
+def _peer_anonymize_user_ids(
+    db: Session,
+    track: Track,
+    viewer: User,
+) -> set[int]:
+    album = db.get(Album, track.album_id)
+    if album is None:
+        return set()
+    return peer_identity_anonymize_user_ids_for_viewer(db, track, album, viewer)
 
 
 def _album_for_track(track: Track, db: Session) -> Album:
@@ -162,18 +180,35 @@ def _phase_reviewer_id(issue: Issue, track: Track, album: Album) -> int | None:
 def _phase_reviewer_ids(issue: Issue, track: Track, album: Album, db: Session) -> set[int]:
     """Return all reviewer user IDs for the issue's phase.
 
-    For active review steps with StageAssignment records, include every assigned
-    reviewer (pending/completed). Otherwise fall back to role-based resolution.
+    StageAssignment is the source of truth for multi-review phases. Match both
+    canonical phases (``peer``) and step IDs (``peer_review``) so historical
+    issue permissions keep following the assigned review group even after the
+    track has moved to a later step.
     """
-    phase = _effective_issue_phase(issue, track, album)
+    phase = issue.phase
+    phase_aliases = {phase}
+    if phase in {IssuePhase.PEER.value, "peer_review"}:
+        phase_aliases.update({IssuePhase.PEER.value, "peer_review"})
+    elif phase in {IssuePhase.PRODUCER.value, "producer_gate"}:
+        phase_aliases.update({IssuePhase.PRODUCER.value, "producer_gate"})
+    elif phase == IssuePhase.MASTERING.value:
+        phase_aliases.add("mastering")
+    elif phase == IssuePhase.FINAL_REVIEW.value:
+        phase_aliases.add("final_review")
+
     config = parse_workflow_config(album)
-    step = get_current_step(config, track)
-    if step and infer_issue_phase_for_step(step) == phase and step.type == "review":
+    matching_stage_ids = [
+        step.id
+        for step in get_steps(config)
+        if step.type == "review"
+        and (step.id in phase_aliases or infer_issue_phase_for_step(step) in phase_aliases)
+    ]
+    if matching_stage_ids:
         reviewer_ids = set(
             db.scalars(
                 select(StageAssignment.user_id).where(
                     StageAssignment.track_id == track.id,
-                    StageAssignment.stage_id == step.id,
+                    StageAssignment.stage_id.in_(matching_stage_ids),
                     StageAssignment.status.in_(["pending", "completed"]),
                 )
             ).all()
@@ -187,8 +222,16 @@ def _phase_reviewer_ids(issue: Issue, track: Track, album: Album, db: Session) -
 
 def _ensure_issue_visible_to_user(issue: Issue, track: Track, user: User) -> None:
     # Pending-discussion issues are hidden from submitters until discussion ends.
-    if user.id == track.submitter_id and issue.status == IssueStatus.PENDING_DISCUSSION:
+    if user.id == track.submitter_id and _is_submitter_hidden_issue_status(issue.status):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
+
+
+def _ensure_comment_visible_to_user(comment: Comment, track: Track, user: User, db: Session) -> None:
+    album = db.get(Album, track.album_id)
+    if album and user.id == track.submitter_id and user.id == album.producer_id:
+        return
+    if comment.visibility == "internal" and user.id == track.submitter_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
 
 
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User, db: Session) -> None:
@@ -209,11 +252,11 @@ def _validate_status_transition(
 ) -> None:
     """Enforce role-based status transition rules.
 
-    Submitter may:  open → resolved|disagreed, disagreed → resolved
+    Submitter may:  open → resolved|disagreed
     Reviewer may:   open → resolved|pending_discussion
-                   pending_discussion → open|resolved
+                   pending_discussion → open|internal_resolved
+                   internal_resolved → open
                    resolved|disagreed → open
-                   disagreed → resolved|pending_discussion
     """
     old = issue.status
     if old == new_status:
@@ -226,24 +269,31 @@ def _validate_status_transition(
     # Submitter actions
     if is_submitter and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.DISAGREED):
         return
-    if is_submitter and old == IssueStatus.DISAGREED and new_status == IssueStatus.RESOLVED:
-        return
 
     # Reviewer actions
     if is_reviewer and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
         return
-    # Only the issue creator can publish an internal issue (pending_discussion → open)
+    # Only the issue creator can publish an internal issue (internal state -> open)
     is_creator = user.id == issue.author_id
-    if is_creator and old == IssueStatus.PENDING_DISCUSSION and new_status in (IssueStatus.OPEN, IssueStatus.RESOLVED):
+    if is_creator and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status in (
+        IssueStatus.OPEN,
+        IssueStatus.INTERNAL_RESOLVED,
+    ):
         return
-    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.RESOLVED:
+    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.INTERNAL_RESOLVED:
+        return
+    if is_reviewer and old == IssueStatus.INTERNAL_RESOLVED and new_status == IssueStatus.OPEN:
         return
     if is_reviewer and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
         return
-    if is_reviewer and old == IssueStatus.DISAGREED and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
-        return
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot perform this status transition.")
+
+
+def _status_note_visibility(old_status: IssueStatus, new_status: IssueStatus) -> str:
+    if _is_submitter_hidden_issue_status(old_status) or _is_submitter_hidden_issue_status(new_status):
+        return "internal"
+    return "public"
 
 
 @router.post(
@@ -269,6 +319,7 @@ async def create_issue(
     severity_enum: _IssueSeverity
     parsed_markers: list[IssueMarkerCreate]
     issue_visibility: str = "public"
+    visibility_provided = False
     audios: list[StarletteUploadFile] = []
     images: list[StarletteUploadFile] = []
     audio_object_keys: str | None = None
@@ -277,7 +328,8 @@ async def create_issue(
     content_type = (request.headers.get("content-type") or "").lower()
     if content_type.startswith("application/json"):
         try:
-            payload = IssueCreate.model_validate(await request.json())
+            raw_json = await request.json()
+            payload = IssueCreate.model_validate(raw_json)
         except ValidationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -295,6 +347,7 @@ async def create_issue(
         severity_enum = payload.severity
         parsed_markers = payload.markers
         issue_visibility = payload.visibility
+        visibility_provided = "visibility" in raw_json
     else:
         form = await request.form()
         title = str(form.get("title") or "").strip()
@@ -313,6 +366,7 @@ async def create_issue(
         issue_description = description
         issue_phase = phase
         issue_visibility = visibility
+        visibility_provided = "visibility" in form
 
         audios = [item for item in form.getlist("audios") if isinstance(item, StarletteUploadFile)]
         images = [item for item in form.getlist("images") if isinstance(item, StarletteUploadFile)]
@@ -341,6 +395,9 @@ async def create_issue(
         except ValueError:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid severity: {severity}")
 
+    if issue_visibility not in {"public", "internal"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="visibility must be 'public' or 'internal'.")
+
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
@@ -348,7 +405,29 @@ async def create_issue(
     effective_phase = _ensure_custom_issue_permission(
         track, album, current_user, issue_phase, db,
     )
-    initial_status = IssueStatus.PENDING_DISCUSSION if issue_visibility == "internal" else IssueStatus.OPEN
+    config = parse_workflow_config(album)
+    current_step = get_current_step(config, track)
+    active_assignment_count = 0
+    if current_step and current_step.type == "review" and infer_issue_phase_for_step(current_step) == effective_phase:
+        active_assignment_count = db.scalar(
+            select(func.count(StageAssignment.id)).where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id == current_step.id,
+                StageAssignment.status.in_(["pending", "completed"]),
+            )
+        ) or 0
+    reviewer_scope_count = max(current_step.required_reviewer_count or 1, active_assignment_count) if current_step else 1
+    multi_reviewer_context = (
+        current_step is not None
+        and current_step.type == "review"
+        and infer_issue_phase_for_step(current_step) == effective_phase
+        and reviewer_scope_count > 1
+    )
+    initial_status = (
+        IssueStatus.PENDING_DISCUSSION
+        if multi_reviewer_context and (issue_visibility == "internal" or not visibility_provided)
+        else IssueStatus.OPEN
+    )
 
     for m in parsed_markers:
         if m.marker_type == MarkerType.RANGE and m.time_end is None:
@@ -497,14 +576,22 @@ async def create_issue(
         "issue_created",
         payload={"phase": effective_phase, "title": issue_title, "issue_id": issue.id},
     )
-    if current_user.id != track.submitter_id and issue.status != IssueStatus.PENDING_DISCUSSION:
+    if current_user.id != track.submitter_id and not _is_submitter_hidden_issue_status(issue.status):
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
                related_track_id=track.id, related_issue_id=issue.id,
                background_tasks=background_tasks, album_id=track.album_id)
     db.commit()
     db.refresh(issue)
-    return build_issue_read(issue, db)
+    broadcast_track_updated(background_tasks, track.id)
+    anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    return build_issue_read(
+        issue,
+        db,
+        anonymize_user_ids=anonymize_user_ids,
+        viewer_user=current_user,
+        viewer_track=track,
+    )
 
 
 @router.get("/api/tracks/{track_id}/issues", response_model=list[IssueRead])
@@ -525,11 +612,22 @@ def list_issues(
         .options(selectinload(Issue.markers), selectinload(Issue.audios), selectinload(Issue.images))
     ).all())
     if current_user.id == track.submitter_id:
-        issues = [issue for issue in issues if issue.status != IssueStatus.PENDING_DISCUSSION]
+        issues = [issue for issue in issues if not _is_submitter_hidden_issue_status(issue.status)]
     # Pre-fetch all issue authors
     author_ids = {i.author_id for i in issues}
     users_cache = {u.id: u for u in db.scalars(select(User).where(User.id.in_(author_ids))).all()} if author_ids else {}
-    return [build_issue_read(issue, db, users_cache=users_cache) for issue in issues]
+    anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    return [
+        build_issue_read(
+            issue,
+            db,
+            users_cache=users_cache,
+            anonymize_user_ids=anonymize_user_ids,
+            viewer_user=current_user,
+            viewer_track=track,
+        )
+        for issue in issues
+    ]
 
 
 @router.get("/api/issues/{issue_id}", response_model=IssueDetail)
@@ -550,23 +648,61 @@ def get_issue(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
     _ensure_issue_visible_to_user(issue, track, current_user)
-    return build_issue_detail(issue, db)
+    return build_issue_detail_for_user(issue, track, current_user, db)
 
 
 @router.patch("/api/issues/{issue_id}", response_model=IssueDetail)
 async def update_issue(
     issue_id: int,
     background_tasks: BackgroundTasks,
-    status_field: Optional[str] = Form(default=None, alias="status"),
-    title: Optional[str] = Form(default=None),
-    description: Optional[str] = Form(default=None),
-    severity: Optional[str] = Form(default=None),
-    status_note: Optional[str] = Form(default=None),
-    images: list[UploadFile] = File(default=[]),
-    audios: list[UploadFile] = File(default=[]),
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> IssueDetail:
+    status_field: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    severity: Optional[str] = None
+    status_note: Optional[str] = None
+    images: list[UploadFile] = []
+    audios: list[UploadFile] = []
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("application/json"):
+        try:
+            payload = IssueUpdate.model_validate(await request.json())
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=jsonable_encoder(exc.errors()),
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid request body.",
+            )
+
+        status_field = payload.status.value if payload.status is not None else None
+        title = payload.title
+        description = payload.description
+        severity = payload.severity.value if payload.severity is not None else None
+        status_note = payload.status_note
+    else:
+        form = await request.form()
+        raw_status = form.get("status")
+        raw_title = form.get("title")
+        raw_description = form.get("description")
+        raw_severity = form.get("severity")
+        raw_status_note = form.get("status_note")
+
+        status_field = str(raw_status).strip() if raw_status is not None else None
+        title = str(raw_title) if raw_title is not None else None
+        description = str(raw_description) if raw_description is not None else None
+        severity = str(raw_severity).strip() if raw_severity is not None else None
+        status_note = str(raw_status_note) if raw_status_note is not None else None
+        images = [item for item in form.getlist("images") if isinstance(item, StarletteUploadFile)]
+        audios = [item for item in form.getlist("audios") if isinstance(item, StarletteUploadFile)]
+
     issue = db.get(Issue, issue_id)
     if issue is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
@@ -640,6 +776,7 @@ async def update_issue(
             issue_id=issue.id,
             author_id=current_user.id,
             content=effective_note,
+            visibility=_status_note_visibility(old_status, new_status),
             is_status_note=True,
             old_status=old_status.value,
             new_status=new_status.value,
@@ -686,8 +823,8 @@ async def update_issue(
                background_tasks=background_tasks, album_id=track.album_id if track else None)
 
     if (
-        old_status == IssueStatus.PENDING_DISCUSSION
-        and new_status != IssueStatus.PENDING_DISCUSSION
+        _is_submitter_hidden_issue_status(old_status)
+        and not _is_submitter_hidden_issue_status(new_status)
         and current_user.id != track.submitter_id
     ):
         notify(
@@ -711,7 +848,8 @@ async def update_issue(
     )
     db.commit()
     db.refresh(issue)
-    return build_issue_detail(issue, db)
+    broadcast_track_updated(background_tasks, track.id)
+    return build_issue_detail_for_user(issue, track, current_user, db)
 
 
 @router.post(
@@ -777,7 +915,8 @@ async def add_comment(
                 detail=f"Unsupported audio type: {audio_file.content_type}. Allowed: mp3, wav, flac, aac, ogg.",
             )
 
-    comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content or '')
+    comment_visibility = "internal" if _is_submitter_hidden_issue_status(issue.status) else "public"
+    comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content or '', visibility=comment_visibility)
     db.add(comment)
     db.flush()
 
@@ -853,7 +992,12 @@ async def add_comment(
 
     db.commit()
     db.refresh(comment)
-    return build_comment_read(comment, db)
+    broadcast_track_updated(background_tasks, track.id)
+    album = db.get(Album, track.album_id)
+    anonymize_user_ids: set[int] = set()
+    if album is not None:
+        anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+    return build_comment_read(comment, db, anonymize_user_ids=anonymize_user_ids)
 
 
 # ── R2 presigned upload for comment audio ────────────────────────────────────
@@ -910,6 +1054,7 @@ def request_comment_audio_upload(
 def batch_update_issues(
     track_id: int,
     payload: IssueBatchUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[IssueRead]:
@@ -934,15 +1079,27 @@ def batch_update_issues(
                 issue_id=issue.id,
                 author_id=current_user.id,
                 content=payload.status_note,
+                visibility=_status_note_visibility(old_status, payload.status),
                 is_status_note=True,
                 old_status=old_status.value,
                 new_status=payload.status.value,
             ))
 
     db.commit()
+    broadcast_track_updated(background_tasks, track.id)
     for issue in issues:
         db.refresh(issue)
-    return [build_issue_read(issue, db) for issue in issues]
+    anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    return [
+        build_issue_read(
+            issue,
+            db,
+            anonymize_user_ids=anonymize_user_ids,
+            viewer_user=current_user,
+            viewer_track=track,
+        )
+        for issue in issues
+    ]
 
 
 # ── issue audio file serving ─────────────────────────────────────────────────
@@ -1019,6 +1176,7 @@ def serve_comment_audio(
         raise HTTPException(status_code=404, detail="Associated track not found.")
     ensure_track_visibility(track, user, db)
     _ensure_issue_visible_to_user(issue, track, user)
+    _ensure_comment_visible_to_user(comment, track, user, db)
 
     if audio.storage_backend == "r2":
         from app.services.r2 import public_url
@@ -1050,12 +1208,19 @@ def serve_comment_audio(
 def update_comment(
     comment_id: int,
     payload: CommentUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> CommentRead:
     comment = db.get(Comment, comment_id)
     if comment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
+    issue = db.get(Issue, comment.issue_id)
+    track = db.get(Track, issue.track_id) if issue else None
+    if track is not None:
+        ensure_track_visibility(track, current_user, db)
+        _ensure_issue_visible_to_user(issue, track, current_user)
+        _ensure_comment_visible_to_user(comment, track, current_user, db)
     if comment.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can edit this comment.")
     if comment.is_status_note:
@@ -1072,25 +1237,42 @@ def update_comment(
         comment.edited_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(comment)
-    return build_comment_read(comment, db)
+    issue = db.get(Issue, comment.issue_id)
+    if issue is not None:
+        broadcast_track_updated(background_tasks, issue.track_id)
+    anonymize_user_ids: set[int] = set()
+    if track is not None:
+        anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    return build_comment_read(comment, db, anonymize_user_ids=anonymize_user_ids)
 
 
 @router.delete("/api/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_comment(
     comment_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
     comment = db.get(Comment, comment_id)
     if comment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
+    issue = db.get(Issue, comment.issue_id)
+    track = db.get(Track, issue.track_id) if issue else None
+    if track is not None:
+        ensure_track_visibility(track, current_user, db)
+        _ensure_issue_visible_to_user(issue, track, current_user)
+        _ensure_comment_visible_to_user(comment, track, current_user, db)
     if comment.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can delete this comment.")
     if comment.is_status_note:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Status notes cannot be deleted.")
 
+    issue_id = comment.issue_id
     db.delete(comment)
     db.commit()
+    issue = db.get(Issue, issue_id)
+    if issue is not None:
+        broadcast_track_updated(background_tasks, issue.track_id)
 
 
 @router.get("/api/comments/{comment_id}/history", response_model=list[EditHistoryRead])
@@ -1107,6 +1289,8 @@ def get_comment_history(
         track = db.get(Track, issue.track_id)
         if track:
             ensure_track_visibility(track, current_user, db)
+            _ensure_issue_visible_to_user(issue, track, current_user)
+            _ensure_comment_visible_to_user(comment, track, current_user, db)
 
     histories = list(db.scalars(
         select(EditHistory)

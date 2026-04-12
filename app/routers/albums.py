@@ -1,15 +1,19 @@
+import asyncio
 import io
 import json
 import logging
+import tempfile
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
 
@@ -27,7 +31,7 @@ from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataU
 from app.security import get_current_user, require_producer
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
-from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed
+from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed, peer_identity_anonymize_user_ids_for_viewer
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
@@ -418,6 +422,12 @@ def get_album_stats(
     if actor_ids:
         actors_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(actor_ids))).all()}
 
+    anonymize_user_ids: set[int] = set()
+    for track in db.scalars(select(Track).where(Track.album_id == album_id)).all():
+        anonymize_user_ids.update(
+            peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+        )
+
     overdue_count = 0
     if album.phase_deadlines:
         deadlines = json.loads(album.phase_deadlines)
@@ -444,7 +454,15 @@ def get_album_stats(
         total_tracks=total_tracks,
         by_status=by_status,
         open_issues=open_issues,
-        recent_events=[build_event_read(e, db, users_cache=actors_by_id) for e in recent_events],
+        recent_events=[
+            build_event_read(
+                e,
+                db,
+                users_cache=actors_by_id,
+                anonymize_user_ids=anonymize_user_ids,
+            )
+            for e in recent_events
+        ],
         deadline=album.deadline,
         overdue_track_count=overdue_count,
     )
@@ -475,7 +493,21 @@ def get_album_activity(
     if actor_ids:
         actors_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(actor_ids))).all()}
 
-    return [build_event_read(e, db, users_cache=actors_by_id) for e in events]
+    anonymize_user_ids: set[int] = set()
+    for track in db.scalars(select(Track).where(Track.album_id == album_id)).all():
+        anonymize_user_ids.update(
+            peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+        )
+
+    return [
+        build_event_read(
+            e,
+            db,
+            users_cache=actors_by_id,
+            anonymize_user_ids=anonymize_user_ids,
+        )
+        for e in events
+    ]
 
 
 @router.get("/{album_id}/tracks", response_model=list[TrackRead])
@@ -504,7 +536,7 @@ def list_album_tracks(
         select(Track).where(*filters)
         .order_by(Track.track_number.asc().nulls_last(), Track.id)
     ).all())
-    return [build_track_read(track, current_user, album) for track in tracks]
+    return [build_track_read(track, current_user, album, db=db) for track in tracks]
 
 
 @router.get("/{album_id}/archived-tracks", response_model=list[TrackRead])
@@ -527,7 +559,7 @@ def list_archived_tracks(
         )
         .order_by(Track.archived_at.desc())
     ).all())
-    return [build_track_read(track, current_user, album) for track in tracks]
+    return [build_track_read(track, current_user, album, db=db) for track in tracks]
 
 
 @router.patch("/{album_id}/track-order", response_model=list[TrackRead])
@@ -552,7 +584,7 @@ def reorder_tracks(
     for t in tracks:
         db.refresh(t)
     ordered = sorted(tracks, key=lambda x: (x.track_number is None, x.track_number or 0, x.id))
-    return [build_track_read(t, current_user, album) for t in ordered]
+    return [build_track_read(t, current_user, album, db=db) for t in ordered]
 
 
 @router.get("/{album_id}/webhook", response_model=WebhookConfig)
@@ -653,12 +685,50 @@ def update_workflow_config(
     return {"ok": True, "migrations": migrations}
 
 
-@router.get("/{album_id}/export")
-def export_album(
+# ---------------------------------------------------------------------------
+# Album export – SSE progress stream + temp-file download
+# ---------------------------------------------------------------------------
+
+# In-memory store for completed export temp files: download_id -> (path, created_ts)
+_export_temp_store: dict[str, tuple[str, float]] = {}
+_EXPORT_TTL_SECONDS = 600  # 10 minutes
+
+
+def _cleanup_expired_exports() -> None:
+    now = time.time()
+    expired = [k for k, (_, ts) in _export_temp_store.items() if now - ts > _EXPORT_TTL_SECONDS]
+    for k in expired:
+        p, _ = _export_temp_store.pop(k, ("", 0))
+        Path(p).unlink(missing_ok=True)
+
+
+def _resolve_delivery_file(delivery, upload_dir: Path) -> tuple[Path, bool]:
+    """Resolve a MasterDelivery to a local file path.
+
+    Returns (path, is_temp).  When ``is_temp`` is True the caller must
+    delete the file after use.
+    """
+    if delivery.storage_backend == "r2":
+        from app.services.r2 import download_to_temp
+        return download_to_temp(delivery.file_path), True
+
+    file_path = Path(delivery.file_path)
+    if not file_path.is_absolute():
+        file_path = upload_dir / file_path.name
+    return file_path, False
+
+
+def _sse_event(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.get("/{album_id}/export/stream")
+async def export_album_stream(
     album_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> StreamingResponse:
+):
+    """SSE endpoint that exports album tracks with metadata, streaming progress."""
     album = ensure_album_producer(album_id, current_user, db)
 
     completed_tracks = list(
@@ -675,55 +745,247 @@ def export_album(
             detail="No completed tracks to export.",
         )
 
-    upload_dir = settings.get_upload_path()
-    buffer = io.BytesIO()
-    manifest_entries: list[dict] = []
+    # Pre-load album metadata needed inside the generator
+    album_title = album.title
+    album_circle_name = album.circle_name
+    album_cover_image = album.cover_image
+    album_release_date = album.release_date
+    album_genres_raw = album.genres
+    album_catalog_number = album.catalog_number
 
-    # Resolve and batch-check all file paths before opening the zip writer,
-    # so the existence checks are grouped rather than interleaved with I/O.
-    track_file_entries: list[tuple[Track, Path]] = []
+    # Parse genres (JSON array string)
+    genres_str: str | None = None
+    if album_genres_raw:
+        try:
+            genres_list = json.loads(album_genres_raw)
+            if isinstance(genres_list, list) and genres_list:
+                genres_str = "; ".join(str(g) for g in genres_list)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    release_date_str: str | None = None
+    if album_release_date:
+        release_date_str = str(album_release_date.year)
+
+    # Pre-load cover image bytes
+    cover_data: bytes | None = None
+    if album_cover_image:
+        cover_path = settings.get_upload_path() / album_cover_image
+        if cover_path.exists():
+            cover_data = cover_path.read_bytes()
+
+    # Snapshot track data to avoid lazy-load issues inside the async generator
+    track_snapshots: list[dict] = []
     for track in completed_tracks:
         delivery = current_master_delivery(track)
         if delivery is None:
             continue
-        file_path = Path(delivery.file_path)
-        if not file_path.is_absolute():
-            file_path = upload_dir / file_path.name
-        if file_path.exists():
-            track_file_entries.append((track, file_path))
+        track_snapshots.append({
+            "title": track.title,
+            "artist": track.artist,
+            "track_number": track.track_number,
+            "duration": track.duration,
+            "bpm": track.bpm,
+            "delivery_file_path": delivery.file_path,
+            "delivery_storage_backend": delivery.storage_backend,
+        })
 
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for track, file_path in track_file_entries:
-            ext = file_path.suffix
-            num = track.track_number or 0
-            safe_title = track.title.replace("/", "_").replace("\\", "_")
-            safe_artist = track.artist.replace("/", "_").replace("\\", "_")
-            zip_name = f"{num:02d} - {safe_artist} - {safe_title}{ext}"
-            zf.write(str(file_path), zip_name)
-            manifest_entries.append(
-                {
+    total_tracks = len(track_snapshots)
+    upload_dir = settings.get_upload_path()
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        from app.services.audio import embed_audio_metadata
+
+        yield _sse_event({"type": "start", "total": total_tracks})
+
+        _cleanup_expired_exports()
+
+        manifest_entries: list[dict] = []
+        temp_files: list[Path] = []
+        # Collect (zip_name, local_path, is_temp) for building the ZIP at the end
+        zip_entries: list[tuple[str, Path, bool]] = []
+
+        try:
+            for idx, snap in enumerate(track_snapshots):
+                num = snap["track_number"] or 0
+                safe_title = snap["title"].replace("/", "_").replace("\\", "_")
+                safe_artist = snap["artist"].replace("/", "_").replace("\\", "_")
+
+                # --- Step 1: resolve file ---
+                step = "downloading" if snap["delivery_storage_backend"] == "r2" else "reading"
+                yield _sse_event({
+                    "type": "track_progress",
+                    "index": idx + 1,
+                    "total": total_tracks,
+                    "title": snap["title"],
+                    "step": step,
+                })
+
+                class _FakeDelivery:
+                    file_path = snap["delivery_file_path"]
+                    storage_backend = snap["delivery_storage_backend"]
+
+                try:
+                    src_path, is_temp_src = await asyncio.to_thread(
+                        _resolve_delivery_file, _FakeDelivery(), upload_dir
+                    )
+                except Exception:
+                    logger.warning("Failed to resolve file for track %s", snap["title"], exc_info=True)
+                    yield _sse_event({
+                        "type": "track_skipped",
+                        "index": idx + 1,
+                        "total": total_tracks,
+                        "title": snap["title"],
+                    })
+                    continue
+
+                if not src_path.exists():
+                    yield _sse_event({
+                        "type": "track_skipped",
+                        "index": idx + 1,
+                        "total": total_tracks,
+                        "title": snap["title"],
+                    })
+                    continue
+
+                # --- Step 2: copy to temp + embed metadata ---
+                yield _sse_event({
+                    "type": "track_progress",
+                    "index": idx + 1,
+                    "total": total_tracks,
+                    "title": snap["title"],
+                    "step": "metadata",
+                })
+
+                ext = src_path.suffix
+                zip_name = f"{num:02d} - {safe_artist} - {safe_title}{ext}"
+
+                if is_temp_src:
+                    # Already a temp copy (R2) – embed in-place
+                    work_path = src_path
+                else:
+                    # Local original – copy to temp to avoid mutating the source
+                    import shutil
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                    tmp.close()
+                    work_path = Path(tmp.name)
+                    await asyncio.to_thread(shutil.copy2, str(src_path), str(work_path))
+                    temp_files.append(work_path)
+
+                await asyncio.to_thread(
+                    embed_audio_metadata,
+                    work_path,
+                    title=snap["title"],
+                    artist=snap["artist"],
+                    album=album_title,
+                    album_artist=album_circle_name,
+                    track_number=snap["track_number"],
+                    total_tracks=total_tracks,
+                    genre=genres_str,
+                    date=release_date_str,
+                    cover_data=cover_data,
+                )
+
+                zip_entries.append((zip_name, work_path, is_temp_src or (work_path in temp_files)))
+                manifest_entries.append({
                     "track_number": num,
-                    "title": track.title,
-                    "artist": track.artist,
-                    "duration": track.duration,
-                    "bpm": track.bpm,
+                    "title": snap["title"],
+                    "artist": snap["artist"],
+                    "duration": snap["duration"],
+                    "bpm": snap["bpm"],
                     "file": zip_name,
-                }
-            )
+                })
 
-        manifest = json.dumps(
-            {"album": album.title, "tracks": manifest_entries},
-            indent=2,
-            ensure_ascii=False,
-        )
-        zf.writestr("manifest.json", manifest)
+                yield _sse_event({
+                    "type": "track_done",
+                    "index": idx + 1,
+                    "total": total_tracks,
+                    "title": snap["title"],
+                })
 
-    buffer.seek(0)
-    safe_album_title = album.title.replace(" ", "_").replace("/", "_").replace("\\", "_")
+            # --- Step 3: build ZIP ---
+            yield _sse_event({"type": "zipping", "total": total_tracks})
+
+            def _build_zip() -> str:
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for zip_name, local_path, _ in zip_entries:
+                        zf.write(str(local_path), zip_name)
+                    manifest = json.dumps(
+                        {"album": album_title, "tracks": manifest_entries},
+                        indent=2, ensure_ascii=False,
+                    )
+                    zf.writestr("manifest.json", manifest)
+
+                download_id = uuid.uuid4().hex
+                safe_album = album_title.replace(" ", "_").replace("/", "_").replace("\\", "_")
+                tmp_path = Path(tempfile.gettempdir()) / f"export_{download_id}_{safe_album}.zip"
+                tmp_path.write_bytes(buf.getvalue())
+                _export_temp_store[download_id] = (str(tmp_path), time.time())
+                return download_id
+
+            download_id = await asyncio.to_thread(_build_zip)
+
+            yield _sse_event({
+                "type": "complete",
+                "download_id": download_id,
+                "total": total_tracks,
+                "processed": len(zip_entries),
+            })
+        except Exception:
+            logger.error("Export stream error for album %s", album_id, exc_info=True)
+            yield _sse_event({"type": "error", "message": "Export failed unexpectedly."})
+        finally:
+            # Clean up all temp working copies
+            for _, local_path, is_temp in zip_entries:
+                if is_temp:
+                    Path(local_path).unlink(missing_ok=True)
+            for p in temp_files:
+                p.unlink(missing_ok=True)
+
     return StreamingResponse(
-        buffer,
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/{album_id}/export/download/{download_id}")
+async def export_album_download(
+    album_id: int,
+    download_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Download a completed export ZIP by its temporary download ID."""
+    # Auth check – must be album producer
+    ensure_album_producer(album_id, current_user, db)
+
+    entry = _export_temp_store.get(download_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Export not found or expired.")
+
+    file_path, _ = entry
+    if not Path(file_path).exists():
+        _export_temp_store.pop(download_id, None)
+        raise HTTPException(status_code=404, detail="Export file not found.")
+
+    album = db.get(Album, album_id)
+    safe_title = (album.title if album else "album").replace(" ", "_").replace("/", "_").replace("\\", "_")
+
+    async def _stream_and_cleanup():
+        try:
+            with open(file_path, "rb") as f:
+                while chunk := f.read(64 * 1024):
+                    yield chunk
+        finally:
+            _export_temp_store.pop(download_id, None)
+            Path(file_path).unlink(missing_ok=True)
+
+    return StreamingResponse(
+        _stream_and_cleanup(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{safe_album_title}.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.zip"'},
     )
 
 
