@@ -854,10 +854,18 @@ def test_multi_reviewer_forward_waits_for_required_count(client, db_session, fac
         json={"decision": "pass"},
     )
     assert second.status_code == 200
-    assert second.json()["status"] == "producer_gate"
+    assert second.json()["status"] == "custom_review"
+
+    finalize = client.post(
+        f"/api/tracks/{track.id}/workflow/transition",
+        headers=auth_headers(reviewer_a),
+        json={"decision": "pass"},
+    )
+    assert finalize.status_code == 200
+    assert finalize.json()["status"] == "producer_gate"
 
 
-def test_multi_reviewer_non_forward_decision_rolls_back_immediately(client, db_session, factory, auth_headers):
+def test_multi_reviewer_non_forward_decision_waits_for_peer_finalization(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user(username="submitter")
@@ -925,7 +933,162 @@ def test_multi_reviewer_non_forward_decision_rolls_back_immediately(client, db_s
         json={"decision": "needs_revision"},
     )
     assert rollback.status_code == 200
-    assert rollback.json()["status"] == "custom_revision"
+    assert rollback.json()["status"] == "custom_review"
+
+    finalize = client.post(
+        f"/api/tracks/{track.id}/workflow/transition",
+        headers=auth_headers(reviewer_a),
+        json={"decision": "needs_revision"},
+    )
+    assert finalize.status_code == 200
+    assert finalize.json()["status"] == "custom_revision"
+
+
+def test_manual_review_stage_waits_for_explicit_assignment(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_review",
+                    "label": "Custom Review",
+                    "type": "review",
+                    "ui_variant": "generic",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "producer_gate", "needs_revision": "custom_revision"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 2,
+                },
+                {
+                    "id": "custom_revision",
+                    "label": "Custom Revision",
+                    "type": "revision",
+                    "assignee_role": "submitter",
+                    "order": 1,
+                    "return_to": "custom_review",
+                    "transitions": {},
+                },
+                {
+                    "id": "producer_gate",
+                    "label": "Producer Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 2,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_review"
+    track.peer_reviewer_id = None
+    db_session.commit()
+
+    detail = client.get(f"/api/tracks/{track.id}", headers=auth_headers(producer))
+    assert detail.status_code == 200
+    assert detail.json()["track"]["peer_reviewer_id"] is None
+    assert detail.json()["track"]["workflow_transitions"] in (None, [])
+
+    assignments = client.get(
+        f"/api/tracks/{track.id}/assignments",
+        headers=auth_headers(producer),
+    )
+    assert assignments.status_code == 200
+    assert assignments.json() == []
+
+
+def test_producer_can_participate_in_peer_review_and_still_use_producer_gate(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[producer, submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "peer_review",
+                    "label": "Peer Review",
+                    "type": "review",
+                    "ui_variant": "peer_review",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "producer_gate", "needs_revision": "peer_revision"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 2,
+                    "revision_step": "peer_revision",
+                },
+                {
+                    "id": "peer_revision",
+                    "label": "Peer Revision",
+                    "type": "revision",
+                    "assignee_role": "submitter",
+                    "order": 1,
+                    "return_to": "peer_review",
+                    "transitions": {},
+                },
+                {
+                    "id": "producer_gate",
+                    "label": "Producer Gate",
+                    "type": "approval",
+                    "ui_variant": "producer_gate",
+                    "assignee_role": "producer",
+                    "order": 2,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "peer_review"
+    source_version = track.source_versions[-1]
+    now = datetime.now(timezone.utc)
+    db_session.add_all([
+        StageAssignment(track_id=track.id, stage_id="peer_review", user_id=producer.id, status="pending", assigned_at=now),
+        StageAssignment(track_id=track.id, stage_id="peer_review", user_id=reviewer.id, status="pending", assigned_at=now),
+    ])
+    db_session.commit()
+
+    factory.checklist(track=track, reviewer=producer, source_version_id=source_version.id, label="Balance", passed=True)
+    factory.checklist(track=track, reviewer=reviewer, source_version_id=source_version.id, label="Balance", passed=True)
+
+    producer_review = client.post(
+        f"/api/tracks/{track.id}/workflow/transition",
+        headers=auth_headers(producer),
+        json={"decision": "pass"},
+    )
+    assert producer_review.status_code == 200
+    assert producer_review.json()["status"] == "peer_review"
+
+    reviewer_review = client.post(
+        f"/api/tracks/{track.id}/workflow/transition",
+        headers=auth_headers(reviewer),
+        json={"decision": "pass"},
+    )
+    assert reviewer_review.status_code == 200
+    assert reviewer_review.json()["status"] == "peer_review"
+
+    finalize = client.post(
+        f"/api/tracks/{track.id}/workflow/transition",
+        headers=auth_headers(producer),
+        json={"decision": "pass"},
+    )
+    assert finalize.status_code == 200
+    assert finalize.json()["status"] == "producer_gate"
+
+    producer_gate = client.get(f"/api/tracks/{track.id}", headers=auth_headers(producer))
+    assert producer_gate.status_code == 200
+    assert producer_gate.json()["track"]["status"] == "producer_gate"
+    assert producer_gate.json()["track"]["workflow_transitions"][0]["decision"] == "approve"
 
 
 def test_revision_upload_reopens_review_assignments_with_decisions_cleared(client, db_session, factory, auth_headers):

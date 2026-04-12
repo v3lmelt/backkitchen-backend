@@ -766,6 +766,7 @@ class StageAssignmentRead(BaseModel):
     user_id: int
     status: str
     decision: str | None = None
+    cancellation_reason: str | None = None
     assigned_at: datetime
     completed_at: datetime | None = None
     user: UserRead | None = None

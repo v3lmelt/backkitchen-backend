@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -25,7 +24,6 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models.album import Album
-from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus, RejectionMode, WorkflowVariant
@@ -35,6 +33,130 @@ from app.workflow import current_source_version, log_track_event
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG, SPECIAL_TARGETS, STEP_TYPE_ALIASES
 
 logger = logging.getLogger(__name__)
+
+ASSIGNMENT_ACTIVE_STATUSES = ("pending", "completed")
+ASSIGNMENT_CANCEL_REASON_QUORUM_MET = "quorum_met"
+ASSIGNMENT_CANCEL_REASON_REASSIGNED = "reassigned"
+REVIEW_FORWARD_DECISIONS = {"pass", "approve"}
+
+
+def _review_requires_group_finalization(step: "StepDef") -> bool:
+    return step.type == "review" and max(1, step.required_reviewer_count or 1) > 1
+
+
+def _review_active_assignments(
+    db: Session,
+    track_id: int,
+    stage_id: str,
+) -> list[StageAssignment]:
+    return list(
+        db.scalars(
+            select(StageAssignment)
+            .where(
+                StageAssignment.track_id == track_id,
+                StageAssignment.stage_id == stage_id,
+                StageAssignment.status.in_(ASSIGNMENT_ACTIVE_STATUSES),
+            )
+            .order_by(StageAssignment.assigned_at.asc(), StageAssignment.id.asc())
+        ).all()
+    )
+
+
+def _set_track_peer_reviewer_from_assignments(
+    track: Track,
+    step: "StepDef",
+    assignments: list[StageAssignment],
+) -> None:
+    if step.assignee_role != "peer_reviewer":
+        return
+    first_active = next((assignment for assignment in assignments if assignment.status in ASSIGNMENT_ACTIVE_STATUSES), None)
+    track.peer_reviewer_id = first_active.user_id if first_active else None
+
+
+def _notify_manual_assignment_needed(
+    db: Session,
+    album: Album,
+    track: Track,
+    step: "StepDef",
+    background_tasks: BackgroundTasks | None,
+) -> None:
+    if not background_tasks or not album.producer_id:
+        return
+    step_label = _step_label_zh(step)
+    notify(
+        db,
+        [album.producer_id],
+        "reviewer_assignment_needed",
+        "需要手动指派评审人",
+        f"「{track.title}」在「{step_label}」阶段等待制作人手动指派评审人。",
+        related_track_id=track.id,
+        background_tasks=background_tasks,
+        album_id=track.album_id,
+    )
+
+
+def _notify_assigned_reviewers(
+    db: Session,
+    track: Track,
+    step: "StepDef",
+    reviewer_ids: list[int],
+    background_tasks: BackgroundTasks | None,
+    *,
+    reopened: bool = False,
+) -> None:
+    if not reviewer_ids or not background_tasks:
+        return
+    step_label = _step_label_zh(step)
+    title = "评审已重新开启" if reopened else "你被指派为评审人"
+    body = (
+        f"「{track.title}」已重新进入「{step_label}」，请继续评审。"
+        if reopened
+        else f"你已被指派评审「{track.title}」（{step_label}）。"
+    )
+    notify(
+        db,
+        reviewer_ids,
+        "reviewer_assigned",
+        title,
+        body,
+        related_track_id=track.id,
+        background_tasks=background_tasks,
+        album_id=track.album_id,
+    )
+
+
+def _cancel_pending_review_assignments(
+    db: Session,
+    track_id: int,
+    stage_id: str,
+    *,
+    reason: str,
+) -> None:
+    db.execute(
+        update(StageAssignment)
+        .where(
+            StageAssignment.track_id == track_id,
+            StageAssignment.stage_id == stage_id,
+            StageAssignment.status == "pending",
+        )
+        .values(status="cancelled", cancellation_reason=reason)
+    )
+
+
+def _discard_internal_review_issues(db: Session, track: Track) -> None:
+    from app.models.issue import Issue, IssueStatus as _IssueStatus
+
+    pending_issues = list(
+        db.scalars(
+            select(Issue).where(
+                Issue.track_id == track.id,
+                Issue.workflow_cycle == track.workflow_cycle,
+                Issue.status == _IssueStatus.PENDING_DISCUSSION,
+            )
+        ).all()
+    )
+    for pending_issue in pending_issues:
+        db.delete(pending_issue)
 
 
 def _is_delivery_transition_user_visible(step: "StepDef", decision: str) -> bool:
@@ -244,27 +366,19 @@ def user_matches_role_or_assignment(
 ) -> bool:
     """Like user_matches_role but also checks StageAssignment for review steps."""
     if step.type == "review":
-        has_assignments = bool(
-            db.scalar(
-                select(func.count(StageAssignment.id)).where(
-                    StageAssignment.track_id == track.id,
-                    StageAssignment.stage_id == step.id,
-                )
-            )
-        )
-        # When explicit assignments exist for the stage, only pending assignees
-        # may act. This prevents already-finished reviewers from re-triggering
-        # transitions via the legacy role fallback.
+        has_assignments = bool(_review_active_assignments(db, track.id, step.id))
         if has_assignments:
             assignment = db.scalar(
                 select(StageAssignment.id).where(
                     StageAssignment.track_id == track.id,
                     StageAssignment.stage_id == step.id,
                     StageAssignment.user_id == user.id,
-                    StageAssignment.status == "pending",
+                    StageAssignment.status.in_(ASSIGNMENT_ACTIVE_STATUSES),
                 )
             )
             return assignment is not None
+        if step.assignment_mode == "manual":
+            return False
     return user_matches_role(user, album, track, step)
 
 
@@ -303,18 +417,7 @@ def assign_reviewers(
                 "(need %d, have %d). Falling back to manual.",
                 track.id, step.id, count, len(candidates),
             )
-            if background_tasks and album.producer_id:
-                step_label = _step_label_zh(step)
-                notify(
-                    db, [album.producer_id],
-                    "reviewer_assignment_needed",
-                    "需要手动指派评审人",
-                    f"「{track.title}」在「{step_label}」阶段无法自动分配评审人"
-                    "，请手动指派。",
-                    related_track_id=track.id,
-                    background_tasks=background_tasks,
-                    album_id=track.album_id,
-                )
+            _notify_manual_assignment_needed(db, album, track, step, background_tasks)
             return []
 
         # Load-balanced: pick candidates with fewest pending assignments
@@ -340,47 +443,14 @@ def assign_reviewers(
                 stage_id=step.id,
                 user_id=uid,
                 status="pending",
+                cancellation_reason=None,
                 assigned_at=now,
             ))
-        # Notify assigned reviewers
-        step_label = _step_label_zh(step)
-        notify(
-            db, selected,
-            "reviewer_assigned",
-            "你被指派为评审人",
-            f"你已被自动分配评审「{track.title}」（{step_label}）",
-            related_track_id=track.id,
-            background_tasks=background_tasks,
-            album_id=track.album_id,
-        )
+        _notify_assigned_reviewers(db, track, step, selected, background_tasks)
         return selected
 
     # Manual mode — no auto-assignment
     return []
-
-
-def _assign_random_peer_reviewer(db: Session, album: Album, track: Track) -> int:
-    """Fallback reviewer picker for manual-mode peer_review steps.
-
-    Chooses a random album member (excluding the submitter and the mastering
-    engineer) and sets it as ``track.peer_reviewer_id``. Used when a review
-    step is wired to ``peer_reviewer`` role in manual mode and no reviewer
-    was explicitly assigned by the producer yet.
-    """
-    members = db.scalars(select(AlbumMember).where(AlbumMember.album_id == album.id)).all()
-    candidates = [
-        member.user_id
-        for member in members
-        if member.user_id != track.submitter_id and member.user_id != album.mastering_engineer_id
-    ]
-    if not candidates:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="No eligible peer reviewer is available for this track.",
-        )
-    selected = random.choice(candidates)
-    track.peer_reviewer_id = selected
-    return selected
 
 
 def assign_peer_reviewer_for_step(
@@ -389,62 +459,46 @@ def assign_peer_reviewer_for_step(
 ) -> None:
     """Handle reviewer assignment when entering a review step.
 
-    For ``peer_reviewer`` role in manual mode, picks a random album member
-    as a fallback if no reviewer has been explicitly assigned. For other
-    configurations, uses the custom reviewer assignment system.
+    Manual review stages now stay blocked until the producer explicitly assigns
+    reviewers. Auto-assignment and explicit assignee overrides continue to
+    create StageAssignment records immediately.
     """
     if step.type != "review":
         return
 
-    # Clear stale assignments for this step before (re)assigning.
-    db.execute(
-        update(StageAssignment)
-        .where(
-            StageAssignment.track_id == track.id,
-            StageAssignment.stage_id == step.id,
-            StageAssignment.status == "pending",
-        )
-        .values(status="cancelled")
+    _cancel_pending_review_assignments(
+        db,
+        track.id,
+        step.id,
+        reason=ASSIGNMENT_CANCEL_REASON_REASSIGNED,
     )
 
     # Step-level assignee_user_id override takes precedence over all other modes.
     if step.assignee_user_id:
-        track.peer_reviewer_id = step.assignee_user_id
-        db.add(StageAssignment(
+        assignment = StageAssignment(
             track_id=track.id,
             stage_id=step.id,
             user_id=step.assignee_user_id,
             status="pending",
+            cancellation_reason=None,
             assigned_at=datetime.now(timezone.utc),
-        ))
-        notify(
-            db, [step.assignee_user_id],
-            "reviewer_assigned", "你被指派为评审人",
-            f"你已被指派评审「{track.title}」",
-            related_track_id=track.id,
-            background_tasks=background_tasks,
-            album_id=track.album_id,
         )
+        db.add(assignment)
+        _set_track_peer_reviewer_from_assignments(track, step, [assignment])
+        _notify_assigned_reviewers(db, track, step, [step.assignee_user_id], background_tasks)
         return
 
-    if step.assignee_role == "peer_reviewer" and step.assignment_mode != "auto":
-        if track.peer_reviewer_id is None:
-            assigned_id = _assign_random_peer_reviewer(db, album, track)
-            notify(
-                db, [assigned_id],
-                "reviewer_assigned", "你被指派为评审人",
-                f"你已被指派评审「{track.title}」",
-                related_track_id=track.id,
-                background_tasks=background_tasks,
-                album_id=track.album_id,
-            )
+    if step.assignment_mode == "manual":
+        _set_track_peer_reviewer_from_assignments(track, step, [])
+        _notify_manual_assignment_needed(db, album, track, step, background_tasks)
         return
 
     assigned = assign_reviewers(db, album, track, step, background_tasks)
-    # For peer_reviewer role, also set the first assignee on the track
-    # for backward compatibility with existing UI
-    if step.assignee_role == "peer_reviewer" and assigned and not track.peer_reviewer_id:
-        track.peer_reviewer_id = assigned[0]
+    assignments = [
+        StageAssignment(track_id=track.id, stage_id=step.id, user_id=uid, status="pending")
+        for uid in assigned
+    ]
+    _set_track_peer_reviewer_from_assignments(track, step, assignments)
 
 
 def prepare_review_assignments_for_stage_entry(
@@ -476,15 +530,24 @@ def prepare_review_assignments_for_stage_entry(
         assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
         return
 
+    reopened_user_ids: list[int] = []
     for assignment in existing_assignments:
-        if assignment.status in {"completed", "cancelled"}:
+        if assignment.status == "completed" or (
+            assignment.status == "cancelled"
+            and assignment.cancellation_reason in {None, ASSIGNMENT_CANCEL_REASON_QUORUM_MET}
+        ):
             assignment.status = "pending"
             assignment.completed_at = None
             assignment.decision = None
+            assignment.cancellation_reason = None
+            reopened_user_ids.append(assignment.user_id)
 
-    if step.assignee_role == "peer_reviewer":
-        first_pending = next((a for a in existing_assignments if a.status == "pending"), None)
-        track.peer_reviewer_id = first_pending.user_id if first_pending else track.peer_reviewer_id
+    active_assignments = [assignment for assignment in existing_assignments if assignment.status in ASSIGNMENT_ACTIVE_STATUSES]
+    if not active_assignments:
+        assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
+        return
+    _set_track_peer_reviewer_from_assignments(track, step, active_assignments)
+    _notify_assigned_reviewers(db, track, step, reopened_user_ids, background_tasks, reopened=True)
 
 
 # ---------------------------------------------------------------------------
@@ -501,9 +564,28 @@ def get_allowed_transitions(
     if step is None:
         return []
 
-    # Check role — with assignment awareness for review steps
-    if db and step.type == "review":
-        if not user_matches_role_or_assignment(user, album, track, step, db):
+    # Review steps use assignment state rather than the legacy role fallback.
+    if step.type == "review":
+        if db is None:
+            return []
+        review_assignments = _review_active_assignments(db, track.id, step.id)
+        if not review_assignments:
+            return []
+        user_pending_assignment = next(
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "pending"),
+            None,
+        )
+        user_completed_assignment = next(
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "completed"),
+            None,
+        )
+        completed_reviews = sum(1 for assignment in review_assignments if assignment.status == "completed")
+        quorum_reached = completed_reviews >= max(1, step.required_reviewer_count or 1)
+        if user_pending_assignment is None and not (
+            user_completed_assignment is not None
+            and _review_requires_group_finalization(step)
+            and quorum_reached
+        ):
             return []
     elif not user_matches_role(user, album, track, step):
         return []
@@ -607,9 +689,37 @@ def execute_transition(
             detail=f"Track is in unknown state '{track.status}'.",
         )
 
-    # Validate permissions — with assignment-aware check for review steps
+    review_assignments: list[StageAssignment] = []
+    pending_assignment: StageAssignment | None = None
+    completed_assignment: StageAssignment | None = None
+    required_reviews = max(1, step.required_reviewer_count or 1)
+    completed_reviews = 0
+    quorum_reached = False
+    review_requires_group_finalization = _review_requires_group_finalization(step)
+
+    # Validate permissions — review steps depend on assignment state.
     if step.type == "review":
-        if not user_matches_role_or_assignment(user, album, track, step, db):
+        review_assignments = _review_active_assignments(db, track.id, step.id)
+        if not review_assignments:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This review stage is waiting for reviewer assignment.",
+            )
+        pending_assignment = next(
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "pending"),
+            None,
+        )
+        completed_assignment = next(
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "completed"),
+            None,
+        )
+        completed_reviews = sum(1 for assignment in review_assignments if assignment.status == "completed")
+        quorum_reached = completed_reviews >= required_reviews
+        if pending_assignment is None and not (
+            completed_assignment is not None
+            and review_requires_group_finalization
+            and quorum_reached
+        ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You are not authorised to act on this step.",
@@ -653,86 +763,18 @@ def execute_transition(
                 detail="Submit the peer review checklist before finishing the review.",
             )
 
-    pending_assignment = None
-    total_assignments = 0
-    completed_assignments = 0
-    required_reviews = 1
-    if step.type == "review":
-        pending_assignment = db.scalar(
-            select(StageAssignment).where(
-                StageAssignment.track_id == track.id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.user_id == user.id,
-                StageAssignment.status == "pending",
-            )
-        )
-        total_assignments = db.scalar(
-            select(func.count(StageAssignment.id)).where(
-                StageAssignment.track_id == track.id,
-                StageAssignment.stage_id == step.id,
-            )
-        ) or 0
-        completed_assignments = db.scalar(
-            select(func.count(StageAssignment.id)).where(
-                StageAssignment.track_id == track.id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.status == "completed",
-            )
-        ) or 0
-        required_reviews = max(1, step.required_reviewer_count or 1)
-
     target = step.transitions[decision]
     previous_status = track.status
     steps = get_steps(config)
 
-    # Multi-review gate rules:
-    # - Any non-forward review decision immediately rolls back.
-    # - pass/approve only advances once required reviewer count is reached.
-    # - once advancing, remaining pending assignments are cancelled.
-    is_review_forward_decision = step.type == "review" and decision in {"pass", "approve"}
-
-    if step.type == "review" and pending_assignment:
+    if step.type == "review" and pending_assignment is not None:
         pending_assignment.status = "completed"
         pending_assignment.decision = decision
         pending_assignment.completed_at = datetime.now(timezone.utc)
-
-        if not is_review_forward_decision:
-            db.execute(
-                update(StageAssignment)
-                .where(
-                    StageAssignment.track_id == track.id,
-                    StageAssignment.stage_id == step.id,
-                    StageAssignment.status == "pending",
-                    StageAssignment.user_id != user.id,
-                )
-                .values(status="cancelled")
-            )
-            # Discard internal issues on reject too
-            from app.models.issue import Issue, IssueStatus as _IssueStatus
-
-            reject_pending = list(db.scalars(
-                select(Issue).where(
-                    Issue.track_id == track.id,
-                    Issue.workflow_cycle == track.workflow_cycle,
-                    Issue.status == _IssueStatus.PENDING_DISCUSSION,
-                )
-            ).all())
-            for pi in reject_pending:
-                db.delete(pi)
-
-    if step.type == "review" and pending_assignment is not None:
         db.flush()
 
-    if step.type == "review" and is_review_forward_decision and total_assignments > 0:
-        finished = db.scalar(
-            select(func.count(StageAssignment.id)).where(
-                StageAssignment.track_id == track.id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.status == "completed",
-            )
-        ) or 0
-        needed = min(required_reviews, total_assignments)
-        if finished < needed:
+        finished_reviews = completed_reviews + 1
+        if review_requires_group_finalization:
             log_track_event(
                 db, track, user,
                 "workflow_review_progress",
@@ -742,34 +784,39 @@ def execute_transition(
                     "step": step.id,
                     "phase": infer_issue_phase_for_step(step),
                     "decision": decision,
-                    "completed_reviews": finished,
-                    "required_reviews": needed,
+                    "completed_reviews": finished_reviews,
+                    "required_reviews": required_reviews,
+                    "quorum_reached": finished_reviews >= required_reviews,
                 },
             )
+
+            if finished_reviews >= required_reviews:
+                ready_reviewers = [
+                    assignment.user_id
+                    for assignment in review_assignments
+                    if assignment.user_id != user.id
+                ]
+                if ready_reviewers:
+                    notify(
+                        db,
+                        ready_reviewers,
+                        "workflow_review_ready_for_final_decision",
+                        "同行评审已达成人数",
+                        f"「{track.title}」已达到同行评审人数要求，请评审组内讨论并提交最终结论。",
+                        related_track_id=track.id,
+                        background_tasks=background_tasks,
+                        album_id=track.album_id,
+                    )
             return
 
-        db.execute(
-            update(StageAssignment)
-            .where(
-                StageAssignment.track_id == track.id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.status == "pending",
-            )
-            .values(status="cancelled")
+    if step.type == "review":
+        _cancel_pending_review_assignments(
+            db,
+            track.id,
+            step.id,
+            reason=ASSIGNMENT_CANCEL_REASON_QUORUM_MET,
         )
-
-        # Discard internal issues (pending_discussion) that were never published
-        from app.models.issue import Issue, IssueStatus as _IssueStatus
-
-        pending_issues = list(db.scalars(
-            select(Issue).where(
-                Issue.track_id == track.id,
-                Issue.workflow_cycle == track.workflow_cycle,
-                Issue.status == _IssueStatus.PENDING_DISCUSSION,
-            )
-        ).all())
-        for pi in pending_issues:
-            db.delete(pi)
+        _discard_internal_review_issues(db, track)
 
     # Producer-direct intake: skip peer review, mark variant accordingly
     if decision == "accept_producer_direct":
