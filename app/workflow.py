@@ -440,6 +440,8 @@ def build_track_read(
         workflow_step=workflow_step,
         workflow_transitions=workflow_transitions,
         is_public=track.is_public,
+        author_notes=track.author_notes,
+        mastering_notes=track.mastering_notes,
     )
 
 
