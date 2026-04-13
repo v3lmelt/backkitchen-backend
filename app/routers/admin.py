@@ -316,6 +316,11 @@ def admin_reassign(
     album = db.get(Album, track.album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    album_member_ids = set(
+        db.scalars(
+            select(AlbumMember.user_id).where(AlbumMember.album_id == album.id)
+        ).all()
+    )
     new_users: list[User] = []
     for uid in payload.user_ids:
         u = db.get(User, uid)
@@ -323,6 +328,11 @@ def admin_reassign(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"User {uid} not found.",
+            )
+        if uid not in album_member_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"User {u.display_name} is not a member of this album.",
             )
         new_users.append(u)
 
