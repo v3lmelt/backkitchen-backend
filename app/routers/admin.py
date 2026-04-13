@@ -2,7 +2,7 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, joinedload, load_only, selectinload
 
 from app.database import get_db
 from app.models.album import Album
@@ -26,6 +26,7 @@ from app.schemas.schemas import (
 )
 from app.security import get_current_user
 from app.workflow import build_track_read, log_track_event
+from app.workflow_engine import parse_workflow_config
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -149,19 +150,16 @@ def admin_dashboard(
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
 ) -> AdminDashboardStats:
-    total_users = db.scalar(select(func.count(User.id))) or 0
     users_by_role: dict[str, int] = {}
     for role, cnt in db.execute(select(User.role, func.count(User.id)).group_by(User.role)):
         users_by_role[role] = cnt
+    total_users = sum(users_by_role.values())
 
     total_albums = db.scalar(select(func.count(Album.id))) or 0
     active_albums = db.scalar(
         select(func.count(Album.id)).where(Album.archived_at.is_(None))
     ) or 0
 
-    total_tracks = db.scalar(
-        select(func.count(Track.id)).where(Track.archived_at.is_(None))
-    ) or 0
     tracks_by_status: dict[str, int] = {}
     for st, cnt in db.execute(
         select(Track.status, func.count(Track.id))
@@ -169,6 +167,7 @@ def admin_dashboard(
         .group_by(Track.status)
     ):
         tracks_by_status[st] = cnt
+    total_tracks = sum(tracks_by_status.values())
 
     open_issues = db.scalar(
         select(func.count(Issue.id)).where(Issue.status == IssueStatus.OPEN)
@@ -224,7 +223,7 @@ def admin_activity_log(
         select(WorkflowEvent)
         .options(
             joinedload(WorkflowEvent.actor),
-            joinedload(WorkflowEvent.track),
+            joinedload(WorkflowEvent.track).load_only(Track.id, Track.title),
         )
         .order_by(WorkflowEvent.created_at.desc())
     )
@@ -281,8 +280,6 @@ def admin_force_status(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
 
-    # Validate target status: must be a known workflow step or terminal status
-    from app.workflow_engine import parse_workflow_config
     config = parse_workflow_config(album)
     valid_step_ids = {s["id"] for s in config.get("steps", [])}
     terminal = {s.value for s in TrackStatus}

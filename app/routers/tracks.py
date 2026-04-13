@@ -796,11 +796,11 @@ def list_tracks(
         album = db.get(Album, album_id)
         if album is None:
             return []
-        members_by_album = get_all_album_member_ids(db, album_id=album_id)
         albums_by_id = {album.id: album}
         if current_user.is_admin:
             visible_album_ids = {album.id}
         else:
+            members_by_album = get_all_album_member_ids(db, album_id=album_id)
             visible_album_ids = {
                 album.id
                 for album in albums_by_id.values()
@@ -809,11 +809,11 @@ def list_tracks(
             }
     else:
         albums = list(db.scalars(select(Album)).all())
-        members_by_album = get_all_album_member_ids(db)
         albums_by_id = {alb.id: alb for alb in albums}
         if current_user.is_admin:
             visible_album_ids = set(albums_by_id.keys())
         else:
+            members_by_album = get_all_album_member_ids(db)
             visible_album_ids = {
                 alb.id
                 for alb in albums

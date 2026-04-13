@@ -77,7 +77,7 @@ def list_circles(
     current_user: User = Depends(get_current_user),
 ):
     if current_user.is_admin:
-        all_circles = list(db.execute(select(Circle)).scalars().all())
+        all_circles = list(db.scalars(select(Circle)).all())
         return [_circle_to_summary(c) for c in all_circles]
 
     memberships = db.execute(
