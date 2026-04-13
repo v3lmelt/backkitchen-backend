@@ -59,18 +59,10 @@ IMAGE_EXT_MAP = {
     "image/webp": ".webp",
 }
 
-ALLOWED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/flac", "audio/aac", "audio/ogg", "audio/x-flac", "audio/x-wav"}
-AUDIO_EXT_MAP = {
-    "audio/mpeg": ".mp3",
-    "audio/wav": ".wav",
-    "audio/x-wav": ".wav",
-    "audio/flac": ".flac",
-    "audio/x-flac": ".flac",
-    "audio/aac": ".aac",
-    "audio/ogg": ".ogg",
-}
-MAX_AUDIOS_PER_COMMENT = 3
-MAX_AUDIOS_PER_ISSUE = 3
+from app.config import ALLOWED_AUDIO_TYPES, AUDIO_EXT_MAP, MAX_AUDIOS_PER_UPLOAD
+
+MAX_AUDIOS_PER_COMMENT = MAX_AUDIOS_PER_UPLOAD
+MAX_AUDIOS_PER_ISSUE = MAX_AUDIOS_PER_UPLOAD
 MAX_IMAGES_PER_ISSUE = 3
 
 router = APIRouter(tags=["issues"])

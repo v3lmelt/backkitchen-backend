@@ -576,16 +576,29 @@ class DiscussionImageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DiscussionAudioRead(BaseModel):
+    id: int
+    discussion_id: int
+    audio_url: str
+    original_filename: str
+    duration: float | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class DiscussionRead(BaseModel):
     id: int
     track_id: int
     author_id: int
     visibility: str = "public"
+    phase: str = "general"
     content: str
     created_at: datetime
     edited_at: datetime | None = None
     author: UserRead | None = None
     images: list[DiscussionImageRead] = []
+    audios: list[DiscussionAudioRead] = []
 
     model_config = ConfigDict(from_attributes=True)
 

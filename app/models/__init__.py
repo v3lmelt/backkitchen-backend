@@ -5,7 +5,7 @@ from app.models.circle import Circle, CircleInviteCode, CircleMember
 from app.models.checklist import ChecklistItem
 from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
-from app.models.discussion import TrackDiscussion, TrackDiscussionImage
+from app.models.discussion import TrackDiscussion, TrackDiscussionAudio, TrackDiscussionImage
 from app.models.edit_history import EditHistory
 from app.models.comment_image import CommentImage
 from app.models.invitation import Invitation
@@ -55,6 +55,7 @@ __all__ = [
     "Track",
     "TrackPlaybackPreference",
     "TrackDiscussion",
+    "TrackDiscussionAudio",
     "TrackDiscussionImage",
     "TrackStatus",
     "TrackSourceVersion",

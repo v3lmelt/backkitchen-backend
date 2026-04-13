@@ -11,6 +11,19 @@ _INSECURE_DEFAULT_KEY = "dev-secret-key-change-in-production"
 MAX_AUDIO_UPLOAD_SIZE = 200 * 1024 * 1024  # 200 MB
 MAX_IMAGE_UPLOAD_SIZE = 10 * 1024 * 1024   # 10 MB
 
+# Audio upload constants (shared by issues and discussions routers)
+MAX_AUDIOS_PER_UPLOAD = 3
+ALLOWED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/flac", "audio/aac", "audio/ogg", "audio/x-flac", "audio/x-wav"}
+AUDIO_EXT_MAP = {
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+}
+
 
 class Settings(BaseSettings):
     APP_NAME: str = "Audio Management API"

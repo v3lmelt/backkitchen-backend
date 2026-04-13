@@ -10,17 +10,17 @@ from sqlalchemy.orm import Session, selectinload
 from app.config import settings
 from app.database import get_db
 from app.models.album import Album
-from app.models.discussion import TrackDiscussion, TrackDiscussionImage
+from app.models.discussion import TrackDiscussion, TrackDiscussionAudio, TrackDiscussionImage
 from app.models.edit_history import EditHistory
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
 from app.realtime import broadcast_track_updated
-from app.schemas.schemas import DiscussionImageRead, DiscussionRead, DiscussionUpdate, EditHistoryRead, UserRead
+from app.schemas.schemas import DiscussionAudioRead, DiscussionImageRead, DiscussionRead, DiscussionUpdate, EditHistoryRead, UserRead
 from app.security import get_current_user
 from app.services.upload import stream_upload
-from app.workflow import ensure_track_visibility
+from app.workflow import ensure_track_visibility, is_mastering_participant
 from app.workflow import mask_user_read_if_needed, peer_identity_anonymize_user_ids_for_viewer
 
 router = APIRouter(tags=["discussions"])
@@ -40,11 +40,23 @@ def _build_discussion_read(
         )
         for img in discussion.images
     ]
+    audios = [
+        DiscussionAudioRead(
+            id=a.id,
+            discussion_id=a.discussion_id,
+            audio_url=f"/uploads/{a.file_path}",
+            original_filename=a.original_filename,
+            duration=a.duration,
+            created_at=a.created_at,
+        )
+        for a in discussion.audios
+    ]
     return DiscussionRead(
         id=discussion.id,
         track_id=discussion.track_id,
         author_id=discussion.author_id,
         visibility=discussion.visibility,
+        phase=discussion.phase,
         content=discussion.content,
         created_at=discussion.created_at,
         edited_at=discussion.edited_at,
@@ -53,6 +65,7 @@ def _build_discussion_read(
             anonymize_user_ids,
         ),
         images=images,
+        audios=audios,
     )
 
 
@@ -62,6 +75,7 @@ def _build_discussion_read(
 )
 def list_discussions(
     track_id: int,
+    phase: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[DiscussionRead]:
@@ -69,15 +83,23 @@ def list_discussions(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
-    discussions = list(
-        db.scalars(
-            select(TrackDiscussion)
-            .where(TrackDiscussion.track_id == track_id)
-            .order_by(TrackDiscussion.created_at.asc())
-            .options(selectinload(TrackDiscussion.images), selectinload(TrackDiscussion.author))
-        ).all()
-    )
     album = db.get(Album, track.album_id)
+    can_see_mastering = album is not None and is_mastering_participant(current_user, track, album)
+
+    if phase == "mastering" and not can_see_mastering:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to mastering discussions.")
+
+    stmt = (
+        select(TrackDiscussion)
+        .where(TrackDiscussion.track_id == track_id)
+        .order_by(TrackDiscussion.created_at.asc())
+        .options(selectinload(TrackDiscussion.images), selectinload(TrackDiscussion.audios), selectinload(TrackDiscussion.author))
+    )
+    if phase is not None:
+        stmt = stmt.where(TrackDiscussion.phase == phase)
+    elif not can_see_mastering:
+        stmt = stmt.where(TrackDiscussion.phase != "mastering")
+    discussions = list(db.scalars(stmt).all())
     anonymize_user_ids: set[int] = set()
     if album is not None:
         anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
@@ -93,19 +115,26 @@ async def create_discussion(
     track_id: int,
     background_tasks: BackgroundTasks,
     content: str = Form(...),
+    phase: str = Form(default="general"),
     images: Optional[list[UploadFile]] = File(default=None),
+    audios: Optional[list[UploadFile]] = File(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> DiscussionRead:
+    if phase not in ("general", "mastering"):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid phase.")
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
+    if phase == "mastering" and not is_mastering_participant(current_user, track, album):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to mastering discussions.")
     anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
 
     discussion = TrackDiscussion(
         track_id=track_id,
         author_id=current_user.id,
+        phase=phase,
         content=content,
     )
     db.add(discussion)
@@ -139,18 +168,55 @@ async def create_discussion(
                 )
             )
 
-    # Notify track participants
-    reviewer_ids = set(
-        db.scalars(
-            select(StageAssignment.user_id).where(
-                StageAssignment.track_id == track.id,
-                StageAssignment.status.in_(["pending", "completed"]),
+    if audios and phase == "mastering":
+        from app.config import ALLOWED_AUDIO_TYPES, AUDIO_EXT_MAP, MAX_AUDIO_UPLOAD_SIZE, MAX_AUDIOS_PER_UPLOAD
+        from app.services.audio import extract_audio_metadata
+
+        if len(audios) > MAX_AUDIOS_PER_UPLOAD:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Maximum {MAX_AUDIOS_PER_UPLOAD} audio files per discussion.")
+        audio_dir = settings.get_upload_path() / "discussion_audios"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        for audio_file in audios:
+            if not audio_file.content_type or audio_file.content_type not in ALLOWED_AUDIO_TYPES:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Unsupported audio type: {audio_file.content_type}",
+                )
+            ext = AUDIO_EXT_MAP.get(audio_file.content_type, ".mp3")
+            filename = f"{uuid.uuid4().hex}{ext}"
+            dest = audio_dir / filename
+            await stream_upload(audio_file, dest, MAX_AUDIO_UPLOAD_SIZE)
+            duration = extract_audio_metadata(dest).duration
+            db.add(
+                TrackDiscussionAudio(
+                    discussion_id=discussion.id,
+                    file_path=f"discussion_audios/{filename}",
+                    original_filename=audio_file.filename or filename,
+                    duration=duration,
+                )
             )
-        ).all()
-    )
-    participant_ids = {track.submitter_id, track.peer_reviewer_id, album.producer_id, *reviewer_ids}
-    if album.mastering_engineer_id:
-        participant_ids.add(album.mastering_engineer_id)
+    elif audios and phase != "mastering":
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Audio uploads are only allowed in mastering discussions.")
+
+    # Notify participants — mastering discussions only notify submitter, mastering engineer, and producer
+    if phase == "mastering":
+        participant_ids: set[int | None] = {track.submitter_id, album.producer_id}
+        if album.mastering_engineer_id:
+            participant_ids.add(album.mastering_engineer_id)
+        notify_body = f"「{track.title}」有新的母带讨论"
+    else:
+        reviewer_ids = set(
+            db.scalars(
+                select(StageAssignment.user_id).where(
+                    StageAssignment.track_id == track.id,
+                    StageAssignment.status.in_(["pending", "completed"]),
+                )
+            ).all()
+        )
+        participant_ids = {track.submitter_id, track.peer_reviewer_id, album.producer_id, *reviewer_ids}
+        if album.mastering_engineer_id:
+            participant_ids.add(album.mastering_engineer_id)
+        notify_body = f"「{track.title}」有新的讨论"
     participant_ids.discard(current_user.id)
     participant_ids.discard(None)
     notify(
@@ -158,7 +224,7 @@ async def create_discussion(
         list(participant_ids),
         "new_discussion",
         "新讨论",
-        f"「{track.title}」有新的讨论",
+        notify_body,
         related_track_id=track.id,
         background_tasks=background_tasks,
         album_id=track.album_id,
@@ -189,6 +255,8 @@ def update_discussion(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
     album = db.get(Album, track.album_id)
+    if discussion.phase == "mastering" and album is not None and not is_mastering_participant(current_user, track, album):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to mastering discussions.")
     anonymize_user_ids: set[int] = set()
     if album is not None:
         anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
@@ -227,6 +295,10 @@ def delete_discussion(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
+    if discussion.phase == "mastering":
+        album = db.get(Album, track.album_id)
+        if album is not None and not is_mastering_participant(current_user, track, album):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to mastering discussions.")
     if discussion.author_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can delete this discussion.")
 
@@ -248,6 +320,10 @@ def get_discussion_history(
     track = db.get(Track, discussion.track_id)
     if track:
         ensure_track_visibility(track, current_user, db)
+        if discussion.phase == "mastering":
+            album = db.get(Album, track.album_id)
+            if album is not None and not is_mastering_participant(current_user, track, album):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to mastering discussions.")
 
     histories = list(db.scalars(
         select(EditHistory)
