@@ -145,6 +145,9 @@ def list_albums(
     members_by_album = get_all_album_member_ids(db)
     visible: list[AlbumRead] = []
     for album in albums:
+        if current_user.is_admin:
+            visible.append(_album_to_read(album, db))
+            continue
         member_ids = members_by_album.get(album.id, set())
         if current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids:
             visible.append(_album_to_read(album, db))

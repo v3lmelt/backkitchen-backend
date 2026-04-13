@@ -798,22 +798,28 @@ def list_tracks(
             return []
         members_by_album = get_all_album_member_ids(db, album_id=album_id)
         albums_by_id = {album.id: album}
-        visible_album_ids = {
-            album.id
-            for album in albums_by_id.values()
-            if current_user.id
-            in ({album.producer_id, album.mastering_engineer_id} | members_by_album.get(album.id, set()))
-        }
+        if current_user.is_admin:
+            visible_album_ids = {album.id}
+        else:
+            visible_album_ids = {
+                album.id
+                for album in albums_by_id.values()
+                if current_user.id
+                in ({album.producer_id, album.mastering_engineer_id} | members_by_album.get(album.id, set()))
+            }
     else:
         albums = list(db.scalars(select(Album)).all())
         members_by_album = get_all_album_member_ids(db)
-        visible_album_ids = {
-            alb.id
-            for alb in albums
-            if current_user.id
-            in ({alb.producer_id, alb.mastering_engineer_id} | members_by_album.get(alb.id, set()))
-        }
         albums_by_id = {alb.id: alb for alb in albums}
+        if current_user.is_admin:
+            visible_album_ids = set(albums_by_id.keys())
+        else:
+            visible_album_ids = {
+                alb.id
+                for alb in albums
+                if current_user.id
+                in ({alb.producer_id, alb.mastering_engineer_id} | members_by_album.get(alb.id, set()))
+            }
 
     stmt = (
         select(Track)
@@ -852,7 +858,7 @@ def list_tracks(
         alb = albums_by_id.get(track.album_id)
         if alb is None:
             continue
-        is_privileged = current_user.id in (alb.producer_id, alb.mastering_engineer_id)
+        is_privileged = current_user.is_admin or current_user.id in (alb.producer_id, alb.mastering_engineer_id)
         is_submitter = track.submitter_id == current_user.id
         is_reviewer = track.peer_reviewer_id == current_user.id
         is_assigned_reviewer = track.id in assigned_track_ids

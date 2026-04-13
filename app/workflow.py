@@ -85,6 +85,8 @@ def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Album not found.",
         )
+    if user.is_admin:
+        return album
     if album.producer_id != user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -94,6 +96,8 @@ def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
 
 
 def ensure_album_visibility(album: Album, user: User, db: Session) -> None:
+    if user.is_admin:
+        return
     member_ids = get_album_member_ids(db, album.id)
     visible_ids = {album.producer_id, album.mastering_engineer_id}
     visible_ids.update(member_ids)
@@ -237,6 +241,9 @@ def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
     album = db.get(Album, track.album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    # Admins bypass all visibility checks
+    if user.is_admin:
+        return album
     # Producer and mastering engineer always have access
     if user.id in (album.producer_id, album.mastering_engineer_id):
         return album
