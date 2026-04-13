@@ -1,16 +1,31 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.database import get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
+from app.models.issue import Issue, IssueStatus
+from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus
 from app.models.user import User
+from app.models.workflow_event import WorkflowEvent
 from app.routers.albums import _album_to_read
-from app.schemas.schemas import AdminUserUpdate, AlbumRead, TrackRead, UserRead
+from app.schemas.schemas import (
+    AdminActivityLogEntry,
+    AdminDashboardStats,
+    AdminForceStatus,
+    AdminReassign,
+    AdminUserUpdate,
+    AlbumRead,
+    TrackRead,
+    UserRead,
+    WorkflowEventRead,
+)
 from app.security import get_current_user
-from app.workflow import build_track_read
+from app.workflow import build_track_read, log_track_event
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -124,3 +139,221 @@ def admin_list_album_tracks(
         ).all()
     )
     return [build_track_read(track, admin, album, db=db) for track in tracks]
+
+
+# ── Dashboard stats ──────────────────────────────────────────────────────────
+
+
+@router.get("/dashboard", response_model=AdminDashboardStats)
+def admin_dashboard(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+) -> AdminDashboardStats:
+    total_users = db.scalar(select(func.count(User.id))) or 0
+    users_by_role: dict[str, int] = {}
+    for role, cnt in db.execute(select(User.role, func.count(User.id)).group_by(User.role)):
+        users_by_role[role] = cnt
+
+    total_albums = db.scalar(select(func.count(Album.id))) or 0
+    active_albums = db.scalar(
+        select(func.count(Album.id)).where(Album.archived_at.is_(None))
+    ) or 0
+
+    total_tracks = db.scalar(
+        select(func.count(Track.id)).where(Track.archived_at.is_(None))
+    ) or 0
+    tracks_by_status: dict[str, int] = {}
+    for st, cnt in db.execute(
+        select(Track.status, func.count(Track.id))
+        .where(Track.archived_at.is_(None))
+        .group_by(Track.status)
+    ):
+        tracks_by_status[st] = cnt
+
+    open_issues = db.scalar(
+        select(func.count(Issue.id)).where(Issue.status == IssueStatus.OPEN)
+    ) or 0
+
+    recent_events_rows = list(
+        db.scalars(
+            select(WorkflowEvent)
+            .options(joinedload(WorkflowEvent.actor))
+            .order_by(WorkflowEvent.created_at.desc())
+            .limit(20)
+        ).unique().all()
+    )
+    recent_events = [
+        WorkflowEventRead(
+            id=e.id,
+            event_type=e.event_type,
+            from_status=e.from_status,
+            to_status=e.to_status,
+            payload=json.loads(e.payload) if e.payload else None,
+            created_at=e.created_at,
+            actor=None if e.actor is None else UserRead.model_validate(e.actor),
+        )
+        for e in recent_events_rows
+    ]
+
+    return AdminDashboardStats(
+        total_users=total_users,
+        users_by_role=users_by_role,
+        total_albums=total_albums,
+        active_albums=active_albums,
+        total_tracks=total_tracks,
+        tracks_by_status=tracks_by_status,
+        open_issues=open_issues,
+        recent_events=recent_events,
+    )
+
+
+# ── Activity log ─────────────────────────────────────────────────────────────
+
+
+@router.get("/activity-log", response_model=list[AdminActivityLogEntry])
+def admin_activity_log(
+    album_id: int | None = Query(default=None),
+    event_type: str | None = Query(default=None),
+    actor_user_id: int | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+) -> list[AdminActivityLogEntry]:
+    stmt = (
+        select(WorkflowEvent)
+        .options(
+            joinedload(WorkflowEvent.actor),
+            joinedload(WorkflowEvent.track),
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    if album_id is not None:
+        stmt = stmt.where(WorkflowEvent.album_id == album_id)
+    if event_type is not None:
+        stmt = stmt.where(WorkflowEvent.event_type == event_type)
+    if actor_user_id is not None:
+        stmt = stmt.where(WorkflowEvent.actor_user_id == actor_user_id)
+    stmt = stmt.limit(limit).offset(offset)
+
+    events = list(db.scalars(stmt).unique().all())
+
+    album_ids = {e.album_id for e in events if e.album_id}
+    album_map: dict[int, str] = {}
+    if album_ids:
+        for aid, title in db.execute(
+            select(Album.id, Album.title).where(Album.id.in_(album_ids))
+        ):
+            album_map[aid] = title
+
+    return [
+        AdminActivityLogEntry(
+            id=e.id,
+            event_type=e.event_type,
+            from_status=e.from_status,
+            to_status=e.to_status,
+            payload=json.loads(e.payload) if e.payload else None,
+            created_at=e.created_at,
+            actor=None if e.actor is None else UserRead.model_validate(e.actor),
+            track_id=e.track_id,
+            track_title=e.track.title if e.track else None,
+            album_id=e.album_id,
+            album_title=album_map.get(e.album_id) if e.album_id else None,
+        )
+        for e in events
+    ]
+
+
+# ── Workflow intervention ────────────────────────────────────────────────────
+
+
+@router.post("/tracks/{track_id}/force-status")
+def admin_force_status(
+    track_id: int,
+    payload: AdminForceStatus,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = db.get(Album, track.album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+
+    # Validate target status: must be a known workflow step or terminal status
+    from app.workflow_engine import parse_workflow_config
+    config = parse_workflow_config(album)
+    valid_step_ids = {s["id"] for s in config.get("steps", [])}
+    terminal = {s.value for s in TrackStatus}
+    valid_statuses = valid_step_ids | terminal
+    if payload.new_status not in valid_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid status. Valid: {sorted(valid_statuses)}",
+        )
+
+    old_status = track.status
+    track.status = payload.new_status
+    log_track_event(
+        db, track, admin, "admin_force_status",
+        from_status=old_status,
+        to_status=payload.new_status,
+        payload={"reason": payload.reason},
+    )
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, admin, album, db=db)
+
+
+@router.post("/tracks/{track_id}/reassign")
+def admin_reassign(
+    track_id: int,
+    payload: AdminReassign,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = db.get(Album, track.album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    new_user = db.get(User, payload.user_id)
+    if new_user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target user not found.")
+
+    old_reviewer_id = track.peer_reviewer_id
+    track.peer_reviewer_id = payload.user_id
+
+    # Cancel existing pending assignments for the current stage and create a new one
+    pending = list(db.scalars(
+        select(StageAssignment).where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id == track.status,
+            StageAssignment.status == "pending",
+        )
+    ).all())
+    for a in pending:
+        a.status = "completed"
+        a.cancellation_reason = "reassigned"
+    db.add(StageAssignment(
+        track_id=track.id,
+        stage_id=track.status,
+        user_id=payload.user_id,
+        status="pending",
+    ))
+
+    log_track_event(
+        db, track, admin, "admin_reassign",
+        payload={
+            "reason": payload.reason,
+            "old_reviewer_id": old_reviewer_id,
+            "new_reviewer_id": payload.user_id,
+            "new_reviewer_name": new_user.display_name,
+            "stage": track.status,
+        },
+    )
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, admin, album, db=db)
