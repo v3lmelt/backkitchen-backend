@@ -76,7 +76,7 @@ class AdminForceStatus(BaseModel):
 
 
 class AdminReassign(BaseModel):
-    user_id: int
+    user_ids: list[int] = Field(..., min_length=1)
     reason: str = Field(..., min_length=1, max_length=500)
 
 

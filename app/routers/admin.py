@@ -316,14 +316,20 @@ def admin_reassign(
     album = db.get(Album, track.album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    new_user = db.get(User, payload.user_id)
-    if new_user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target user not found.")
+    new_users: list[User] = []
+    for uid in payload.user_ids:
+        u = db.get(User, uid)
+        if u is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User {uid} not found.",
+            )
+        new_users.append(u)
 
     old_reviewer_id = track.peer_reviewer_id
-    track.peer_reviewer_id = payload.user_id
+    track.peer_reviewer_id = payload.user_ids[0]
 
-    # Cancel existing pending assignments for the current stage and create a new one
+    # Cancel existing pending assignments for the current stage
     pending = list(db.scalars(
         select(StageAssignment).where(
             StageAssignment.track_id == track.id,
@@ -334,20 +340,23 @@ def admin_reassign(
     for a in pending:
         a.status = "completed"
         a.cancellation_reason = "reassigned"
-    db.add(StageAssignment(
-        track_id=track.id,
-        stage_id=track.status,
-        user_id=payload.user_id,
-        status="pending",
-    ))
+
+    # Create new assignments for each user
+    for u in new_users:
+        db.add(StageAssignment(
+            track_id=track.id,
+            stage_id=track.status,
+            user_id=u.id,
+            status="pending",
+        ))
 
     log_track_event(
         db, track, admin, "admin_reassign",
         payload={
             "reason": payload.reason,
             "old_reviewer_id": old_reviewer_id,
-            "new_reviewer_id": payload.user_id,
-            "new_reviewer_name": new_user.display_name,
+            "new_user_ids": payload.user_ids,
+            "new_user_names": [u.display_name for u in new_users],
             "stage": track.status,
         },
     )
