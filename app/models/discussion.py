@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -17,6 +17,7 @@ class TrackDiscussion(Base):
         Integer, ForeignKey("users.id"), nullable=False
     )
     visibility: Mapped[str] = mapped_column(String(20), nullable=False, default="public", server_default="public")
+    phase: Mapped[str] = mapped_column(String(20), nullable=False, default="general", server_default="general")
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
@@ -27,6 +28,11 @@ class TrackDiscussion(Base):
     author: Mapped["User"] = relationship("User", foreign_keys=[author_id])  # noqa: F821
     images: Mapped[list["TrackDiscussionImage"]] = relationship(
         "TrackDiscussionImage",
+        back_populates="discussion",
+        cascade="all, delete-orphan",
+    )
+    audios: Mapped[list["TrackDiscussionAudio"]] = relationship(
+        "TrackDiscussionAudio",
         back_populates="discussion",
         cascade="all, delete-orphan",
     )
@@ -46,4 +52,23 @@ class TrackDiscussionImage(Base):
 
     discussion: Mapped["TrackDiscussion"] = relationship(
         "TrackDiscussion", back_populates="images"
+    )
+
+
+class TrackDiscussionAudio(Base):
+    __tablename__ = "track_discussion_audios"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    discussion_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("track_discussions.id"), nullable=False, index=True
+    )
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    duration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    discussion: Mapped["TrackDiscussion"] = relationship(
+        "TrackDiscussion", back_populates="audios"
     )

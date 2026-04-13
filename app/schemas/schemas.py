@@ -45,6 +45,41 @@ class AdminUserUpdate(BaseModel):
     email_verified: bool | None = None
 
 
+class AdminDashboardStats(BaseModel):
+    total_users: int
+    users_by_role: dict[str, int]
+    total_albums: int
+    active_albums: int
+    total_tracks: int
+    tracks_by_status: dict[str, int]
+    open_issues: int
+    recent_events: list["WorkflowEventRead"] = []
+
+
+class AdminActivityLogEntry(BaseModel):
+    id: int
+    event_type: str
+    from_status: str | None = None
+    to_status: str | None = None
+    payload: dict[str, Any] | None = None
+    created_at: datetime
+    actor: UserRead | None = None
+    track_id: int | None = None
+    track_title: str | None = None
+    album_id: int | None = None
+    album_title: str | None = None
+
+
+class AdminForceStatus(BaseModel):
+    new_status: str = Field(..., min_length=1, max_length=50)
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+class AdminReassign(BaseModel):
+    user_ids: list[int] = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
 class UserUpdateProfile(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=100)
     email: str | None = Field(default=None, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -576,16 +611,29 @@ class DiscussionImageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DiscussionAudioRead(BaseModel):
+    id: int
+    discussion_id: int
+    audio_url: str
+    original_filename: str
+    duration: float | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class DiscussionRead(BaseModel):
     id: int
     track_id: int
     author_id: int
     visibility: str = "public"
+    phase: str = "general"
     content: str
     created_at: datetime
     edited_at: datetime | None = None
     author: UserRead | None = None
     images: list[DiscussionImageRead] = []
+    audios: list[DiscussionAudioRead] = []
 
     model_config = ConfigDict(from_attributes=True)
 

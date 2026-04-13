@@ -76,6 +76,10 @@ def list_circles(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if current_user.is_admin:
+        all_circles = list(db.scalars(select(Circle)).all())
+        return [_circle_to_summary(c) for c in all_circles]
+
     memberships = db.execute(
         select(CircleMember).where(CircleMember.user_id == current_user.id)
     ).scalars().all()
@@ -138,7 +142,7 @@ def get_circle(
 
     is_member = any(m.user_id == current_user.id for m in circle.members)
     is_creator = circle.created_by == current_user.id
-    if not is_member and not is_creator:
+    if not current_user.is_admin and not is_member and not is_creator:
         raise HTTPException(status_code=403, detail="Not a member of this circle")
 
     return _circle_to_read(circle)

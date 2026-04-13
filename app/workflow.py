@@ -28,6 +28,7 @@ from app.schemas.schemas import (
     CommentAudioRead,
     CommentImageRead,
     CommentRead,
+    DiscussionAudioRead,
     DiscussionImageRead,
     DiscussionRead,
     IssueAudioRead,
@@ -84,6 +85,8 @@ def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Album not found.",
         )
+    if user.is_admin:
+        return album
     if album.producer_id != user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -93,6 +96,8 @@ def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
 
 
 def ensure_album_visibility(album: Album, user: User, db: Session) -> None:
+    if user.is_admin:
+        return
     member_ids = get_album_member_ids(db, album.id)
     visible_ids = {album.producer_id, album.mastering_engineer_id}
     visible_ids.update(member_ids)
@@ -133,6 +138,11 @@ def should_anonymize_track(track: Track, user: User, album: Album) -> bool:
 
 def _is_identity_privileged_viewer(user: User, album: Album) -> bool:
     return user.id in (album.producer_id, album.mastering_engineer_id)
+
+
+def is_mastering_participant(user: User, track: Track, album: Album) -> bool:
+    """Return True if user is submitter, producer, or mastering engineer for this track."""
+    return user.id in {track.submitter_id, album.producer_id, album.mastering_engineer_id}
 
 
 def _hash_user_id(user_id: int) -> str:
@@ -231,6 +241,9 @@ def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
     album = db.get(Album, track.album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+    # Admins bypass all visibility checks
+    if user.is_admin:
+        return album
     # Producer and mastering engineer always have access
     if user.id in (album.producer_id, album.mastering_engineer_id):
         return album
@@ -664,6 +677,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.audios),
             selectinload(Track.workflow_events),
             selectinload(Track.discussions).selectinload(TrackDiscussion.images),
+            selectinload(Track.discussions).selectinload(TrackDiscussion.audios),
             selectinload(Track.source_versions),
             selectinload(Track.master_deliveries),
             selectinload(Track.checklist_items),
@@ -726,8 +740,10 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             track_id=d.track_id,
             author_id=d.author_id,
             visibility=d.visibility,
+            phase=d.phase,
             content=d.content,
             created_at=d.created_at,
+            edited_at=d.edited_at,
             author=_mask_user_read_if_needed(
                 _user_read(users_by_id.get(d.author_id) or d.author),
                 anonymize_user_ids,
@@ -741,12 +757,27 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
                 )
                 for img in d.images
             ],
+            audios=[
+                DiscussionAudioRead(
+                    id=a.id,
+                    discussion_id=a.discussion_id,
+                    audio_url=f"/uploads/{a.file_path}",
+                    original_filename=a.original_filename,
+                    duration=a.duration,
+                    created_at=a.created_at,
+                )
+                for a in d.audios
+            ],
         )
         for d in track.discussions
         if not (
             d.visibility == "internal"
             and user.id == track.submitter_id
             and user.id != album.producer_id
+        )
+        and not (
+            d.phase == "mastering"
+            and not is_mastering_participant(user, track, album)
         )
     ]
     # Mirror the defensive try/except used in `_album_to_read`: a stored

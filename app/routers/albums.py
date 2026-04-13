@@ -142,6 +142,8 @@ def list_albums(
         pattern = f"%{search}%"
         stmt = stmt.where(Album.title.ilike(pattern) | Album.description.ilike(pattern))
     albums = list(db.scalars(stmt).all())
+    if current_user.is_admin:
+        return [_album_to_read(album, db) for album in albums]
     members_by_album = get_all_album_member_ids(db)
     visible: list[AlbumRead] = []
     for album in albums:
