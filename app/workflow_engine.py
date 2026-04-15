@@ -144,7 +144,16 @@ def _cancel_pending_review_assignments(
     )
 
 
-def _discard_internal_review_issues(db: Session, track: Track) -> None:
+def _discard_internal_review_issues(
+    db: Session,
+    track: Track,
+    background_tasks: "BackgroundTasks | None" = None,
+) -> None:
+    """Close unresolved internal-discussion issues as INTERNAL_RESOLVED.
+
+    Previously these were deleted outright, which silently removed reviewer
+    feedback.  Now they are resolved internally and their authors are notified.
+    """
     from app.models.issue import Issue, IssueStatus as _IssueStatus
 
     pending_issues = list(
@@ -156,8 +165,25 @@ def _discard_internal_review_issues(db: Session, track: Track) -> None:
             )
         ).all()
     )
-    for pending_issue in pending_issues:
-        db.delete(pending_issue)
+    if not pending_issues:
+        return
+
+    author_ids: set[int] = set()
+    for issue in pending_issues:
+        issue.status = _IssueStatus.INTERNAL_RESOLVED
+        author_ids.add(issue.author_id)
+
+    if background_tasks and author_ids:
+        notify(
+            db,
+            list(author_ids),
+            "issue_status_changed",
+            "内部讨论问题已自动结案",
+            f"「{track.title}」进入修订阶段，{len(pending_issues)} 个待讨论问题已自动内部结案。",
+            related_track_id=track.id,
+            background_tasks=background_tasks,
+            album_id=track.album_id,
+        )
 
 
 def _is_delivery_transition_user_visible(step: "StepDef", decision: str) -> bool:
@@ -836,7 +862,7 @@ def execute_transition(
             step.id,
             reason=ASSIGNMENT_CANCEL_REASON_QUORUM_MET,
         )
-        _discard_internal_review_issues(db, track)
+        _discard_internal_review_issues(db, track, background_tasks)
 
     # Producer-direct intake: skip peer review, mark variant accordingly
     if decision == "accept_producer_direct":
