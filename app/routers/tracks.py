@@ -1268,45 +1268,22 @@ def reassign_reviewer(
     track.peer_reviewer_id = None
 
     if deduped_user_ids:
-        # Cancel assignments for users NOT in the new list (any status).
-        # Keep completed assignments for users who ARE in the new list.
+        # Cancel ALL existing assignments for this step (pending + completed)
+        # so reassignment always starts from a clean slate.
         db.execute(
             update(StageAssignment)
             .where(
                 StageAssignment.track_id == track_id,
                 StageAssignment.stage_id == step.id,
                 StageAssignment.status.in_(["pending", "completed"]),
-                StageAssignment.user_id.not_in(deduped_user_ids),
-            )
-            .values(status="cancelled", cancellation_reason="reassigned")
-        )
-        # Cancel pending assignments for users who ARE in the new list
-        # (they'll get a fresh pending, or keep completed).
-        db.execute(
-            update(StageAssignment)
-            .where(
-                StageAssignment.track_id == track_id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.status == "pending",
-                StageAssignment.user_id.in_(deduped_user_ids),
             )
             .values(status="cancelled", cancellation_reason="reassigned")
         )
 
         now = datetime.now(timezone.utc)
         track.peer_reviewer_id = deduped_user_ids[0]
-        already_completed = set(db.scalars(
-            select(StageAssignment.user_id).where(
-                StageAssignment.track_id == track_id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.status == "completed",
-                StageAssignment.user_id.in_(deduped_user_ids),
-            )
-        ).all())
         newly_assigned: list[int] = []
         for uid in deduped_user_ids:
-            if uid in already_completed:
-                continue
             db.add(StageAssignment(
                 track_id=track_id,
                 stage_id=step.id,
