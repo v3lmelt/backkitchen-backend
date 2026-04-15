@@ -45,6 +45,7 @@ from app.schemas.schemas import (
     WorkflowTransitionRequest,
 )
 from app.workflow_engine import (
+    compute_reopen_resets,
     prepare_review_assignments_for_stage_entry,
     execute_transition as engine_execute_transition,
     execute_revision_upload as engine_revision_upload,
@@ -1393,6 +1394,25 @@ def create_reopen_request(
     db.commit()
     db.refresh(req)
     return ReopenRequestRead.model_validate(req)
+
+
+@router.get("/{track_id}/reopen-preview")
+def preview_reopen(
+    track_id: int,
+    target_stage_id: str = Query(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Preview what will be reset when reopening a track to a given stage."""
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if track.status != "completed":
+        raise HTTPException(status_code=409, detail="Only completed tracks can be previewed for reopen.")
+
+    resets = compute_reopen_resets(db, album, track, target_stage_id)
+    return {"resets": resets}
 
 
 @router.post("/{track_id}/reopen", response_model=TrackRead)

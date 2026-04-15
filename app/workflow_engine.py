@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from app.models.album import Album
 from app.models.checklist import ChecklistItem
+from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus, RejectionMode, WorkflowVariant
 from app.models.user import User
@@ -1142,6 +1143,73 @@ def migrate_tracks_on_workflow_change(
 # ---------------------------------------------------------------------------
 
 
+def _collect_reopen_resets(
+    steps: list[StepDef],
+    target_step: StepDef,
+    track: Track,
+    db: Session,
+) -> list[str]:
+    """Return a list of human-readable descriptions of what will be reset."""
+    resets: list[str] = []
+
+    target_order = target_step.order
+    later_stages = [s for s in steps if s.order > target_order]
+
+    # Stage assignments that will be reset
+    later_stage_ids = [s.id for s in later_stages]
+    if later_stage_ids:
+        assignment_count = db.scalar(
+            select(func.count()).select_from(StageAssignment).where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id.in_(later_stage_ids),
+                StageAssignment.status.in_(("completed", "cancelled")),
+            )
+        ) or 0
+        if assignment_count:
+            stage_labels = ", ".join(s.label for s in later_stages if s.type == "review")
+            if stage_labels:
+                resets.append(f"stage_assignments:{stage_labels}")
+
+    # Checklist items
+    checklist_count = db.scalar(
+        select(func.count()).select_from(ChecklistItem).where(
+            ChecklistItem.track_id == track.id,
+            ChecklistItem.workflow_cycle == track.workflow_cycle,
+        )
+    ) or 0
+    if checklist_count:
+        resets.append("checklist_items")
+
+    # Master delivery approval timestamps
+    approval_count = db.scalar(
+        select(func.count()).select_from(MasterDelivery).where(
+            MasterDelivery.track_id == track.id,
+            MasterDelivery.workflow_cycle == track.workflow_cycle,
+            (MasterDelivery.producer_approved_at.isnot(None))
+            | (MasterDelivery.submitter_approved_at.isnot(None)),
+        )
+    ) or 0
+    if approval_count:
+        resets.append("master_delivery_approvals")
+
+    return resets
+
+
+def compute_reopen_resets(
+    db: Session,
+    album: Album,
+    track: Track,
+    target_stage_id: str,
+) -> list[str]:
+    """Public helper: preview what will be reset without executing the reopen."""
+    config = parse_workflow_config(album)
+    steps = get_steps(config)
+    target_step = get_step_by_id(steps, target_stage_id)
+    if target_step is None:
+        return []
+    return _collect_reopen_resets(steps, target_step, track, db)
+
+
 def execute_reopen(
     db: Session,
     album: Album,
@@ -1149,10 +1217,13 @@ def execute_reopen(
     actor: User,
     target_stage_id: str,
     background_tasks: BackgroundTasks | None = None,
-) -> None:
+) -> list[str]:
     """Reopen a completed track to a specific stage.
 
-    Increments ``workflow_cycle`` and sets ``track.status`` to the target stage.
+    Increments ``workflow_cycle``, sets ``track.status`` to the target stage,
+    and resets downstream state (stage assignments, checklist items, master
+    delivery approvals).  Returns a list of reset descriptions for the caller
+    to surface to the user.
     """
     config = parse_workflow_config(album)
     steps = get_steps(config)
@@ -1164,10 +1235,59 @@ def execute_reopen(
             detail=f"Target stage '{target_stage_id}' not found in workflow.",
         )
 
+    # Collect reset info BEFORE mutating state
+    resets = _collect_reopen_resets(steps, target_step, track, db)
+
     previous_status = track.status
     track.status = target_stage_id
     track.workflow_cycle += 1
     track.rejection_mode = None
+
+    # ------------------------------------------------------------------
+    # Reset downstream state
+    # ------------------------------------------------------------------
+    target_order = target_step.order
+    later_stage_ids = [s.id for s in steps if s.order > target_order]
+
+    # 1) Reset stage assignments for all stages after the target
+    if later_stage_ids:
+        db.execute(
+            update(StageAssignment)
+            .where(
+                StageAssignment.track_id == track.id,
+                StageAssignment.stage_id.in_(later_stage_ids),
+                StageAssignment.status.in_(("completed", "cancelled")),
+            )
+            .values(
+                status="pending",
+                completed_at=None,
+                decision=None,
+                cancellation_reason=None,
+            )
+        )
+
+    # 2) Clear checklist items from the current (old) cycle
+    db.execute(
+        delete(ChecklistItem).where(
+            ChecklistItem.track_id == track.id,
+            ChecklistItem.workflow_cycle == track.workflow_cycle - 1,
+        )
+    )
+
+    # 3) Clear master delivery approval timestamps (current cycle)
+    db.execute(
+        update(MasterDelivery)
+        .where(
+            MasterDelivery.track_id == track.id,
+            MasterDelivery.workflow_cycle == track.workflow_cycle - 1,
+        )
+        .values(
+            producer_approved_at=None,
+            submitter_approved_at=None,
+        )
+    )
+
+    db.expire_all()
 
     log_track_event(
         db, track, actor,
@@ -1177,6 +1297,7 @@ def execute_reopen(
         payload={
             "target_stage": target_stage_id,
             "new_cycle": track.workflow_cycle,
+            "resets": resets,
         },
     )
 
@@ -1201,6 +1322,8 @@ def execute_reopen(
             album_id=track.album_id,
             webhook_context={"actor_id": actor.id, "actor_name": actor.display_name, "to_step": target_label},
         )
+
+    return resets
 
 
 # ---------------------------------------------------------------------------
