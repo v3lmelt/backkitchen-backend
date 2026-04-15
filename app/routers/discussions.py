@@ -16,7 +16,7 @@ from app.models.stage_assignment import StageAssignment
 from app.models.track import Track
 from app.models.user import User
 from app.notifications import notify
-from app.realtime import broadcast_track_updated
+from app.realtime import broadcast_discussion_event, broadcast_track_updated
 from app.schemas.schemas import DiscussionAudioRead, DiscussionImageRead, DiscussionRead, DiscussionUpdate, EditHistoryRead, UserRead
 from app.security import get_current_user
 from app.services.upload import stream_upload
@@ -233,6 +233,7 @@ async def create_discussion(
     db.commit()
     db.refresh(discussion)
     broadcast_track_updated(background_tasks, track.id)
+    broadcast_discussion_event(background_tasks, track.id, "created", discussion.id)
     return _build_discussion_read(discussion, anonymize_user_ids)
 
 
@@ -275,6 +276,7 @@ def update_discussion(
     db.commit()
     db.refresh(discussion)
     broadcast_track_updated(background_tasks, discussion.track_id)
+    broadcast_discussion_event(background_tasks, discussion.track_id, "updated", discussion.id)
     return _build_discussion_read(discussion, anonymize_user_ids)
 
 
@@ -303,9 +305,11 @@ def delete_discussion(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the author can delete this discussion.")
 
     track_id = discussion.track_id
+    disc_id = discussion.id
     db.delete(discussion)
     db.commit()
     broadcast_track_updated(background_tasks, track_id)
+    broadcast_discussion_event(background_tasks, track_id, "deleted", disc_id)
 
 
 @router.get("/api/discussions/{discussion_id}/history", response_model=list[EditHistoryRead])

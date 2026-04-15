@@ -13,6 +13,25 @@ def broadcast_track_updated(background_tasks: BackgroundTasks, track_id: int) ->
     )
 
 
+def broadcast_discussion_event(
+    background_tasks: BackgroundTasks,
+    track_id: int,
+    event: str,
+    discussion_id: int,
+) -> None:
+    """Schedule a discussion-specific event (created/updated/deleted)."""
+    background_tasks.add_task(
+        track_manager.broadcast,
+        track_id,
+        {
+            "type": "discussion_event",
+            "track_id": track_id,
+            "event": event,
+            "discussion_id": discussion_id,
+        },
+    )
+
+
 def broadcast_notifications_updated(background_tasks: BackgroundTasks, user_ids: list[int | None]) -> None:
     """Schedule a notification refresh event for one or more users."""
     target_ids = [user_id for user_id in dict.fromkeys(user_ids) if user_id is not None]

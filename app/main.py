@@ -425,7 +425,7 @@ def _run_archived_track_cleanup() -> int:
         for track_id in expired_ids:
             try:
                 track = db.get(Track, track_id)
-                if track is None:
+                if track is None or track.archived_at is None:
                     continue
                 local_paths, r2_keys = collect_track_files(track)
                 db.delete(track)
@@ -463,7 +463,7 @@ def _run_archived_album_cleanup() -> int:
         for album_id in expired_ids:
             try:
                 album = db.get(Album, album_id)
-                if album is None:
+                if album is None or album.archived_at is None:
                     continue
                 local_paths, r2_keys = collect_album_files(album)
                 db.delete(album)
