@@ -813,6 +813,10 @@ def execute_transition(
     previous_status = track.status
     steps = get_steps(config)
 
+    # NOTE: SQLite serialises all writes via a single-writer lock, so concurrent
+    # reviewer submissions are safe — each transaction sees a consistent snapshot
+    # of `completed_reviews`.  If migrating to PostgreSQL, add SELECT … FOR UPDATE
+    # on the StageAssignment rows to prevent the same race under MVCC.
     if step.type == "review" and pending_assignment is not None:
         pending_assignment.status = "completed"
         pending_assignment.decision = decision

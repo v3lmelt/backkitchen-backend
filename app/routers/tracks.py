@@ -1642,6 +1642,43 @@ def approve_final_review(
     return build_track_read(track, current_user, album, db=db)
 
 
+@router.post("/{track_id}/final-review/request-return", status_code=status.HTTP_204_NO_CONTENT)
+def request_return_in_final_review(
+    track_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    """Submitter asks the producer to return the track during final review."""
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+
+    # Must be the submitter (and not the producer — the producer can return directly)
+    if current_user.id != track.submitter_id or current_user.id == album.producer_id:
+        raise HTTPException(status_code=403, detail="Only the submitter (non-producer) can request a return.")
+
+    # Verify track is in a final_review step
+    from app.workflow_engine import get_current_step
+    config = album.workflow_config or {}
+    step = get_current_step(config, track)
+    if step is None or not (step.ui_variant == "final_review" or step.id == "final_review"):
+        raise HTTPException(status_code=409, detail="Track is not in a final review step.")
+
+    notify(
+        db,
+        [album.producer_id],
+        "final_review_return_requested",
+        "提交者请求退回",
+        f"「{track.title}」的提交者请求退回该曲目进行修改。请前往终审页面处理。",
+        related_track_id=track.id,
+        background_tasks=background_tasks,
+        album_id=track.album_id,
+    )
+    db.commit()
+
+
 from app.services.cleanup import cleanup_files, collect_track_files
 
 
