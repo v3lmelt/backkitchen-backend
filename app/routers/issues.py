@@ -212,6 +212,12 @@ def _phase_reviewer_ids(issue: Issue, track: Track, album: Album, db: Session) -
     return {fallback} if fallback is not None else set()
 
 
+def _status_handler_ids(issue: Issue, track: Track, album: Album, db: Session) -> set[int]:
+    if issue.phase == IssuePhase.FINAL_REVIEW.value:
+        return {album.mastering_engineer_id} if album.mastering_engineer_id is not None else set()
+    return _phase_reviewer_ids(issue, track, album, db)
+
+
 def _ensure_issue_visible_to_user(issue: Issue, track: Track, user: User) -> None:
     # Pending-discussion issues are hidden from submitters until discussion ends.
     if user.id == track.submitter_id and _is_submitter_hidden_issue_status(issue.status):
@@ -228,7 +234,8 @@ def _ensure_comment_visible_to_user(comment: Comment, track: Track, user: User, 
 
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User, db: Session) -> None:
     reviewer_ids = _phase_reviewer_ids(issue, track, album, db)
-    allowed = {track.submitter_id, issue.author_id} | reviewer_ids
+    status_handler_ids = _status_handler_ids(issue, track, album, db)
+    allowed = {track.submitter_id, issue.author_id} | reviewer_ids | status_handler_ids
     allowed.discard(None)
     if user.id not in allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to update this issue.")
@@ -244,39 +251,48 @@ def _validate_status_transition(
 ) -> None:
     """Enforce role-based status transition rules.
 
-    Submitter may:  open → resolved|disagreed
-    Reviewer may:   open → resolved|pending_discussion
-                   pending_discussion → open|internal_resolved
-                   internal_resolved → open
-                   resolved|disagreed → open
+    Submitter may:  open → resolved|disagreed (except final review)
+    Status handler may: open → resolved|pending_discussion
+                        pending_discussion → open|internal_resolved
+                        internal_resolved → open
+                        resolved|disagreed → open
+
+    Final-review issue statuses are handled by the mastering engineer.
     """
     old = issue.status
     if old == new_status:
         return
 
     is_submitter = user.id == track.submitter_id
-    reviewer_ids = _phase_reviewer_ids(issue, track, album, db)
-    is_reviewer = user.id in reviewer_ids or user.id == issue.author_id
+    handler_ids = _status_handler_ids(issue, track, album, db)
+    is_status_handler = user.id in handler_ids or (
+        issue.phase != IssuePhase.FINAL_REVIEW.value and user.id == issue.author_id
+    )
 
     # Submitter actions
-    if is_submitter and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.DISAGREED):
+    if (
+        issue.phase != IssuePhase.FINAL_REVIEW.value
+        and is_submitter
+        and old == IssueStatus.OPEN
+        and new_status in (IssueStatus.RESOLVED, IssueStatus.DISAGREED)
+    ):
         return
 
-    # Reviewer actions
-    if is_reviewer and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
+    # Status handler actions
+    if is_status_handler and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
         return
     # Only the issue creator can publish an internal issue (internal state -> open)
     is_creator = user.id == issue.author_id
-    if is_creator and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status in (
+    if issue.phase != IssuePhase.FINAL_REVIEW.value and is_creator and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status in (
         IssueStatus.OPEN,
         IssueStatus.INTERNAL_RESOLVED,
     ):
         return
-    if is_reviewer and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.INTERNAL_RESOLVED:
+    if is_status_handler and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.INTERNAL_RESOLVED:
         return
-    if is_reviewer and old == IssueStatus.INTERNAL_RESOLVED and new_status == IssueStatus.OPEN:
+    if is_status_handler and old == IssueStatus.INTERNAL_RESOLVED and new_status == IssueStatus.OPEN:
         return
-    if is_reviewer and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
+    if is_status_handler and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
         return
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot perform this status transition.")

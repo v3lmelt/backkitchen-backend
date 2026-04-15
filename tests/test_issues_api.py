@@ -201,6 +201,43 @@ def test_update_issue_enforces_phase_permissions(client, factory, auth_headers):
     assert success.json()["status"] == IssueStatus.RESOLVED.value
 
 
+def test_final_review_issue_status_is_managed_by_mastering_engineer_only(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.FINAL_REVIEW)
+    delivery = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
+    issue = factory.issue(
+        track=track,
+        author=producer,
+        phase=IssuePhase.FINAL_REVIEW,
+        master_delivery_id=delivery.id,
+    )
+
+    metadata_update = client.patch(
+        f"/api/issues/{issue.id}",
+        headers=auth_headers(producer),
+        json={"title": "Updated final review note"},
+    )
+    forbidden_status_update = client.patch(
+        f"/api/issues/{issue.id}",
+        headers=auth_headers(producer),
+        json={"status": "resolved"},
+    )
+    allowed_status_update = client.patch(
+        f"/api/issues/{issue.id}",
+        headers=auth_headers(mastering),
+        json={"status": "resolved"},
+    )
+
+    assert metadata_update.status_code == 200
+    assert metadata_update.json()["title"] == "Updated final review note"
+    assert forbidden_status_update.status_code == 403
+    assert allowed_status_update.status_code == 200
+    assert allowed_status_update.json()["status"] == IssueStatus.RESOLVED.value
+
+
 def test_add_comment_rejects_invalid_image_type(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
