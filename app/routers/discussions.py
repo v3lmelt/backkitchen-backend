@@ -114,13 +114,15 @@ def list_discussions(
 async def create_discussion(
     track_id: int,
     background_tasks: BackgroundTasks,
-    content: str = Form(...),
+    content: str = Form(default=""),
     phase: str = Form(default="general"),
     images: Optional[list[UploadFile]] = File(default=None),
     audios: Optional[list[UploadFile]] = File(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> DiscussionRead:
+    if not content.strip() and not images and not audios:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Content or attachments required.")
     if phase not in ("general", "mastering"):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid phase.")
     track = db.get(Track, track_id)
