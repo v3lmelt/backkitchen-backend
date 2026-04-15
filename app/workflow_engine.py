@@ -1317,6 +1317,7 @@ def execute_reopen(
         )
     )
 
+    db.flush()
     db.expire_all()
 
     log_track_event(

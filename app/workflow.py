@@ -287,9 +287,12 @@ def current_master_delivery(track: Track) -> MasterDelivery | None:
     current_cycle_deliveries = [
         item for item in track.master_deliveries if item.workflow_cycle == track.workflow_cycle
     ]
-    if not current_cycle_deliveries:
-        return None
-    return max(current_cycle_deliveries, key=lambda item: item.delivery_number)
+    if current_cycle_deliveries:
+        return max(current_cycle_deliveries, key=lambda item: item.delivery_number)
+    # Fallback: after a reopen the workflow_cycle increments and the new cycle
+    # has no deliveries yet.  Return the latest delivery from any previous
+    # cycle so the old mastering audio remains playable and viewable.
+    return max(track.master_deliveries, key=lambda item: (item.workflow_cycle, item.delivery_number))
 
 
 def track_allowed_actions(
