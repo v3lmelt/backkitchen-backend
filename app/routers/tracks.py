@@ -1388,8 +1388,14 @@ def preview_reopen(
     if track.status != "completed":
         raise HTTPException(status_code=409, detail="Only completed tracks can be previewed for reopen.")
 
+    from app.workflow_engine import get_step_by_id, get_steps, parse_workflow_config, should_new_cycle
+
     resets = compute_reopen_resets(db, album, track, target_stage_id)
-    return {"resets": resets}
+    config = parse_workflow_config(album)
+    steps = get_steps(config)
+    target_step = get_step_by_id(steps, target_stage_id)
+    cycle_incremented = target_step is not None and should_new_cycle(steps, target_step)
+    return {"resets": resets, "cycle_incremented": cycle_incremented}
 
 
 @router.post("/{track_id}/reopen", response_model=TrackRead)

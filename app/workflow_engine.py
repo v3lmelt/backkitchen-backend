@@ -1173,11 +1173,28 @@ def migrate_tracks_on_workflow_change(
 # ---------------------------------------------------------------------------
 
 
+def should_new_cycle(steps: list[StepDef], target_step: StepDef) -> bool:
+    """Return True when reopening to ``target_step`` should increment workflow_cycle.
+
+    Cycle increments only when the target is at or before the first delivery
+    step (i.e. the master delivery must be redone).  Reopening to a later
+    step (e.g. final_review) keeps the same cycle so the existing delivery
+    stays current without a fallback lookup.
+    """
+    delivery_steps = [s for s in steps if s.type == "delivery"]
+    if not delivery_steps:
+        return True
+    first_delivery_order = min(s.order for s in delivery_steps)
+    return target_step.order <= first_delivery_order
+
+
 def _collect_reopen_resets(
     steps: list[StepDef],
     target_step: StepDef,
     track: Track,
     db: Session,
+    *,
+    new_cycle: bool = True,
 ) -> list[str]:
     """Return a list of human-readable descriptions of what will be reset."""
     resets: list[str] = []
@@ -1200,15 +1217,16 @@ def _collect_reopen_resets(
             if stage_labels:
                 resets.append(f"stage_assignments:{stage_labels}")
 
-    # Checklist items
-    checklist_count = db.scalar(
-        select(func.count()).select_from(ChecklistItem).where(
-            ChecklistItem.track_id == track.id,
-            ChecklistItem.workflow_cycle == track.workflow_cycle,
-        )
-    ) or 0
-    if checklist_count:
-        resets.append("checklist_items")
+    # Checklist items — only cleared when starting a new cycle
+    if new_cycle:
+        checklist_count = db.scalar(
+            select(func.count()).select_from(ChecklistItem).where(
+                ChecklistItem.track_id == track.id,
+                ChecklistItem.workflow_cycle == track.workflow_cycle,
+            )
+        ) or 0
+        if checklist_count:
+            resets.append("checklist_items")
 
     # Master delivery approval timestamps
     approval_count = db.scalar(
@@ -1237,7 +1255,8 @@ def compute_reopen_resets(
     target_step = get_step_by_id(steps, target_stage_id)
     if target_step is None:
         return []
-    return _collect_reopen_resets(steps, target_step, track, db)
+    new_cycle = should_new_cycle(steps, target_step)
+    return _collect_reopen_resets(steps, target_step, track, db, new_cycle=new_cycle)
 
 
 def execute_reopen(
@@ -1250,10 +1269,12 @@ def execute_reopen(
 ) -> list[str]:
     """Reopen a completed track to a specific stage.
 
-    Increments ``workflow_cycle``, sets ``track.status`` to the target stage,
-    and resets downstream state (stage assignments, checklist items, master
-    delivery approvals).  Returns a list of reset descriptions for the caller
-    to surface to the user.
+    When the target is at or before the first delivery step the
+    ``workflow_cycle`` increments (master delivery must be redone) and
+    old-cycle checklist items are deleted.  When the target is after the
+    delivery step (e.g. final_review) the cycle stays the same so the
+    existing delivery remains current — only approval timestamps are
+    cleared.
     """
     config = parse_workflow_config(album)
     steps = get_steps(config)
@@ -1265,12 +1286,15 @@ def execute_reopen(
             detail=f"Target stage '{target_stage_id}' not found in workflow.",
         )
 
+    new_cycle = should_new_cycle(steps, target_step)
+
     # Collect reset info BEFORE mutating state
-    resets = _collect_reopen_resets(steps, target_step, track, db)
+    resets = _collect_reopen_resets(steps, target_step, track, db, new_cycle=new_cycle)
 
     previous_status = track.status
     track.status = target_stage_id
-    track.workflow_cycle += 1
+    if new_cycle:
+        track.workflow_cycle += 1
     track.rejection_mode = None
 
     # ------------------------------------------------------------------
@@ -1296,26 +1320,39 @@ def execute_reopen(
             )
         )
 
-    # 2) Clear checklist items from the current (old) cycle
-    db.execute(
-        delete(ChecklistItem).where(
-            ChecklistItem.track_id == track.id,
-            ChecklistItem.workflow_cycle == track.workflow_cycle - 1,
+    if new_cycle:
+        # 2) Clear checklist items from the old cycle
+        db.execute(
+            delete(ChecklistItem).where(
+                ChecklistItem.track_id == track.id,
+                ChecklistItem.workflow_cycle == track.workflow_cycle - 1,
+            )
         )
-    )
-
-    # 3) Clear master delivery approval timestamps (current cycle)
-    db.execute(
-        update(MasterDelivery)
-        .where(
-            MasterDelivery.track_id == track.id,
-            MasterDelivery.workflow_cycle == track.workflow_cycle - 1,
+        # 3) Clear master delivery approval timestamps (old cycle)
+        db.execute(
+            update(MasterDelivery)
+            .where(
+                MasterDelivery.track_id == track.id,
+                MasterDelivery.workflow_cycle == track.workflow_cycle - 1,
+            )
+            .values(
+                producer_approved_at=None,
+                submitter_approved_at=None,
+            )
         )
-        .values(
-            producer_approved_at=None,
-            submitter_approved_at=None,
+    else:
+        # 3) Clear master delivery approval timestamps (same cycle)
+        db.execute(
+            update(MasterDelivery)
+            .where(
+                MasterDelivery.track_id == track.id,
+                MasterDelivery.workflow_cycle == track.workflow_cycle,
+            )
+            .values(
+                producer_approved_at=None,
+                submitter_approved_at=None,
+            )
         )
-    )
 
     db.flush()
     db.expire_all()
@@ -1327,7 +1364,8 @@ def execute_reopen(
         to_status=track.status,
         payload={
             "target_stage": target_stage_id,
-            "new_cycle": track.workflow_cycle,
+            "workflow_cycle": track.workflow_cycle,
+            "cycle_incremented": new_cycle,
             "resets": resets,
         },
     )
