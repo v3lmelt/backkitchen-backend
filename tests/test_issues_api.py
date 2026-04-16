@@ -1,5 +1,7 @@
 import json
+import sys
 from io import BytesIO
+from types import SimpleNamespace
 
 from sqlalchemy import select
 
@@ -399,7 +401,11 @@ def test_issue_audio_route_redirects_r2_attachments(client, db_session, factory,
     db_session.commit()
     db_session.refresh(issue_audio)
 
-    monkeypatch.setattr("app.services.r2.public_url", lambda key: f"https://cdn.example.com/{key}")
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.r2",
+        SimpleNamespace(public_url=lambda key: f"https://cdn.example.com/{key}"),
+    )
 
     response = client.get(
         f"/api/issue-audios/{issue_audio.id}/file",
