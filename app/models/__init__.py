@@ -1,4 +1,5 @@
 from app.models.album import Album
+from app.models.admin_audit_log import AdminAuditLog
 from app.models.email_verification import EmailVerificationToken
 from app.models.album_member import AlbumMember
 from app.models.circle import Circle, CircleInviteCode, CircleMember
@@ -27,6 +28,7 @@ from app.models.workflow_template import WorkflowTemplate
 
 __all__ = [
     "Album",
+    "AdminAuditLog",
     "EmailVerificationToken",
     "AlbumMember",
     "Circle",

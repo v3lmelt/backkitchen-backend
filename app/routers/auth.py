@@ -9,6 +9,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.admin_permissions import sync_admin_role_flags
 from app.models.email_verification import EmailVerificationToken
 from app.models.password_reset import PasswordResetToken
 from app.models.user import User
@@ -39,6 +40,7 @@ _PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 60
 
 
 def _build_auth_response(user: User) -> AuthResponse:
+    sync_admin_role_flags(user)
     return AuthResponse(access_token=create_access_token(user), user=UserRead.model_validate(user))
 
 
@@ -79,6 +81,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Email not verified. Please check your inbox.",
+        )
+    if user.suspended_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Contact an administrator.",
         )
     return _build_auth_response(user)
 
@@ -221,6 +228,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
     user.password = hash_password(payload.new_password)
+    user.session_version = max(int(user.session_version or 1), 1) + 1
     record.used = True
     db.commit()
     db.refresh(user)
@@ -229,6 +237,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
 
 @router.get("/me", response_model=UserRead)
 def get_me(current_user: User = Depends(get_current_user)) -> UserRead:
+    sync_admin_role_flags(current_user)
     return UserRead.model_validate(current_user)
 
 
@@ -256,6 +265,7 @@ def update_me(
         current_user.feishu_contact = payload.feishu_contact or None
         changed = True
     if changed:
+        sync_admin_role_flags(current_user)
         db.commit()
         db.refresh(current_user)
     if verification_email:
@@ -333,6 +343,7 @@ def change_password(
     if not verify_password(payload.current_password, current_user.password or ""):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect.")
     current_user.password = hash_password(payload.new_password)
+    current_user.session_version = max(int(current_user.session_version or 1), 1) + 1
     db.commit()
 
 
@@ -420,6 +431,8 @@ def delete_account(
     now = datetime.now(timezone.utc)
     original_email = current_user.email
     current_user.deleted_at = now
+    current_user.suspended_at = now
+    current_user.suspension_reason = "Account deleted"
     current_user.display_name = "[deleted user]"
     # Suffix username/email with deleted-<id>-<ts> to free the unique constraints
     suffix = f".deleted-{current_user.id}-{int(now.timestamp())}"
@@ -427,6 +440,7 @@ def delete_account(
         current_user.username = f"{current_user.username}{suffix}"
     if current_user.email:
         current_user.email = f"{current_user.email}{suffix}"
+    current_user.session_version = max(int(current_user.session_version or 1), 1) + 1
     # Invalidate any outstanding password reset tokens tied to the original email
     if original_email:
         db.execute(

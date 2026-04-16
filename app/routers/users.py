@@ -66,6 +66,6 @@ def get_user(
             detail="You can only view your own profile.",
         )
     user = db.get(User, user_id)
-    if user is None:
+    if user is None or user.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
     return user

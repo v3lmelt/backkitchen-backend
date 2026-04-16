@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, func as sqlfunc, select, update
 from sqlalchemy.orm import Session, selectinload
 
+from app.admin_permissions import has_admin_role
 from app.config import settings
 from app.database import get_db
 from app.models.album import Album
@@ -1439,7 +1440,7 @@ def reopen_track(
     album = ensure_track_visibility(track, current_user, db)
     if track.status != "completed":
         raise HTTPException(status_code=409, detail="Only completed tracks can be reopened.")
-    if current_user.id not in (album.producer_id, album.mastering_engineer_id):
+    if current_user.id not in (album.producer_id, album.mastering_engineer_id) and not has_admin_role(current_user, "operator"):
         raise HTTPException(status_code=403, detail="Only the producer or mastering engineer can directly reopen.")
 
     execute_reopen(db, album, track, current_user, payload.target_stage_id, background_tasks)
@@ -1469,7 +1470,7 @@ def decide_reopen_request(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if album.producer_id != current_user.id:
+    if album.producer_id != current_user.id and not has_admin_role(current_user, "operator"):
         raise HTTPException(status_code=403, detail="Only the album producer can decide reopen requests.")
 
     req.status = "approved" if payload.decision == "approve" else "rejected"
@@ -1700,7 +1701,7 @@ def archive_track(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if current_user.id != album.producer_id:
+    if current_user.id != album.producer_id and not has_admin_role(current_user, "operator"):
         raise HTTPException(status_code=403, detail="Only the album producer can archive tracks.")
     if track.archived_at is not None:
         raise HTTPException(status_code=409, detail="Track is already archived.")
@@ -1726,7 +1727,7 @@ def restore_track(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if current_user.id != album.producer_id:
+    if current_user.id != album.producer_id and not has_admin_role(current_user, "operator"):
         raise HTTPException(status_code=403, detail="Only the album producer can restore tracks.")
     if track.archived_at is None:
         raise HTTPException(status_code=409, detail="Track is not archived.")
@@ -1751,7 +1752,7 @@ def delete_track(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if current_user.id not in {track.submitter_id, album.producer_id}:
+    if current_user.id not in {track.submitter_id, album.producer_id} and not has_admin_role(current_user, "operator"):
         raise HTTPException(status_code=403, detail="Only the submitter or producer can delete this track.")
     # Collect all file paths before cascade-deleting DB records
     local_paths, r2_keys = collect_track_files(track)

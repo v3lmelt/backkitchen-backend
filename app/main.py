@@ -20,6 +20,7 @@ from app.database import Base, SessionLocal, engine
 from app.models import (  # noqa: F401
     Album,
     AlbumMember,
+    AdminAuditLog,
     ChecklistItem,
     Circle,
     CircleInviteCode,
@@ -90,10 +91,16 @@ def _run_sqlite_compat_migrations() -> None:
     # Existing users (before email verification feature) are grandfathered as verified
     add_column("users", "email_verified", "email_verified BOOLEAN NOT NULL DEFAULT 1")
     add_column("users", "is_admin", "is_admin BOOLEAN NOT NULL DEFAULT 0")
+    add_column("users", "admin_role", "admin_role VARCHAR(20) NOT NULL DEFAULT 'none'")
+    add_column("users", "suspended_at", "suspended_at DATETIME")
+    add_column("users", "suspension_reason", "suspension_reason TEXT")
+    add_column("users", "session_version", "session_version INTEGER NOT NULL DEFAULT 1")
 
     with engine.begin() as conn:
         if "users" in columns_by_table:
             conn.execute(text("UPDATE users SET role = 'member' WHERE lower(role) IN ('author', 'reviewer')"))
+            conn.execute(text("UPDATE users SET admin_role = CASE WHEN is_admin = 1 THEN 'superadmin' ELSE COALESCE(admin_role, 'none') END WHERE admin_role IS NULL OR admin_role = ''"))
+            conn.execute(text("UPDATE users SET session_version = 1 WHERE session_version IS NULL OR session_version < 1"))
 
         if "tracks" in columns_by_table:
             conn.execute(text("UPDATE tracks SET status = 'submitted' WHERE lower(status) = 'submitted' OR status = 'SUBMITTED'"))

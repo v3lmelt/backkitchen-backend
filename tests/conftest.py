@@ -134,10 +134,14 @@ class Factory:
         display_name: str | None = None,
         email: str | None = None,
         is_admin: bool = False,
+        admin_role: str | None = None,
         email_verified: bool = True,
     ) -> User:
         effective_role = "member" if role == "mastering_engineer" else role
         key = username or self._next(role)
+        resolved_admin_role = admin_role
+        if resolved_admin_role is None:
+            resolved_admin_role = "superadmin" if is_admin else "none"
         user = User(
             username=key,
             display_name=display_name or key.title(),
@@ -145,7 +149,8 @@ class Factory:
             role=effective_role,
             avatar_color="#123456",
             password="pw",
-            is_admin=is_admin,
+            is_admin=is_admin or resolved_admin_role != "none",
+            admin_role=resolved_admin_role,
             email_verified=email_verified,
         )
         self.session.add(user)
