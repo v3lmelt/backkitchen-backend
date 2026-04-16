@@ -127,7 +127,7 @@ def test_discussion_track_not_found(client, factory, auth_headers):
     assert create_response.status_code == 404
 
 
-def test_submitter_cannot_view_internal_discussions_while_issue_pending_discussion(client, db_session, factory, auth_headers):
+def test_submitter_can_view_discussions_while_issue_pending_discussion(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user(username="submitter")
@@ -148,14 +148,15 @@ def test_submitter_cannot_view_internal_discussions_while_issue_pending_discussi
         data={"content": "Internal discussion"},
     )
     assert create_response.status_code == 201
-    assert create_response.json()["visibility"] == "internal"
+    discussion_id = create_response.json()["id"]
+    assert create_response.json()["visibility"] == "public"
 
     list_submitter = client.get(f"/api/tracks/{track.id}/discussions", headers=auth_headers(submitter))
     assert list_submitter.status_code == 200
-    assert list_submitter.json() == []
+    assert [item["id"] for item in list_submitter.json()] == [discussion_id]
 
 
-def test_submitter_still_cannot_view_internal_discussions_after_issue_is_published(client, db_session, factory, auth_headers):
+def test_submitter_can_still_view_discussions_after_issue_is_published(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user(username="submitter")
@@ -177,6 +178,7 @@ def test_submitter_still_cannot_view_internal_discussions_after_issue_is_publish
     )
     assert internal_discussion.status_code == 201
     discussion_id = internal_discussion.json()["id"]
+    assert internal_discussion.json()["visibility"] == "public"
 
     publish = client.patch(
         f"/api/issues/{issue.id}",
@@ -187,10 +189,10 @@ def test_submitter_still_cannot_view_internal_discussions_after_issue_is_publish
 
     list_submitter = client.get(f"/api/tracks/{track.id}/discussions", headers=auth_headers(submitter))
     assert list_submitter.status_code == 200
-    assert all(item["id"] != discussion_id for item in list_submitter.json())
+    assert [item["id"] for item in list_submitter.json()] == [discussion_id]
 
 
-def test_internal_resolved_issue_keeps_new_discussion_internal(client, db_session, factory, auth_headers):
+def test_internal_resolved_issue_does_not_force_new_discussion_internal(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user(username="submitter")
@@ -211,8 +213,9 @@ def test_internal_resolved_issue_keeps_new_discussion_internal(client, db_sessio
         data={"content": "Still internal thread"},
     )
     assert create_response.status_code == 201
-    assert create_response.json()["visibility"] == "internal"
+    discussion_id = create_response.json()["id"]
+    assert create_response.json()["visibility"] == "public"
 
     list_submitter = client.get(f"/api/tracks/{track.id}/discussions", headers=auth_headers(submitter))
     assert list_submitter.status_code == 200
-    assert list_submitter.json() == []
+    assert [item["id"] for item in list_submitter.json()] == [discussion_id]

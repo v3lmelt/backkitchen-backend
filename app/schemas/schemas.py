@@ -291,7 +291,7 @@ class TrackSourceVersionRead(BaseModel):
     id: int
     workflow_cycle: int
     version_number: int
-    file_path: str
+    file_path: str | None = None
     duration: float | None = None
     uploaded_by_id: int | None = None
     revision_notes: str | None = None

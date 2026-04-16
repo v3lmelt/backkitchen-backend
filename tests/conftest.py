@@ -28,7 +28,7 @@ from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.invitation import Invitation
 from app.models.notification import Notification
-from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users
+from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users, workflow_templates
 from app.security import create_access_token
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
@@ -81,6 +81,7 @@ def client(
         lambda _path: SimpleNamespace(duration=123.4, bitrate=None, sample_rate=None),
     )
     monkeypatch.setattr(auth, "send_verification_email", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth, "send_password_reset_email", lambda *_args, **_kwargs: None)
 
     def override_get_db() -> Iterator[Session]:
         session = session_factory()
@@ -101,6 +102,7 @@ def client(
     app.include_router(admin.router)
     app.include_router(circles.router)
     app.include_router(discussions.router)
+    app.include_router(workflow_templates.router)
     app.dependency_overrides[get_db] = override_get_db
     app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
 
