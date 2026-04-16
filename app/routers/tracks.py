@@ -1321,6 +1321,7 @@ def reassign_reviewer(
 
     db.commit()
     db.refresh(track)
+    broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
 
