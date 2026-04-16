@@ -7,10 +7,11 @@ from pathlib import Path
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from app.ws_manager import manager as track_manager
 from app.ws_manager import notification_manager
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, select, text
 
@@ -540,6 +541,28 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+# Catch any non-HTTPException thrown from a handler, log the full traceback,
+# and return a structured JSON 500.  Starlette's default ServerErrorMiddleware
+# returns a bare "Internal Server Error" plain-text body that is easy to miss
+# in logs; this handler guarantees the stack trace lands in journald so we
+# can diagnose intermittent failures (e.g. SQLite lock contention).
+_unhandled_logger = logging.getLogger("app.unhandled")
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    _unhandled_logger.exception(
+        "Unhandled exception on %s %s",
+        request.method,
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error.", "path": request.url.path},
+    )
+
 
 app.include_router(auth.router)
 app.include_router(users.router)
