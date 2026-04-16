@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -18,10 +19,11 @@ from app.models.user import User
 from app.notifications import notify
 from app.realtime import broadcast_discussion_event, broadcast_track_updated
 from app.schemas.schemas import DiscussionAudioRead, DiscussionImageRead, DiscussionRead, DiscussionUpdate, EditHistoryRead, UserRead
-from app.security import get_current_user
+from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.upload import stream_upload
 from app.workflow import ensure_track_visibility, is_mastering_participant
 from app.workflow import mask_user_read_if_needed, peer_identity_anonymize_user_ids_for_viewer
+from app.workflow import discussion_audio_file_url
 
 router = APIRouter(tags=["discussions"])
 
@@ -44,7 +46,7 @@ def _build_discussion_read(
         DiscussionAudioRead(
             id=a.id,
             discussion_id=a.discussion_id,
-            audio_url=f"/uploads/{a.file_path}",
+            audio_url=discussion_audio_file_url(a.id),
             original_filename=a.original_filename,
             duration=a.duration,
             created_at=a.created_at,
@@ -67,6 +69,30 @@ def _build_discussion_read(
         images=images,
         audios=audios,
     )
+
+
+def _resolve_discussion_user(
+    bearer_user: User | None,
+    token_user: User | None,
+) -> User:
+    user = bearer_user or token_user
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    return user
+
+
+def _ensure_discussion_visible_to_user(
+    discussion: TrackDiscussion,
+    track: Track,
+    user: User,
+    db: Session,
+) -> None:
+    album = db.get(Album, track.album_id)
+    if discussion.phase == "mastering":
+        if album is None or not is_mastering_participant(user, track, album):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to mastering discussions.")
+    if discussion.visibility == "internal" and user.id == track.submitter_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to internal discussions.")
 
 
 @router.get(
@@ -337,3 +363,44 @@ def get_discussion_history(
         .order_by(EditHistory.created_at.desc())
     ).all())
     return [EditHistoryRead.model_validate(h) for h in histories]
+
+
+@router.get("/api/discussion-audios/{audio_id}/file")
+def serve_discussion_audio(
+    audio_id: int,
+    resolve: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    bearer_user: User | None = Depends(get_current_user_optional),
+    token_user: User | None = Depends(get_user_from_token_param),
+):
+    user = _resolve_discussion_user(bearer_user, token_user)
+
+    audio = db.get(TrackDiscussionAudio, audio_id)
+    if audio is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discussion audio not found.")
+
+    discussion = db.get(TrackDiscussion, audio.discussion_id)
+    track = db.get(Track, discussion.track_id) if discussion else None
+    if discussion is None or track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Associated discussion not found.")
+
+    ensure_track_visibility(track, user, db)
+    _ensure_discussion_visible_to_user(discussion, track, user, db)
+
+    if resolve == "json":
+        return {"url": None}
+
+    file_path = settings.get_upload_path() / audio.file_path
+    if not file_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file missing from disk.")
+
+    mime_map = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".flac": "audio/flac",
+        ".ogg": "audio/ogg",
+        ".aac": "audio/aac",
+        ".m4a": "audio/mp4",
+    }
+    media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
+    return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)

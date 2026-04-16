@@ -45,17 +45,19 @@ from app.schemas.schemas import (
 )
 
 
-def _audio_url(audio) -> str:
-    """Return the public URL for an audio attachment.
+def issue_audio_file_url(audio_id: int) -> str:
+    """Return the authenticated API URL for an issue audio attachment."""
+    return f"/api/issue-audios/{audio_id}/file"
 
-    For R2-stored files, returns the public CDN URL directly.
-    For local files, returns the ``/uploads/`` path.
-    """
-    if audio.storage_backend == "r2":
-        from app.services.r2 import public_url
 
-        return public_url(audio.file_path)
-    return f"/uploads/{audio.file_path}"
+def comment_audio_file_url(audio_id: int) -> str:
+    """Return the authenticated API URL for a comment audio attachment."""
+    return f"/api/comment-audios/{audio_id}/file"
+
+
+def discussion_audio_file_url(audio_id: int) -> str:
+    """Return the authenticated API URL for a discussion audio attachment."""
+    return f"/api/discussion-audios/{audio_id}/file"
 
 
 def get_album_member_ids(db: Session, album_id: int) -> set[int]:
@@ -487,7 +489,7 @@ def build_issue_read(
         IssueAudioRead(
             id=audio.id,
             issue_id=audio.issue_id,
-            audio_url=_audio_url(audio),
+            audio_url=issue_audio_file_url(audio.id),
             original_filename=audio.original_filename,
             duration=audio.duration,
             created_at=audio.created_at,
@@ -558,7 +560,7 @@ def build_comment_read(
         CommentAudioRead(
             id=audio.id,
             comment_id=audio.comment_id,
-            audio_url=_audio_url(audio),
+            audio_url=comment_audio_file_url(audio.id),
             original_filename=audio.original_filename,
             duration=audio.duration,
             created_at=audio.created_at,
@@ -764,7 +766,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
                 DiscussionAudioRead(
                     id=a.id,
                     discussion_id=a.discussion_id,
-                    audio_url=f"/uploads/{a.file_path}",
+                    audio_url=discussion_audio_file_url(a.id),
                     original_filename=a.original_filename,
                     duration=a.duration,
                     created_at=a.created_at,

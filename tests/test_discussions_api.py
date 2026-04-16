@@ -1,5 +1,8 @@
+from io import BytesIO
+
 from app.models.notification import Notification
 from app.models.issue import IssuePhase, IssueStatus
+from app.security import create_access_token
 
 
 def test_list_discussions_requires_track_visibility(client, factory, auth_headers):
@@ -61,6 +64,35 @@ def test_create_discussion_accepts_images(client, factory, auth_headers):
     images = response.json()["images"]
     assert len(images) == 1
     assert images[0]["image_url"].startswith("/uploads/discussion_images/")
+
+
+def test_mastering_discussion_audio_uses_protected_api_url_and_supports_token_download(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/discussions",
+        headers=auth_headers(mastering),
+        data={"content": "Mastering reference", "phase": "mastering"},
+        files=[("audios", ("reference.wav", BytesIO(b"RIFFdiscussion"), "audio/wav"))],
+    )
+
+    assert response.status_code == 201
+    audios = response.json()["audios"]
+    assert len(audios) == 1
+    assert audios[0]["audio_url"] == f"/api/discussion-audios/{audios[0]['id']}/file"
+
+    download = client.get(
+        audios[0]["audio_url"],
+        params={"token": create_access_token(mastering)},
+    )
+
+    assert download.status_code == 200
+    assert download.content == b"RIFFdiscussion"
+    assert download.headers["content-type"].startswith("audio/wav")
 
 
 def test_create_discussion_rejects_non_image_upload(client, factory, auth_headers):
