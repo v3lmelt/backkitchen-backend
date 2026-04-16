@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.admin_permissions import has_admin_role
 from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
@@ -87,7 +88,7 @@ def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Album not found.",
         )
-    if user.is_admin:
+    if has_admin_role(user, "operator"):
         return album
     if album.producer_id != user.id:
         raise HTTPException(
@@ -98,7 +99,7 @@ def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
 
 
 def ensure_album_visibility(album: Album, user: User, db: Session) -> None:
-    if user.is_admin:
+    if has_admin_role(user, "viewer"):
         return
     member_ids = get_album_member_ids(db, album.id)
     visible_ids = {album.producer_id, album.mastering_engineer_id}
@@ -244,7 +245,7 @@ def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     # Admins bypass all visibility checks
-    if user.is_admin:
+    if has_admin_role(user, "viewer"):
         return album
     # Producer and mastering engineer always have access
     if user.id in (album.producer_id, album.mastering_engineer_id):

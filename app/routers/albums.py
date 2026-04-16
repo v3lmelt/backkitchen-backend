@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
 
+from app.admin_permissions import has_admin_role
 from app.config import settings
 from app.database import get_db
 from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
@@ -515,7 +516,7 @@ def remove_album_member(
     album = db.get(Album, album_id)
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
-    if current_user.id != album.producer_id:
+    if current_user.id != album.producer_id and not has_admin_role(current_user, "operator"):
         raise HTTPException(status_code=403, detail="Only the album producer can remove members.")
     if user_id == album.producer_id:
         raise HTTPException(status_code=400, detail="Cannot remove the album producer.")
@@ -744,7 +745,7 @@ def list_archived_tracks(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-    if current_user.id != album.producer_id:
+    if current_user.id != album.producer_id and not has_admin_role(current_user, "viewer"):
         raise HTTPException(status_code=403, detail="Only the album producer can view archived tracks.")
 
     tracks = list(db.scalars(
@@ -1226,7 +1227,7 @@ def restore_album(
     album = db.get(Album, album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id:
+    if album.producer_id != current_user.id and not has_admin_role(current_user, "operator"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the album producer can restore albums.",

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.admin_permissions import has_admin_role
 from app.database import get_db
 from app.models.album import Album
 from app.models.circle import Circle, CircleMember
@@ -37,13 +38,13 @@ def _get_circle_membership(
         )
     ).scalar_one_or_none()
     is_creator = circle.created_by == user.id
-    if not membership and not is_creator:
+    if not membership and not is_creator and not has_admin_role(user, "viewer"):
         raise HTTPException(status_code=403, detail="Not a member of this circle")
     return circle, membership
 
 
 def _ensure_circle_owner(user: User, circle: Circle) -> None:
-    if circle.created_by != user.id:
+    if circle.created_by != user.id and not has_admin_role(user, "operator"):
         raise HTTPException(
             status_code=403, detail="Only the circle owner can manage workflow templates"
         )
