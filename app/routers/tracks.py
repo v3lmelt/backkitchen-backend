@@ -492,6 +492,13 @@ def _verify_r2_object(object_key: str) -> None:
         raise HTTPException(status_code=400, detail="Upload not found in R2. The file may not have been uploaded yet.")
 
 
+def _validate_r2_object_key(object_key: str, *, expected_prefix: str) -> None:
+    normalized_key = object_key.strip("/")
+    normalized_prefix = expected_prefix.strip("/") + "/"
+    if not normalized_key.startswith(normalized_prefix):
+        raise HTTPException(status_code=400, detail="Upload key does not match the expected target.")
+
+
 @router.post("/request-upload", response_model=PresignedUploadResponse)
 def request_track_upload(
     params: RequestTrackUploadParams,
@@ -527,6 +534,9 @@ def confirm_track_upload(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
+
+    _validate_r2_object_key(params.object_key, expected_prefix=f"tracks/new/source/{current_user.id}")
+    _verify_r2_object(params.object_key)
 
     duration, _bitrate, _sample_rate = _extract_r2_metadata(params.object_key)
     if duration is None and params.duration is not None:
@@ -620,6 +630,11 @@ def confirm_source_version_upload(
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
     _ensure_revision_upload_permission(track, album, current_user)
+    _validate_r2_object_key(
+        params.object_key,
+        expected_prefix=f"tracks/{track_id}/source/{track.version + 1}",
+    )
+    _verify_r2_object(params.object_key)
 
     # Resolve the next step *before* mutating rejection_mode so that the
     # engine can recognise a resubmit on a rejected+resubmittable track.
@@ -711,7 +726,6 @@ def confirm_master_delivery_upload(
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
     _ensure_r2_enabled()
-    _verify_r2_object(params.object_key)
 
     track = db.get(Track, track_id)
     if track is None:
@@ -723,6 +737,11 @@ def confirm_master_delivery_upload(
     current_del = current_master_delivery(track)
     if current_del and current_del.workflow_cycle == track.workflow_cycle:
         delivery_number = current_del.delivery_number + 1
+    _validate_r2_object_key(
+        params.object_key,
+        expected_prefix=f"tracks/{track_id}/master/{delivery_number}",
+    )
+    _verify_r2_object(params.object_key)
     delivery = MasterDelivery(
         track_id=track.id,
         workflow_cycle=track.workflow_cycle,

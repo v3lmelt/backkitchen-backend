@@ -116,6 +116,28 @@ def test_update_me_email(client, factory, auth_headers):
     assert response.json()["email"] == "new@example.com"
 
 
+def test_update_me_email_requires_reverification(client, factory, auth_headers):
+    user = factory.user(email="old@example.com", email_verified=True)
+    user.password = hash_password("testpass123")
+    factory.session.commit()
+
+    response = client.patch(
+        "/api/auth/me",
+        headers=auth_headers(user),
+        json={"email": "new@example.com"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["email"] == "new@example.com"
+    assert response.json()["email_verified"] is False
+
+    login_response = client.post(
+        "/api/auth/login",
+        json={"email": "new@example.com", "password": "testpass123"},
+    )
+    assert login_response.status_code == 403
+
+
 def test_update_me_email_conflict(client, factory, auth_headers):
     factory.user(email="taken@example.com", username="other")
     user = factory.user(email="mine@example.com")
@@ -169,3 +191,43 @@ def test_change_password_wrong_current(client, factory, auth_headers):
         json={"current_password": "wrongpass1", "new_password": "newpass1234"},
     )
     assert response.status_code == 400
+
+
+def test_delete_account_rejects_active_track_submitter(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(email="submitter@example.com", email_verified=True)
+    submitter.password = hash_password("deletepass123")
+    factory.session.commit()
+
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    factory.track(album=album, submitter=submitter, status="peer_revision")
+
+    response = client.post(
+        "/api/auth/me/delete-account",
+        headers=auth_headers(submitter),
+        json={"password": "deletepass123"},
+    )
+
+    assert response.status_code == 409
+    assert "active tracks" in response.json()["detail"]
+
+
+def test_delete_account_rejects_active_mastering_owner(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(email="mastering@example.com", email_verified=True)
+    mastering.password = hash_password("deletepass123")
+    submitter = factory.user()
+    factory.session.commit()
+
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    factory.track(album=album, submitter=submitter, status="mastering")
+
+    response = client.post(
+        "/api/auth/me/delete-account",
+        headers=auth_headers(mastering),
+        json={"password": "deletepass123"},
+    )
+
+    assert response.status_code == 409
+    assert "mastering tracks" in response.json()["detail"]

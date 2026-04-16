@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -239,6 +239,7 @@ def update_me(
     current_user: User = Depends(get_current_user),
 ) -> UserRead:
     changed = False
+    verification_email: str | None = None
     if payload.display_name is not None:
         current_user.display_name = payload.display_name
         changed = True
@@ -246,14 +247,20 @@ def update_me(
         existing = db.scalars(select(User).where(User.email == payload.email, User.id != current_user.id)).first()
         if existing is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email is already registered.")
-        current_user.email = payload.email
-        changed = True
+        if payload.email != current_user.email:
+            current_user.email = payload.email
+            current_user.email_verified = False
+            verification_email = payload.email
+            changed = True
     if payload.feishu_contact is not None:
         current_user.feishu_contact = payload.feishu_contact or None
         changed = True
     if changed:
         db.commit()
         db.refresh(current_user)
+    if verification_email:
+        token = _create_verification_token(verification_email, db)
+        send_verification_email(verification_email, token)
     return UserRead.model_validate(current_user)
 
 
@@ -342,6 +349,7 @@ def delete_account(
     """
     from app.models.album import Album
     from app.models.circle import Circle
+    from app.models.track import RejectionMode, Track, TrackStatus
 
     if not verify_password(payload.password, current_user.password or ""):
         raise HTTPException(
@@ -370,6 +378,43 @@ def delete_account(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="You still produce one or more active albums. Archive or transfer them before closing your account.",
+        )
+
+    active_track_filter = or_(
+        Track.status.notin_([TrackStatus.COMPLETED.value, TrackStatus.REJECTED.value]),
+        and_(
+            Track.status == TrackStatus.REJECTED.value,
+            Track.rejection_mode == RejectionMode.RESUBMITTABLE,
+        ),
+    )
+
+    authored_track = db.scalars(
+        select(Track.id).where(
+            Track.submitter_id == current_user.id,
+            Track.archived_at.is_(None),
+            active_track_filter,
+        ).limit(1)
+    ).first()
+    if authored_track is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You still own one or more active tracks. Complete, archive, or transfer them before closing your account.",
+        )
+
+    mastering_track = db.scalars(
+        select(Track.id)
+        .join(Album, Album.id == Track.album_id)
+        .where(
+            Album.mastering_engineer_id == current_user.id,
+            Track.archived_at.is_(None),
+            active_track_filter,
+        )
+        .limit(1)
+    ).first()
+    if mastering_track is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You are still responsible for one or more active mastering tracks. Reassign them before closing your account.",
         )
 
     now = datetime.now(timezone.utc)

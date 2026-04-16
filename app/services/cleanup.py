@@ -62,6 +62,9 @@ def collect_track_files(track: Track) -> tuple[list[Path], list[str]]:
                 r2_keys.append(audio.file_path)
             else:
                 local_paths.append(upload_base / audio.file_path)
+        for image in issue.images:
+            if image.file_path:
+                local_paths.append(upload_base / image.file_path)
         for comment in issue.comments:
             for img in comment.images:
                 if img.file_path:
@@ -79,6 +82,9 @@ def collect_track_files(track: Track) -> tuple[list[Path], list[str]]:
         for img in disc.images:
             if img.file_path:
                 local_paths.append(upload_base / img.file_path)
+        for audio in disc.audios:
+            if audio.file_path:
+                local_paths.append(upload_base / audio.file_path)
 
     return local_paths, r2_keys
 
