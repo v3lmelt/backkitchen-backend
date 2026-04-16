@@ -169,6 +169,7 @@ def test_create_album_sets_default_workflow_config(client, factory, auth_headers
             "required_reviewer_count",
             "assignee_user_id",
             "require_confirmation",
+            "actor_roles",
         ]:
             if step.get(key) is None:
                 step.pop(key, None)
