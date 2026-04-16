@@ -26,7 +26,11 @@ from app.schemas.schemas import (
 )
 from app.security import get_current_user
 from app.workflow import build_track_read, log_track_event
-from app.workflow_engine import parse_workflow_config
+from app.workflow_engine import (
+    ASSIGNMENT_CANCEL_REASON_REASSIGNED,
+    _cancel_pending_review_assignments,
+    parse_workflow_config,
+)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -339,17 +343,14 @@ def admin_reassign(
     old_reviewer_id = track.peer_reviewer_id
     track.peer_reviewer_id = payload.user_ids[0]
 
-    # Cancel existing pending assignments for the current stage
-    pending = list(db.scalars(
-        select(StageAssignment).where(
-            StageAssignment.track_id == track.id,
-            StageAssignment.stage_id == track.status,
-            StageAssignment.status == "pending",
-        )
-    ).all())
-    for a in pending:
-        a.status = "completed"
-        a.cancellation_reason = "reassigned"
+    # Cancel existing pending assignments for the current stage so they are
+    # filtered out by the frontend (which hides status == "cancelled").
+    _cancel_pending_review_assignments(
+        db,
+        track.id,
+        track.status,
+        reason=ASSIGNMENT_CANCEL_REASON_REASSIGNED,
+    )
 
     # Create new assignments for each user
     for u in new_users:
