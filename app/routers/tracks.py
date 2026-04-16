@@ -843,11 +843,13 @@ def list_tracks(
 
     stmt = (
         select(Track)
-        .where(Track.archived_at.is_(None), Track.status != TrackStatus.REJECTED)
+        .where(Track.archived_at.is_(None))
         .order_by(Track.id)
         .limit(limit)
         .offset(offset)
     )
+    if status_filter != TrackStatus.REJECTED.value:
+        stmt = stmt.where(Track.status != TrackStatus.REJECTED)
     if status_filter is not None:
         stmt = stmt.where(Track.status == status_filter)
     if album_id is not None:

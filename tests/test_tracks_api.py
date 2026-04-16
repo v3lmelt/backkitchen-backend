@@ -87,6 +87,28 @@ def test_list_tracks_respects_submitter_and_reviewer_visibility(client, db_sessi
     assert outsider_response.json() == []
 
 
+def test_list_tracks_hides_rejected_by_default_but_allows_explicit_rejected_filter(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    active_track = factory.track(album=album, submitter=submitter, status="peer_review")
+    rejected_track = factory.track(album=album, submitter=submitter, status=TrackStatus.REJECTED)
+    db_session.commit()
+
+    default_response = client.get("/api/tracks", headers=auth_headers(submitter))
+    rejected_response = client.get(
+        "/api/tracks",
+        headers=auth_headers(submitter),
+        params={"status": TrackStatus.REJECTED.value},
+    )
+
+    assert default_response.status_code == 200
+    assert {item["id"] for item in default_response.json()} == {active_track.id}
+    assert rejected_response.status_code == 200
+    assert [item["id"] for item in rejected_response.json()] == [rejected_track.id]
+
+
 def test_list_tracks_includes_stage_assigned_reviewer_and_allowed_actions(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
