@@ -5,9 +5,11 @@ from sqlalchemy import select
 
 from app.models.comment import Comment
 from app.models.issue import Issue, IssuePhase, IssueStatus
+from app.models.issue_audio import IssueAudio
 from app.models.stage_assignment import StageAssignment
 from app.models.track import TrackStatus
 from app.models.track_source_version import TrackSourceVersion
+from app.security import create_access_token
 
 
 def test_create_peer_issue_binds_to_current_source_version(client, db_session, factory, auth_headers):
@@ -294,6 +296,119 @@ def test_add_comment_persists_images(client, db_session, factory, auth_headers):
     comments = db_session.scalars(select(Comment).where(Comment.issue_id == issue.id)).all()
     assert len(comments) == 1
     assert len(comments[0].images) == 2
+
+
+def test_create_issue_returns_protected_audio_urls_for_local_uploads(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        data={
+            "title": "Clicks in intro",
+            "description": "See attached example",
+            "phase": "peer",
+            "severity": "major",
+            "markers_json": "[]",
+        },
+        files=[("audios", ("issue-note.wav", BytesIO(b"RIFFissue"), "audio/wav"))],
+    )
+
+    assert response.status_code == 201
+    audios = response.json()["audios"]
+    assert len(audios) == 1
+    assert audios[0]["audio_url"] == f"/api/issue-audios/{audios[0]['id']}/file"
+
+    download = client.get(
+        audios[0]["audio_url"],
+        params={"token": create_access_token(reviewer)},
+    )
+
+    assert download.status_code == 200
+    assert download.content == b"RIFFissue"
+    assert download.headers["content-type"].startswith("audio/wav")
+
+
+def test_add_comment_returns_protected_audio_urls_for_local_uploads(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER, source_version_id=track.source_versions[-1].id)
+
+    response = client.post(
+        f"/api/issues/{issue.id}/comments",
+        headers=auth_headers(submitter),
+        data={"content": "Attached audio note"},
+        files=[("audios", ("comment-note.wav", BytesIO(b"RIFFcomment"), "audio/wav"))],
+    )
+
+    assert response.status_code == 201
+    audios = response.json()["audios"]
+    assert len(audios) == 1
+    assert audios[0]["audio_url"] == f"/api/comment-audios/{audios[0]['id']}/file"
+
+    download = client.get(
+        audios[0]["audio_url"],
+        params={"token": create_access_token(submitter)},
+    )
+
+    assert download.status_code == 200
+    assert download.content == b"RIFFcomment"
+    assert download.headers["content-type"].startswith("audio/wav")
+
+
+def test_issue_audio_route_redirects_r2_attachments(client, db_session, factory, auth_headers, monkeypatch):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER, source_version_id=track.source_versions[-1].id)
+    issue_audio = IssueAudio(
+        issue_id=issue.id,
+        file_path="issues/1/example.wav",
+        storage_backend="r2",
+        original_filename="example.wav",
+        duration=1.23,
+    )
+    db_session.add(issue_audio)
+    db_session.commit()
+    db_session.refresh(issue_audio)
+
+    monkeypatch.setattr("app.services.r2.public_url", lambda key: f"https://cdn.example.com/{key}")
+
+    response = client.get(
+        f"/api/issue-audios/{issue_audio.id}/file",
+        params={"token": create_access_token(reviewer)},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://cdn.example.com/issues/1/example.wav"
 
 
 def test_list_issues_for_track(client, factory, auth_headers):
