@@ -1,8 +1,11 @@
 import copy
 import json
+from datetime import datetime, timedelta, timezone
 
+from app.models.circle import CircleMember
 from app.models.issue import IssuePhase, IssueStatus
 from app.models.track import TrackStatus
+from app.models.workflow_event import WorkflowEvent
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 
@@ -18,6 +21,100 @@ def test_create_album(client, factory, auth_headers):
     assert body["title"] == "My Album"
     assert body["producer_id"] == user.id
     assert any(m["user_id"] == user.id for m in body["members"])
+
+
+def test_create_album_applies_team_deadlines_and_template_atomically(
+    client, db_session, factory, auth_headers
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(username="mastering")
+    member = factory.user(username="member")
+
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Back Kitchen", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+    circle_id = circle_response.json()["id"]
+
+    db_session.add_all(
+        [
+            CircleMember(circle_id=circle_id, user_id=mastering.id, role="member"),
+            CircleMember(circle_id=circle_id, user_id=member.id, role="member"),
+        ]
+    )
+    db_session.commit()
+
+    template_config = copy.deepcopy(DEFAULT_WORKFLOW_CONFIG)
+    template_config["steps"][0]["label"] = "Circle Intake"
+    template_response = client.post(
+        f"/api/circles/{circle_id}/workflow-templates",
+        headers=auth_headers(producer),
+        json={
+            "name": "Circle Template",
+            "description": "desc",
+            "workflow_config": template_config,
+        },
+    )
+    assert template_response.status_code == 201
+    template_id = template_response.json()["id"]
+
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(producer),
+        json={
+            "title": "Atomic Album",
+            "circle_id": circle_id,
+            "workflow_template_id": template_id,
+            "mastering_engineer_id": mastering.id,
+            "member_ids": [member.id],
+            "deadline": "2025-01-10T00:00:00Z",
+            "phase_deadlines": {
+                "peer_review": "2025-01-05T00:00:00Z",
+                "mastering": "2025-01-07T00:00:00Z",
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["circle_id"] == circle_id
+    assert body["circle_name"] == "Back Kitchen"
+    assert body["mastering_engineer_id"] == mastering.id
+    assert body["deadline"] == "2025-01-10T00:00:00"
+    assert body["phase_deadlines"] == {
+        "peer_review": "2025-01-05T00:00:00Z",
+        "mastering": "2025-01-07T00:00:00Z",
+    }
+    assert body["workflow_template_id"] == template_id
+    assert body["workflow_config"]["steps"][0]["label"] == "Circle Intake"
+    assert {member["user_id"] for member in body["members"]} == {producer.id, member.id}
+
+
+def test_create_album_rejects_non_circle_team_members(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    outsider = factory.user(username="outsider")
+
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Circle One", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(producer),
+        json={
+            "title": "Circle Album",
+            "circle_id": circle_response.json()["id"],
+            "member_ids": [outsider.id],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "not members of this album's circle" in response.text
 
 
 def test_list_albums_visibility(client, factory, auth_headers):
@@ -119,6 +216,61 @@ def test_album_stats(client, factory, auth_headers):
     assert body["open_issues"] == 1
     assert "peer_review" in body["by_status"]
     assert "completed" in body["by_status"]
+
+
+def test_list_albums_returns_summary_fields(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(username="mastering")
+    member = factory.user(username="member")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[member])
+    album.deadline = datetime(2025, 1, 10, tzinfo=timezone.utc)
+    album.phase_deadlines = json.dumps(
+        {"peer_review": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()}
+    )
+    db_session.commit()
+
+    track1 = factory.track(album=album, submitter=member, status="peer_review")
+    track2 = factory.track(album=album, submitter=member, status=TrackStatus.COMPLETED)
+    source_version = track1.source_versions[-1]
+    factory.issue(
+        track=track1,
+        author=producer,
+        phase=IssuePhase.PEER,
+        status=IssueStatus.OPEN,
+        source_version_id=source_version.id,
+    )
+    db_session.add_all(
+        [
+            WorkflowEvent(
+                track_id=track1.id,
+                album_id=album.id,
+                actor_user_id=producer.id,
+                event_type="track_submitted",
+                to_status="peer_review",
+            ),
+            WorkflowEvent(
+                track_id=track2.id,
+                album_id=album.id,
+                actor_user_id=mastering.id,
+                event_type="master_delivered",
+                to_status="completed",
+            ),
+        ]
+    )
+    db_session.commit()
+
+    response = client.get("/api/albums", headers=auth_headers(producer))
+    assert response.status_code == 200
+    body = response.json()[0]
+
+    assert body["track_count"] == 2
+    assert body["total_tracks"] == 2
+    assert body["by_status"]["peer_review"] == 1
+    assert body["by_status"]["completed"] == 1
+    assert body["open_issues"] == 1
+    assert body["overdue_track_count"] == 1
+    assert len(body["recent_events"]) == 2
+    assert body["recent_events"][0]["event_type"] in {"track_submitted", "master_delivered"}
 
 
 def test_list_album_tracks(client, factory, auth_headers):

@@ -139,6 +139,10 @@ class AlbumCreate(AlbumBase):
     circle_id: int | None = None
     circle_name: str | None = Field(default=None, max_length=200)
     genres: list[str] | None = None
+    mastering_engineer_id: int | None = None
+    member_ids: list[int] = Field(default_factory=list)
+    deadline: datetime | None = None
+    phase_deadlines: dict[str, str] | None = None
     workflow_config: "WorkflowConfigSchema | None" = None
     workflow_template_id: int | None = None
 
@@ -210,9 +214,14 @@ class AlbumRead(AlbumBase):
     updated_at: datetime
     archived_at: datetime | None = None
     track_count: int = 0
+    total_tracks: int = 0
+    by_status: dict[str, int] = Field(default_factory=dict)
+    open_issues: int = 0
+    recent_events: list["WorkflowEventRead"] = Field(default_factory=list)
+    overdue_track_count: int = 0
     producer: UserRead | None = None
     mastering_engineer: UserRead | None = None
-    members: list[AlbumMemberRead] = []
+    members: list[AlbumMemberRead] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 

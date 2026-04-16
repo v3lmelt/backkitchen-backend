@@ -6,6 +6,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator
@@ -21,11 +22,12 @@ from app.config import settings
 from app.database import get_db
 from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
 from app.models.album_member import AlbumMember
-from app.models.circle import CircleMember
+from app.models.circle import Circle, CircleMember
 from app.models.issue import Issue, IssueStatus
 from app.models.track import Track, TrackStatus
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
+from app.models.workflow_template import WorkflowTemplate
 from app.notifications import notify
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema, WorkflowEventRead
 from app.security import get_current_user, require_producer
@@ -37,7 +39,303 @@ from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
 
-def _album_to_read(album: Album, db: Session) -> AlbumRead:
+def _parse_album_json(value: str | None, *, fallback: str) -> list[str] | dict[str, str] | None:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except Exception:
+        logger.warning("Album JSON field %s could not be parsed.", fallback)
+        return None
+
+
+def _workflow_config_to_schema(album: Album) -> WorkflowConfigSchema | None:
+    if not album.workflow_config:
+        return None
+    try:
+        return WorkflowConfigSchema(**json.loads(album.workflow_config))
+    except Exception:
+        logger.warning(
+            "Album %d has an invalid workflow_config and will be read without it.",
+            album.id,
+        )
+        return None
+
+
+def _ensure_circle_access(circle_id: int | None, current_user: User, db: Session) -> Circle | None:
+    if circle_id is None:
+        return None
+    circle = db.get(Circle, circle_id)
+    if circle is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Circle not found.")
+    membership = db.execute(
+        select(CircleMember.id).where(
+            CircleMember.circle_id == circle_id,
+            CircleMember.user_id == current_user.id,
+        )
+    ).scalar_one_or_none()
+    if membership is None and circle.created_by != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member of this circle.")
+    return circle
+
+
+def _resolve_album_workflow(
+    payload: AlbumCreate,
+    current_user: User,
+    db: Session,
+) -> tuple[Circle | None, WorkflowTemplate | None, dict]:
+    circle = _ensure_circle_access(payload.circle_id, current_user, db)
+
+    template: WorkflowTemplate | None = None
+    if payload.workflow_template_id is not None:
+        template = db.get(WorkflowTemplate, payload.workflow_template_id)
+        if template is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Workflow template not found.",
+            )
+        if payload.circle_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Workflow template requires a circle.",
+            )
+        if template.circle_id != payload.circle_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Workflow template does not belong to this circle.",
+            )
+
+    if payload.workflow_config is not None:
+        workflow_config = payload.workflow_config.model_dump(mode="json")
+    elif template is not None:
+        workflow_config = WorkflowConfigSchema(
+            **json.loads(template.workflow_config)
+        ).model_dump(mode="json")
+    else:
+        workflow_config = DEFAULT_WORKFLOW_CONFIG
+
+    return circle, template, workflow_config
+
+
+def _validate_album_team_payload(
+    album: Album,
+    payload: AlbumTeamUpdate,
+    current_user: User,
+    db: Session,
+) -> tuple[int | None, set[int]]:
+    if payload.mastering_engineer_id is not None:
+        mastering_engineer = db.get(User, payload.mastering_engineer_id)
+        if mastering_engineer is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Mastering engineer not found.",
+            )
+
+    desired_member_ids = set(payload.member_ids)
+    desired_member_ids.add(current_user.id)
+
+    if album.circle_id is not None:
+        circle_member_ids = set(
+            db.scalars(
+                select(CircleMember.user_id).where(CircleMember.circle_id == album.circle_id)
+            ).all()
+        )
+        circle_owner_id = album.circle.created_by if album.circle else db.scalar(
+            select(Circle.created_by).where(Circle.id == album.circle_id)
+        )
+        if circle_owner_id is not None:
+            circle_member_ids.add(circle_owner_id)
+        invalid_ids = desired_member_ids - circle_member_ids
+        if invalid_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Users {sorted(invalid_ids)} are not members of this album's circle.",
+            )
+        if (
+            payload.mastering_engineer_id is not None
+            and payload.mastering_engineer_id not in circle_member_ids
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Mastering engineer is not a member of this album's circle.",
+            )
+    else:
+        for user_id in desired_member_ids:
+            if db.get(User, user_id) is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"User {user_id} not found.",
+                )
+
+    return payload.mastering_engineer_id, desired_member_ids
+
+
+def _apply_album_team_changes(
+    album: Album,
+    mastering_engineer_id: int | None,
+    desired_member_ids: set[int],
+    db: Session,
+) -> None:
+    album.mastering_engineer_id = mastering_engineer_id
+
+    existing_members = {member.user_id: member for member in album.members}
+    for user_id, member in list(existing_members.items()):
+        if user_id not in desired_member_ids:
+            db.delete(member)
+    for user_id in desired_member_ids:
+        if user_id not in existing_members:
+            db.add(AlbumMember(album_id=album.id, user_id=user_id))
+
+
+def _build_album_stats_summary_map(
+    albums: list[Album],
+    db: Session,
+    current_user: User,
+    *,
+    recent_event_limit: int = 10,
+) -> dict[int, AlbumStats]:
+    if not albums:
+        return {}
+
+    album_by_id = {album.id: album for album in albums}
+    album_ids = list(album_by_id)
+    stats_by_id = {
+        album.id: AlbumStats(
+            total_tracks=0,
+            by_status={},
+            open_issues=0,
+            recent_events=[],
+            deadline=album.deadline,
+            overdue_track_count=0,
+        )
+        for album in albums
+    }
+
+    status_rows = db.execute(
+        select(Track.album_id, Track.status, sqlfunc.count(Track.id))
+        .where(
+            Track.album_id.in_(album_ids),
+            Track.archived_at.is_(None),
+            Track.status != TrackStatus.REJECTED,
+        )
+        .group_by(Track.album_id, Track.status)
+    ).all()
+    for album_id, track_status, count in status_rows:
+        stats = stats_by_id[album_id]
+        stats.by_status[track_status] = count
+        stats.total_tracks += count
+
+    open_issue_rows = db.execute(
+        select(Track.album_id, sqlfunc.count(Issue.id))
+        .join(Issue, Issue.track_id == Track.id)
+        .where(
+            Track.album_id.in_(album_ids),
+            Issue.status == IssueStatus.OPEN,
+        )
+        .group_by(Track.album_id)
+    ).all()
+    for album_id, count in open_issue_rows:
+        stats_by_id[album_id].open_issues = count
+
+    phase_deadline_album_ids = [album.id for album in albums if album.phase_deadlines]
+    if phase_deadline_album_ids:
+        phase_deadlines_by_album = {
+            album.id: _parse_album_json(album.phase_deadlines, fallback="phase_deadlines") or {}
+            for album in albums
+            if album.phase_deadlines
+        }
+        phase_track_rows = db.execute(
+            select(Track.album_id, Track.status)
+            .where(
+                Track.album_id.in_(phase_deadline_album_ids),
+                Track.archived_at.is_(None),
+                Track.status != TrackStatus.REJECTED,
+            )
+        ).all()
+        phase_status_map = {
+            "peer_review": {"peer_review", "peer_revision"},
+            "mastering": {"mastering", "mastering_revision"},
+            "final_review": {"final_review"},
+        }
+        now = datetime.now(timezone.utc)
+        for album_id, track_status in phase_track_rows:
+            deadlines = phase_deadlines_by_album.get(album_id, {})
+            for phase_key, statuses in phase_status_map.items():
+                if track_status not in statuses:
+                    continue
+                raw_deadline = deadlines.get(phase_key)
+                if raw_deadline is None:
+                    break
+                try:
+                    deadline = datetime.fromisoformat(raw_deadline)
+                    if deadline.tzinfo is None:
+                        deadline = deadline.replace(tzinfo=timezone.utc)
+                    if now > deadline:
+                        stats_by_id[album_id].overdue_track_count += 1
+                except (TypeError, ValueError):
+                    pass
+                break
+
+    ranked_events = (
+        select(
+            WorkflowEvent.id.label("event_id"),
+            func.row_number()
+            .over(
+                partition_by=WorkflowEvent.album_id,
+                order_by=(WorkflowEvent.created_at.desc(), WorkflowEvent.id.desc()),
+            )
+            .label("event_rank"),
+        )
+        .where(WorkflowEvent.album_id.in_(album_ids))
+        .subquery()
+    )
+    recent_events = list(
+        db.scalars(
+            select(WorkflowEvent)
+            .join(ranked_events, WorkflowEvent.id == ranked_events.c.event_id)
+            .where(ranked_events.c.event_rank <= recent_event_limit)
+            .order_by(WorkflowEvent.album_id, WorkflowEvent.created_at.desc(), WorkflowEvent.id.desc())
+        ).all()
+    )
+
+    actor_ids = {event.actor_user_id for event in recent_events if event.actor_user_id}
+    actors_by_id: dict[int, User] = {}
+    if actor_ids:
+        actors_by_id = {
+            user.id: user
+            for user in db.scalars(select(User).where(User.id.in_(actor_ids))).all()
+        }
+
+    anonymize_user_ids_by_album: dict[int, set[int]] = defaultdict(set)
+    if recent_events:
+        recent_event_album_ids = sorted({event.album_id for event in recent_events})
+        for track in db.scalars(select(Track).where(Track.album_id.in_(recent_event_album_ids))).all():
+            album = album_by_id.get(track.album_id)
+            if album is None:
+                continue
+            anonymize_user_ids_by_album[track.album_id].update(
+                peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+            )
+
+    for event in recent_events:
+        stats_by_id[event.album_id].recent_events.append(
+            build_event_read(
+                event,
+                db,
+                users_cache=actors_by_id,
+                anonymize_user_ids=anonymize_user_ids_by_album.get(event.album_id),
+            )
+        )
+
+    return stats_by_id
+
+
+def _read_album_with_summary(album: Album, db: Session, current_user: User) -> AlbumRead:
+    summary = _build_album_stats_summary_map([album], db, current_user).get(album.id)
+    return _album_to_read(album, db, summary=summary)
+
+
+def _album_to_read(album: Album, db: Session, *, summary: AlbumStats | None = None) -> AlbumRead:
     members = [
         {
             "id": member.id,
@@ -47,23 +345,18 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         }
         for member in album.members
     ]
-    phase_deadlines = json.loads(album.phase_deadlines) if album.phase_deadlines else None
-    genres = json.loads(album.genres) if album.genres else None
-    workflow_config: WorkflowConfigSchema | None = None
-    try:
-        workflow_config = WorkflowConfigSchema(**json.loads(album.workflow_config))
-    except Exception:
-        logger.warning(
-            "Album %d has an invalid workflow_config and will be read without it.",
-            album.id,
-        )
-    track_count = db.scalar(
-        select(func.count()).select_from(Track).where(
-            Track.album_id == album.id,
-            Track.archived_at.is_(None),
-            Track.status != TrackStatus.REJECTED,
-        )
-    ) or 0
+    phase_deadlines = _parse_album_json(album.phase_deadlines, fallback="phase_deadlines")
+    genres = _parse_album_json(album.genres, fallback="genres")
+    workflow_config = _workflow_config_to_schema(album)
+    track_count = summary.total_tracks if summary is not None else (
+        db.scalar(
+            select(func.count()).select_from(Track).where(
+                Track.album_id == album.id,
+                Track.archived_at.is_(None),
+                Track.status != TrackStatus.REJECTED,
+            )
+        ) or 0
+    )
     template_name = None
     if album.workflow_template_id and album.workflow_template:
         template_name = album.workflow_template.name
@@ -90,6 +383,11 @@ def _album_to_read(album: Album, db: Session) -> AlbumRead:
         updated_at=album.updated_at,
         archived_at=album.archived_at,
         track_count=track_count,
+        total_tracks=summary.total_tracks if summary is not None else track_count,
+        by_status=summary.by_status if summary is not None else {},
+        open_issues=summary.open_issues if summary is not None else 0,
+        recent_events=summary.recent_events if summary is not None else [],
+        overdue_track_count=summary.overdue_track_count if summary is not None else 0,
         producer=UserRead.model_validate(album.producer) if album.producer else None,
         mastering_engineer=(
             UserRead.model_validate(album.mastering_engineer)
@@ -106,23 +404,46 @@ def create_album(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_producer),
 ) -> AlbumRead:
-    album_data = payload.model_dump()
-    genres = album_data.pop("genres", None)
-    wf_config = album_data.pop("workflow_config", None)
-    wf_template_id = album_data.pop("workflow_template_id", None)
+    circle, workflow_template, effective_workflow = _resolve_album_workflow(payload, current_user, db)
+    team_payload = AlbumTeamUpdate(
+        mastering_engineer_id=payload.mastering_engineer_id,
+        member_ids=payload.member_ids,
+    )
+    album_data = payload.model_dump(
+        exclude={
+            "genres",
+            "workflow_config",
+            "workflow_template_id",
+            "mastering_engineer_id",
+            "member_ids",
+            "deadline",
+            "phase_deadlines",
+        }
+    )
+    genres = payload.genres
     album = Album(**album_data, producer_id=current_user.id)
+    album.circle_name = payload.circle_name or (circle.name if circle else album.circle_name)
+    album.deadline = payload.deadline
+    album.phase_deadlines = (
+        json.dumps(payload.phase_deadlines, ensure_ascii=False)
+        if payload.phase_deadlines
+        else None
+    )
     if genres:
         album.genres = json.dumps(genres, ensure_ascii=False)
-    effective_workflow = wf_config if wf_config is not None else DEFAULT_WORKFLOW_CONFIG
     album.workflow_config = json.dumps(effective_workflow, ensure_ascii=False)
-    if wf_template_id is not None:
-        album.workflow_template_id = wf_template_id
+    if workflow_template is not None:
+        album.workflow_template_id = workflow_template.id
+
+    mastering_engineer_id, desired_member_ids = _validate_album_team_payload(
+        album, team_payload, current_user, db
+    )
     db.add(album)
     db.flush()
-    db.add(AlbumMember(album_id=album.id, user_id=current_user.id))
+    _apply_album_team_changes(album, mastering_engineer_id, desired_member_ids, db)
     db.commit()
     db.refresh(album)
-    return _album_to_read(album, db)
+    return _read_album_with_summary(album, db, current_user)
 
 
 @router.get("", response_model=list[AlbumRead])
@@ -142,15 +463,16 @@ def list_albums(
         pattern = f"%{search}%"
         stmt = stmt.where(Album.title.ilike(pattern) | Album.description.ilike(pattern))
     albums = list(db.scalars(stmt).all())
-    if current_user.is_admin:
-        return [_album_to_read(album, db) for album in albums]
-    members_by_album = get_all_album_member_ids(db)
-    visible: list[AlbumRead] = []
-    for album in albums:
-        member_ids = members_by_album.get(album.id, set())
-        if current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids:
-            visible.append(_album_to_read(album, db))
-    return visible
+    visible_albums = albums
+    if not current_user.is_admin:
+        members_by_album = get_all_album_member_ids(db)
+        visible_albums = []
+        for album in albums:
+            member_ids = members_by_album.get(album.id, set())
+            if current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids:
+                visible_albums.append(album)
+    summaries = _build_album_stats_summary_map(visible_albums, db, current_user)
+    return [_album_to_read(album, db, summary=summaries.get(album.id)) for album in visible_albums]
 
 
 @router.get("/{album_id}", response_model=AlbumRead)
@@ -163,7 +485,7 @@ def get_album(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-    return _album_to_read(album, db)
+    return _read_album_with_summary(album, db, current_user)
 
 
 @router.patch("/{album_id}/team", response_model=AlbumRead)
@@ -174,59 +496,13 @@ def update_album_team(
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
     album = ensure_album_producer(album_id, current_user, db)
-
-    # --- validate mastering engineer exists ---
-    if payload.mastering_engineer_id is not None:
-        mastering_engineer = db.get(User, payload.mastering_engineer_id)
-        if mastering_engineer is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Mastering engineer not found.",
-            )
-
-    # --- validate members ---
-    desired_member_ids = set(payload.member_ids)
-    desired_member_ids.add(current_user.id)
-
-    if album.circle_id is not None:
-        circle_member_ids = set(
-            db.scalars(
-                select(CircleMember.user_id).where(CircleMember.circle_id == album.circle_id)
-            ).all()
-        )
-        invalid_ids = desired_member_ids - circle_member_ids
-        if invalid_ids:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Users {sorted(invalid_ids)} are not members of this album's circle.",
-            )
-        if payload.mastering_engineer_id is not None and payload.mastering_engineer_id not in circle_member_ids:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Mastering engineer is not a member of this album's circle.",
-            )
-    else:
-        for user_id in desired_member_ids:
-            if db.get(User, user_id) is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"User {user_id} not found.",
-                )
-
-    # --- apply changes (all validation passed) ---
-    album.mastering_engineer_id = payload.mastering_engineer_id
-
-    existing_members = {member.user_id: member for member in album.members}
-    for user_id, member in list(existing_members.items()):
-        if user_id not in desired_member_ids:
-            db.delete(member)
-    for user_id in desired_member_ids:
-        if user_id not in existing_members:
-            db.add(AlbumMember(album_id=album.id, user_id=user_id))
-
+    mastering_engineer_id, desired_member_ids = _validate_album_team_payload(
+        album, payload, current_user, db
+    )
+    _apply_album_team_changes(album, mastering_engineer_id, desired_member_ids, db)
     db.commit()
     db.refresh(album)
-    return _album_to_read(album, db)
+    return _read_album_with_summary(album, db, current_user)
 
 
 @router.delete("/{album_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -300,10 +576,14 @@ def update_deadlines(
 ) -> AlbumRead:
     album = ensure_album_producer(album_id, current_user, db)
     album.deadline = payload.deadline
-    album.phase_deadlines = json.dumps(payload.phase_deadlines) if payload.phase_deadlines else None
+    album.phase_deadlines = (
+        json.dumps(payload.phase_deadlines, ensure_ascii=False)
+        if payload.phase_deadlines
+        else None
+    )
     db.commit()
     db.refresh(album)
-    return _album_to_read(album, db)
+    return _read_album_with_summary(album, db, current_user)
 
 
 @router.patch("/{album_id}/metadata", response_model=AlbumRead)
@@ -323,7 +603,7 @@ def update_album_metadata(
     album.genres = json.dumps(payload.genres, ensure_ascii=False) if payload.genres else None
     db.commit()
     db.refresh(album)
-    return _album_to_read(album, db)
+    return _read_album_with_summary(album, db, current_user)
 
 
 @router.post("/{album_id}/cover", response_model=AlbumRead)
@@ -367,7 +647,7 @@ async def upload_album_cover(
     album.cover_image = f"covers/{filename}"
     db.commit()
     db.refresh(album)
-    return _album_to_read(album, db)
+    return _read_album_with_summary(album, db, current_user)
 
 
 @router.get("/{album_id}/stats", response_model=AlbumStats)
@@ -380,94 +660,7 @@ def get_album_stats(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-
-    # Aggregate track counts by status in a single query
-    status_rows = db.execute(
-        select(Track.status, sqlfunc.count(Track.id))
-        .where(
-            Track.album_id == album_id,
-            Track.archived_at.is_(None),
-            Track.status != TrackStatus.REJECTED,
-        )
-        .group_by(Track.status)
-    ).all()
-    by_status: dict[str, int] = {row[0]: row[1] for row in status_rows}
-    total_tracks = sum(by_status.values())
-
-    # Load tracks only for deadline overdue calculation (only if phase_deadlines is set)
-    tracks: list[Track] = []
-    if album.phase_deadlines:
-        tracks = list(db.scalars(
-            select(Track).where(
-                Track.album_id == album_id,
-                Track.archived_at.is_(None),
-                Track.status != TrackStatus.REJECTED,
-            )
-        ).all())
-
-    open_issues = db.scalar(
-        select(sqlfunc.count(Issue.id))
-        .join(Track, Issue.track_id == Track.id)
-        .where(Track.album_id == album_id, Issue.status == IssueStatus.OPEN)
-    ) or 0
-
-    recent_events = list(db.scalars(
-        select(WorkflowEvent)
-        .where(WorkflowEvent.album_id == album_id)
-        .order_by(WorkflowEvent.created_at.desc())
-        .limit(10)
-    ).all())
-
-    # Pre-fetch actors for recent events
-    actor_ids = {e.actor_user_id for e in recent_events if e.actor_user_id}
-    actors_by_id: dict[int, User] = {}
-    if actor_ids:
-        actors_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(actor_ids))).all()}
-
-    anonymize_user_ids: set[int] = set()
-    for track in db.scalars(select(Track).where(Track.album_id == album_id)).all():
-        anonymize_user_ids.update(
-            peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
-        )
-
-    overdue_count = 0
-    if album.phase_deadlines:
-        deadlines = json.loads(album.phase_deadlines)
-        now = datetime.now(timezone.utc)
-        phase_status_map = {
-            "peer_review": {"peer_review", "peer_revision"},
-            "mastering": {"mastering", "mastering_revision"},
-            "final_review": {"final_review"},
-        }
-        for track in tracks:
-            for phase_key, statuses in phase_status_map.items():
-                if track.status in statuses and phase_key in deadlines:
-                    try:
-                        dl = datetime.fromisoformat(deadlines[phase_key])
-                        if dl.tzinfo is None:
-                            dl = dl.replace(tzinfo=timezone.utc)
-                        if now > dl:
-                            overdue_count += 1
-                            break
-                    except (ValueError, TypeError):
-                        pass
-
-    return AlbumStats(
-        total_tracks=total_tracks,
-        by_status=by_status,
-        open_issues=open_issues,
-        recent_events=[
-            build_event_read(
-                e,
-                db,
-                users_cache=actors_by_id,
-                anonymize_user_ids=anonymize_user_ids,
-            )
-            for e in recent_events
-        ],
-        deadline=album.deadline,
-        overdue_track_count=overdue_count,
-    )
+    return _build_album_stats_summary_map([album], db, current_user)[album.id]
 
 
 @router.get("/{album_id}/activity", response_model=list[WorkflowEventRead])
@@ -1020,7 +1213,7 @@ def archive_album(
     )
     db.commit()
     db.refresh(album)
-    return _album_to_read(album, db)
+    return _read_album_with_summary(album, db, current_user)
 
 
 @router.post("/{album_id}/restore", response_model=AlbumRead)
@@ -1053,4 +1246,4 @@ def restore_album(
     )
     db.commit()
     db.refresh(album)
-    return _album_to_read(album, db)
+    return _read_album_with_summary(album, db, current_user)
