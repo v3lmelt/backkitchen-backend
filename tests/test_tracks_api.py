@@ -986,6 +986,51 @@ def test_upload_master_delivery_custom_delivery_requires_assigned_user(client, d
     assert "assigned user" in response.text
 
 
+def test_confirm_delivery_rejects_steps_that_do_not_require_confirmation(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_delivery",
+                    "label": "Custom Delivery",
+                    "type": "delivery",
+                    "ui_variant": "generic",
+                    "assignee_role": "mastering_engineer",
+                    "order": 0,
+                    "transitions": {"deliver": "final_gate"},
+                    "require_confirmation": False,
+                },
+                {
+                    "id": "final_gate",
+                    "label": "Final Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_delivery"
+    delivery = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/master-deliveries/{delivery.id}/confirm",
+        headers=auth_headers(mastering),
+    )
+
+    assert response.status_code == 409
+    assert "does not require confirmation" in response.text
+
+
 def test_create_issue_custom_step_rejects_mismatched_phase(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")

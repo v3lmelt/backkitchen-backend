@@ -299,6 +299,8 @@ def _ensure_delivery_confirm_permission(track: Track, album: Album, current_user
     step = engine_get_current_step(config, track)
     if step is None or step.type != "delivery":
         raise HTTPException(status_code=409, detail="Track is not in a delivery stage.")
+    if not step.require_confirmation:
+        raise HTTPException(status_code=409, detail="This delivery step does not require confirmation.")
     assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
     if assignee_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the assigned user can confirm delivery.")
