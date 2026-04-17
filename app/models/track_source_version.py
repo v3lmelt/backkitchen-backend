@@ -15,7 +15,7 @@ class TrackSourceVersion(Base):
     )
     workflow_cycle: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     storage_backend: Mapped[str] = mapped_column(String(10), nullable=False, default="local")
     duration: Mapped[float | None] = mapped_column(Float, nullable=True)
     uploaded_by_id: Mapped[int | None] = mapped_column(

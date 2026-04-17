@@ -73,6 +73,21 @@ def _is_submitter_hidden_issue_status(status_value: IssueStatus) -> bool:
     return status_value in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}
 
 
+def _verify_r2_audio_keys(object_keys: list[str], *, expected_prefix: str | None = None) -> None:
+    from app.services.r2 import object_exists
+
+    normalized_prefix = None
+    if expected_prefix is not None:
+        normalized_prefix = expected_prefix.strip("/") + "/"
+
+    for key in object_keys:
+        normalized_key = key.strip("/")
+        if normalized_prefix and not normalized_key.startswith(normalized_prefix):
+            raise HTTPException(status_code=400, detail=f"Upload key does not match the expected target: {key}")
+        if not object_exists(normalized_key):
+            raise HTTPException(status_code=400, detail=f"Upload not found in R2: {key}")
+
+
 def _peer_anonymize_user_ids(
     db: Session,
     track: Track,
@@ -450,8 +465,19 @@ async def create_issue(
                 detail="time_end must be greater than time_start.",
             )
 
+    # Parse R2 audio keys if provided
+    r2_audio_keys: list[str] = []
+    r2_audio_names: list[str] = []
+    if audio_object_keys:
+        r2_audio_keys = [k.strip() for k in audio_object_keys.split("\n") if k.strip()]
+        r2_audio_names = [n.strip() for n in (audio_original_filenames or "").split("\n")]
+        while len(r2_audio_names) < len(r2_audio_keys):
+            r2_audio_names.append(Path(r2_audio_keys[len(r2_audio_names)]).name)
+        _verify_r2_audio_keys(r2_audio_keys)
+
     # Validate audio files
-    if len(audios) > MAX_AUDIOS_PER_ISSUE:
+    total_issue_audio_count = len(audios) + len(r2_audio_keys)
+    if total_issue_audio_count > MAX_AUDIOS_PER_ISSUE:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"An issue may contain at most {MAX_AUDIOS_PER_ISSUE} audio files.",
@@ -475,15 +501,6 @@ async def create_issue(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Unsupported image type: {img_file.content_type}. Allowed: jpeg, png, gif, webp.",
             )
-
-    # Parse R2 audio keys if provided
-    r2_audio_keys: list[str] = []
-    r2_audio_names: list[str] = []
-    if audio_object_keys:
-        r2_audio_keys = [k.strip() for k in audio_object_keys.split("\n") if k.strip()]
-        r2_audio_names = [n.strip() for n in (audio_original_filenames or "").split("\n")]
-        while len(r2_audio_names) < len(r2_audio_keys):
-            r2_audio_names.append(Path(r2_audio_keys[len(r2_audio_names)]).name)
 
     source_version_id = None
     _master_delivery_id = None
@@ -913,7 +930,8 @@ async def add_comment(
                 detail=f"Unsupported file type: {img_file.content_type}. Allowed: jpeg, png, gif, webp.",
             )
 
-    if len(audios) > MAX_AUDIOS_PER_COMMENT:
+    total_comment_audio_count = len(audios) + len(r2_audio_keys)
+    if total_comment_audio_count > MAX_AUDIOS_PER_COMMENT:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"A comment may contain at most {MAX_AUDIOS_PER_COMMENT} audio files.",
@@ -924,6 +942,8 @@ async def add_comment(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Unsupported audio type: {audio_file.content_type}. Allowed: mp3, wav, flac, aac, ogg.",
             )
+    if r2_audio_keys:
+        _verify_r2_audio_keys(r2_audio_keys, expected_prefix=f"comments/{issue_id}/0")
 
     comment_visibility = "internal" if _is_submitter_hidden_issue_status(issue.status) else "public"
     comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content or '', visibility=comment_visibility)

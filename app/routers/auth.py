@@ -5,10 +5,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.admin_permissions import sync_admin_role_flags
 from app.models.email_verification import EmailVerificationToken
 from app.models.password_reset import PasswordResetToken
 from app.models.user import User
@@ -39,6 +40,7 @@ _PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 60
 
 
 def _build_auth_response(user: User) -> AuthResponse:
+    sync_admin_role_flags(user)
     return AuthResponse(access_token=create_access_token(user), user=UserRead.model_validate(user))
 
 
@@ -79,6 +81,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Email not verified. Please check your inbox.",
+        )
+    if user.suspended_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Contact an administrator.",
         )
     return _build_auth_response(user)
 
@@ -221,6 +228,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
     user.password = hash_password(payload.new_password)
+    user.session_version = max(int(user.session_version or 1), 1) + 1
     record.used = True
     db.commit()
     db.refresh(user)
@@ -229,6 +237,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
 
 @router.get("/me", response_model=UserRead)
 def get_me(current_user: User = Depends(get_current_user)) -> UserRead:
+    sync_admin_role_flags(current_user)
     return UserRead.model_validate(current_user)
 
 
@@ -239,6 +248,7 @@ def update_me(
     current_user: User = Depends(get_current_user),
 ) -> UserRead:
     changed = False
+    verification_email: str | None = None
     if payload.display_name is not None:
         current_user.display_name = payload.display_name
         changed = True
@@ -246,14 +256,21 @@ def update_me(
         existing = db.scalars(select(User).where(User.email == payload.email, User.id != current_user.id)).first()
         if existing is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email is already registered.")
-        current_user.email = payload.email
-        changed = True
+        if payload.email != current_user.email:
+            current_user.email = payload.email
+            current_user.email_verified = False
+            verification_email = payload.email
+            changed = True
     if payload.feishu_contact is not None:
         current_user.feishu_contact = payload.feishu_contact or None
         changed = True
     if changed:
+        sync_admin_role_flags(current_user)
         db.commit()
         db.refresh(current_user)
+    if verification_email:
+        token = _create_verification_token(verification_email, db)
+        send_verification_email(verification_email, token)
     return UserRead.model_validate(current_user)
 
 
@@ -326,6 +343,7 @@ def change_password(
     if not verify_password(payload.current_password, current_user.password or ""):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect.")
     current_user.password = hash_password(payload.new_password)
+    current_user.session_version = max(int(current_user.session_version or 1), 1) + 1
     db.commit()
 
 
@@ -342,6 +360,7 @@ def delete_account(
     """
     from app.models.album import Album
     from app.models.circle import Circle
+    from app.models.track import RejectionMode, Track, TrackStatus
 
     if not verify_password(payload.password, current_user.password or ""):
         raise HTTPException(
@@ -372,9 +391,48 @@ def delete_account(
             detail="You still produce one or more active albums. Archive or transfer them before closing your account.",
         )
 
+    active_track_filter = or_(
+        Track.status.notin_([TrackStatus.COMPLETED.value, TrackStatus.REJECTED.value]),
+        and_(
+            Track.status == TrackStatus.REJECTED.value,
+            Track.rejection_mode == RejectionMode.RESUBMITTABLE,
+        ),
+    )
+
+    authored_track = db.scalars(
+        select(Track.id).where(
+            Track.submitter_id == current_user.id,
+            Track.archived_at.is_(None),
+            active_track_filter,
+        ).limit(1)
+    ).first()
+    if authored_track is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You still own one or more active tracks. Complete, archive, or transfer them before closing your account.",
+        )
+
+    mastering_track = db.scalars(
+        select(Track.id)
+        .join(Album, Album.id == Track.album_id)
+        .where(
+            Album.mastering_engineer_id == current_user.id,
+            Track.archived_at.is_(None),
+            active_track_filter,
+        )
+        .limit(1)
+    ).first()
+    if mastering_track is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You are still responsible for one or more active mastering tracks. Reassign them before closing your account.",
+        )
+
     now = datetime.now(timezone.utc)
     original_email = current_user.email
     current_user.deleted_at = now
+    current_user.suspended_at = now
+    current_user.suspension_reason = "Account deleted"
     current_user.display_name = "[deleted user]"
     # Suffix username/email with deleted-<id>-<ts> to free the unique constraints
     suffix = f".deleted-{current_user.id}-{int(now.timestamp())}"
@@ -382,6 +440,7 @@ def delete_account(
         current_user.username = f"{current_user.username}{suffix}"
     if current_user.email:
         current_user.email = f"{current_user.email}{suffix}"
+    current_user.session_version = max(int(current_user.session_version or 1), 1) + 1
     # Invalidate any outstanding password reset tokens tied to the original email
     if original_email:
         db.execute(

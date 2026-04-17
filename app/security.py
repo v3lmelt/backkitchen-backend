@@ -60,6 +60,7 @@ def create_access_token(user: User) -> str:
     payload = {
         "sub": user.id,
         "type": TOKEN_KIND,
+        "sv": max(int(user.session_version or 1), 1),
         "exp": int(
             (
                 datetime.now(timezone.utc)
@@ -119,6 +120,16 @@ def _resolve_bearer_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authenticated user no longer exists.",
         )
+    if user.suspended_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account suspended.",
+        )
+    if int(payload.get("sv", 0)) != max(int(user.session_version or 1), 1):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication token revoked.",
+        )
     return user
 
 
@@ -163,6 +174,11 @@ def get_user_from_token_param(
         return None
     payload = _decode_token(token)
     user = db.get(User, int(payload["sub"]))
-    if user is None:
+    if (
+        user is None
+        or user.deleted_at is not None
+        or user.suspended_at is not None
+        or int(payload.get("sv", 0)) != max(int(user.session_version or 1), 1)
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found.")
     return user

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.admin_permissions import has_admin_role
 from app.config import settings
 from app.database import get_db
 from app.models.album import Album
@@ -31,7 +32,7 @@ router = APIRouter(prefix="/api/circles", tags=["circles"])
 
 
 def _ensure_circle_producer(circle: Circle, current_user: User) -> None:
-    if circle.created_by != current_user.id:
+    if circle.created_by != current_user.id and not has_admin_role(current_user, "operator"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the circle creator can do this")
 
 

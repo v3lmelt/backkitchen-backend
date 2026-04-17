@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.admin_permissions import has_admin_role
 from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
@@ -55,17 +56,19 @@ def next_issue_local_number(db: Session, track_id: int) -> int:
     return (current or 0) + 1
 
 
-def _audio_url(audio) -> str:
-    """Return the public URL for an audio attachment.
+def issue_audio_file_url(audio_id: int) -> str:
+    """Return the authenticated API URL for an issue audio attachment."""
+    return f"/api/issue-audios/{audio_id}/file"
 
-    For R2-stored files, returns the public CDN URL directly.
-    For local files, returns the ``/uploads/`` path.
-    """
-    if audio.storage_backend == "r2":
-        from app.services.r2 import public_url
 
-        return public_url(audio.file_path)
-    return f"/uploads/{audio.file_path}"
+def comment_audio_file_url(audio_id: int) -> str:
+    """Return the authenticated API URL for a comment audio attachment."""
+    return f"/api/comment-audios/{audio_id}/file"
+
+
+def discussion_audio_file_url(audio_id: int) -> str:
+    """Return the authenticated API URL for a discussion audio attachment."""
+    return f"/api/discussion-audios/{audio_id}/file"
 
 
 def get_album_member_ids(db: Session, album_id: int) -> set[int]:
@@ -95,7 +98,7 @@ def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Album not found.",
         )
-    if user.is_admin:
+    if has_admin_role(user, "operator"):
         return album
     if album.producer_id != user.id:
         raise HTTPException(
@@ -106,7 +109,7 @@ def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
 
 
 def ensure_album_visibility(album: Album, user: User, db: Session) -> None:
-    if user.is_admin:
+    if has_admin_role(user, "viewer"):
         return
     member_ids = get_album_member_ids(db, album.id)
     visible_ids = {album.producer_id, album.mastering_engineer_id}
@@ -252,7 +255,7 @@ def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     # Admins bypass all visibility checks
-    if user.is_admin:
+    if has_admin_role(user, "viewer"):
         return album
     # Producer and mastering engineer always have access
     if user.id in (album.producer_id, album.mastering_engineer_id):
@@ -497,7 +500,7 @@ def build_issue_read(
         IssueAudioRead(
             id=audio.id,
             issue_id=audio.issue_id,
-            audio_url=_audio_url(audio),
+            audio_url=issue_audio_file_url(audio.id),
             original_filename=audio.original_filename,
             duration=audio.duration,
             created_at=audio.created_at,
@@ -569,7 +572,7 @@ def build_comment_read(
         CommentAudioRead(
             id=audio.id,
             comment_id=audio.comment_id,
-            audio_url=_audio_url(audio),
+            audio_url=comment_audio_file_url(audio.id),
             original_filename=audio.original_filename,
             duration=audio.duration,
             created_at=audio.created_at,
@@ -775,7 +778,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
                 DiscussionAudioRead(
                     id=a.id,
                     discussion_id=a.discussion_id,
-                    audio_url=f"/uploads/{a.file_path}",
+                    audio_url=discussion_audio_file_url(a.id),
                     original_filename=a.original_filename,
                     duration=a.duration,
                     created_at=a.created_at,

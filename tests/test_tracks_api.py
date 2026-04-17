@@ -4,12 +4,16 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from app.config import settings
+from app.models.discussion import TrackDiscussion, TrackDiscussionAudio
+from app.models.issue_image import IssueImage
 from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.workflow_event import WorkflowEvent
+from app.security import create_access_token
 
 
 def test_create_track_creates_source_version_and_event(client, db_session, factory, auth_headers):
@@ -81,6 +85,28 @@ def test_list_tracks_respects_submitter_and_reviewer_visibility(client, db_sessi
     assert [item["id"] for item in reviewer_response.json()] == [reviewer_track.id]
     assert outsider_response.status_code == 200
     assert outsider_response.json() == []
+
+
+def test_list_tracks_hides_rejected_by_default_but_allows_explicit_rejected_filter(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    active_track = factory.track(album=album, submitter=submitter, status="peer_review")
+    rejected_track = factory.track(album=album, submitter=submitter, status=TrackStatus.REJECTED)
+    db_session.commit()
+
+    default_response = client.get("/api/tracks", headers=auth_headers(submitter))
+    rejected_response = client.get(
+        "/api/tracks",
+        headers=auth_headers(submitter),
+        params={"status": TrackStatus.REJECTED.value},
+    )
+
+    assert default_response.status_code == 200
+    assert {item["id"] for item in default_response.json()} == {active_track.id}
+    assert rejected_response.status_code == 200
+    assert [item["id"] for item in rejected_response.json()] == [rejected_track.id]
 
 
 def test_list_tracks_includes_stage_assigned_reviewer_and_allowed_actions(client, db_session, factory, auth_headers):
@@ -685,6 +711,125 @@ def test_delete_track_removes_audio_file(client, db_session, factory, auth_heade
     assert not audio_path.exists()
 
 
+def test_delete_track_removes_issue_images_and_discussion_audios(client, db_session, factory, auth_headers, upload_dir):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter)
+
+    issue = factory.issue(track=track, author=producer, phase="producer", source_version_id=track.source_versions[-1].id)
+    issue_images_dir = upload_dir / "issue_images"
+    issue_images_dir.mkdir(parents=True, exist_ok=True)
+    issue_image_path = issue_images_dir / "cleanup-test.png"
+    issue_image_path.write_bytes(b"png")
+    db_session.add(IssueImage(issue_id=issue.id, file_path="issue_images/cleanup-test.png"))
+
+    discussion = TrackDiscussion(track_id=track.id, author_id=submitter.id, phase="general", content="cleanup")
+    db_session.add(discussion)
+    db_session.flush()
+    discussion_audios_dir = upload_dir / "discussion_audios"
+    discussion_audios_dir.mkdir(parents=True, exist_ok=True)
+    discussion_audio_path = discussion_audios_dir / "cleanup-test.wav"
+    discussion_audio_path.write_bytes(b"RIFFcleanup")
+    db_session.add(
+        TrackDiscussionAudio(
+            discussion_id=discussion.id,
+            file_path="discussion_audios/cleanup-test.wav",
+            original_filename="cleanup-test.wav",
+            duration=1.0,
+        )
+    )
+    db_session.commit()
+
+    response = client.delete(f"/api/tracks/{track.id}", headers=auth_headers(submitter))
+
+    assert response.status_code == 204
+    assert not issue_image_path.exists()
+    assert not discussion_audio_path.exists()
+
+
+def test_audio_query_token_rejects_deleted_user(client, db_session, factory):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter)
+    token = create_access_token(submitter)
+
+    submitter.deleted_at = datetime.now(timezone.utc)
+    db_session.commit()
+
+    response = client.get(f"/api/tracks/{track.id}/audio", params={"token": token})
+
+    assert response.status_code == 401
+
+
+def test_confirm_track_upload_rejects_unexpected_r2_key(client, factory, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "R2_ENABLED", True)
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+
+    response = client.post(
+        "/api/tracks/confirm-upload",
+        headers=auth_headers(submitter),
+        json={
+            "upload_id": "upload-1",
+            "object_key": "tracks/new/source/999/not-owned.mp3",
+            "album_id": album.id,
+            "title": "R2 Track",
+            "artist": "Nova",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "expected target" in response.json()["detail"]
+
+
+def test_confirm_source_version_upload_rejects_unexpected_r2_key(client, factory, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "R2_ENABLED", True)
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="peer_revision")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions/confirm-upload",
+        headers=auth_headers(submitter),
+        json={
+            "upload_id": "upload-2",
+            "object_key": f"tracks/{track.id}/source/999/not-owned.mp3",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "expected target" in response.json()["detail"]
+
+
+def test_confirm_master_delivery_upload_rejects_unexpected_r2_key(client, factory, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "R2_ENABLED", True)
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/master-deliveries/confirm-upload",
+        headers=auth_headers(mastering),
+        json={
+            "upload_id": "upload-3",
+            "object_key": f"tracks/{track.id}/master/999/not-owned.mp3",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "expected target" in response.json()["detail"]
+
+
 def test_assign_reviewer_rejects_non_album_member(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -839,6 +984,51 @@ def test_upload_master_delivery_custom_delivery_requires_assigned_user(client, d
 
     assert response.status_code == 403
     assert "assigned user" in response.text
+
+
+def test_confirm_delivery_rejects_steps_that_do_not_require_confirmation(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="submitted", peer_reviewer=None)
+
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_delivery",
+                    "label": "Custom Delivery",
+                    "type": "delivery",
+                    "ui_variant": "generic",
+                    "assignee_role": "mastering_engineer",
+                    "order": 0,
+                    "transitions": {"deliver": "final_gate"},
+                    "require_confirmation": False,
+                },
+                {
+                    "id": "final_gate",
+                    "label": "Final Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    track.status = "custom_delivery"
+    delivery = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/master-deliveries/{delivery.id}/confirm",
+        headers=auth_headers(mastering),
+    )
+
+    assert response.status_code == 409
+    assert "does not require confirmation" in response.text
 
 
 def test_create_issue_custom_step_rejects_mismatched_phase(client, db_session, factory, auth_headers):

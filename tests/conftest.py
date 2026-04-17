@@ -28,7 +28,7 @@ from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.invitation import Invitation
 from app.models.notification import Notification
-from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users
+from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users, workflow_templates
 from app.security import create_access_token
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
@@ -81,6 +81,7 @@ def client(
         lambda _path: SimpleNamespace(duration=123.4, bitrate=None, sample_rate=None),
     )
     monkeypatch.setattr(auth, "send_verification_email", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth, "send_password_reset_email", lambda *_args, **_kwargs: None)
 
     def override_get_db() -> Iterator[Session]:
         session = session_factory()
@@ -101,6 +102,7 @@ def client(
     app.include_router(admin.router)
     app.include_router(circles.router)
     app.include_router(discussions.router)
+    app.include_router(workflow_templates.router)
     app.dependency_overrides[get_db] = override_get_db
     app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
 
@@ -132,10 +134,14 @@ class Factory:
         display_name: str | None = None,
         email: str | None = None,
         is_admin: bool = False,
+        admin_role: str | None = None,
         email_verified: bool = True,
     ) -> User:
         effective_role = "member" if role == "mastering_engineer" else role
         key = username or self._next(role)
+        resolved_admin_role = admin_role
+        if resolved_admin_role is None:
+            resolved_admin_role = "superadmin" if is_admin else "none"
         user = User(
             username=key,
             display_name=display_name or key.title(),
@@ -143,7 +149,8 @@ class Factory:
             role=effective_role,
             avatar_color="#123456",
             password="pw",
-            is_admin=is_admin,
+            is_admin=is_admin or resolved_admin_role != "none",
+            admin_role=resolved_admin_role,
             email_verified=email_verified,
         )
         self.session.add(user)
