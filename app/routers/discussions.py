@@ -95,6 +95,9 @@ def _ensure_discussion_visible_to_user(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to internal discussions.")
 
 
+MAX_DISCUSSION_PAGE_SIZE = 50
+
+
 @router.get(
     "/api/tracks/{track_id}/discussions",
     response_model=list[DiscussionRead],
@@ -102,6 +105,8 @@ def _ensure_discussion_visible_to_user(
 def list_discussions(
     track_id: int,
     phase: Optional[str] = None,
+    before_id: Optional[int] = Query(default=None, ge=1),
+    limit: Optional[int] = Query(default=None, ge=1, le=MAX_DISCUSSION_PAGE_SIZE),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[DiscussionRead]:
@@ -118,14 +123,25 @@ def list_discussions(
     stmt = (
         select(TrackDiscussion)
         .where(TrackDiscussion.track_id == track_id)
-        .order_by(TrackDiscussion.created_at.asc())
         .options(selectinload(TrackDiscussion.images), selectinload(TrackDiscussion.audios), selectinload(TrackDiscussion.author))
     )
     if phase is not None:
         stmt = stmt.where(TrackDiscussion.phase == phase)
     elif not can_see_mastering:
         stmt = stmt.where(TrackDiscussion.phase != "mastering")
-    discussions = list(db.scalars(stmt).all())
+
+    if limit is not None:
+        # Cursor pagination: take newest-first slice, optionally older than before_id,
+        # then reverse to ascending so the client renders oldest-at-top.
+        stmt = stmt.order_by(TrackDiscussion.id.desc())
+        if before_id is not None:
+            stmt = stmt.where(TrackDiscussion.id < before_id)
+        stmt = stmt.limit(limit)
+        discussions = list(reversed(db.scalars(stmt).all()))
+    else:
+        stmt = stmt.order_by(TrackDiscussion.id.asc())
+        discussions = list(db.scalars(stmt).all())
+
     anonymize_user_ids: set[int] = set()
     if album is not None:
         anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)

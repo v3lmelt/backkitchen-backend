@@ -219,3 +219,100 @@ def test_internal_resolved_issue_does_not_force_new_discussion_internal(client, 
     list_submitter = client.get(f"/api/tracks/{track.id}/discussions", headers=auth_headers(submitter))
     assert list_submitter.status_code == 200
     assert [item["id"] for item in list_submitter.json()] == [discussion_id]
+
+
+def _seed_general_discussions(client, headers, track_id: int, count: int) -> list[int]:
+    ids: list[int] = []
+    for i in range(count):
+        response = client.post(
+            f"/api/tracks/{track_id}/discussions",
+            headers=headers,
+            data={"content": f"msg {i}"},
+        )
+        assert response.status_code == 201
+        ids.append(response.json()["id"])
+    return ids
+
+
+def test_list_discussions_defaults_to_full_ascending_list(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter)
+    headers = auth_headers(submitter)
+    ids = _seed_general_discussions(client, headers, track.id, 5)
+
+    response = client.get(f"/api/tracks/{track.id}/discussions", headers=headers)
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == ids
+
+
+def test_list_discussions_limit_returns_latest_page_ascending(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter)
+    headers = auth_headers(submitter)
+    ids = _seed_general_discussions(client, headers, track.id, 25)
+
+    response = client.get(f"/api/tracks/{track.id}/discussions?limit=10", headers=headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["id"] for item in body] == ids[-10:]
+
+
+def test_list_discussions_before_id_returns_older_slice(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter)
+    headers = auth_headers(submitter)
+    ids = _seed_general_discussions(client, headers, track.id, 15)
+
+    latest = client.get(f"/api/tracks/{track.id}/discussions?limit=5", headers=headers).json()
+    assert [item["id"] for item in latest] == ids[-5:]
+
+    cursor = latest[0]["id"]
+    older = client.get(
+        f"/api/tracks/{track.id}/discussions?limit=5&before_id={cursor}",
+        headers=headers,
+    )
+
+    assert older.status_code == 200
+    assert [item["id"] for item in older.json()] == ids[-10:-5]
+
+
+def test_list_discussions_rejects_invalid_limit(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter)
+    headers = auth_headers(submitter)
+
+    assert client.get(f"/api/tracks/{track.id}/discussions?limit=0", headers=headers).status_code == 422
+    assert client.get(f"/api/tracks/{track.id}/discussions?limit=51", headers=headers).status_code == 422
+
+
+def test_track_detail_caps_discussions_to_seed_size(client, factory, auth_headers):
+    from app.workflow import TRACK_DETAIL_DISCUSSION_SEED_SIZE
+
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter)
+    headers = auth_headers(submitter)
+    total = TRACK_DETAIL_DISCUSSION_SEED_SIZE + 5
+    ids = _seed_general_discussions(client, headers, track.id, total)
+
+    response = client.get(f"/api/tracks/{track.id}", headers=headers)
+
+    assert response.status_code == 200
+    detail_ids = [d["id"] for d in response.json()["discussions"]]
+    assert detail_ids == ids[-TRACK_DETAIL_DISCUSSION_SEED_SIZE:]
