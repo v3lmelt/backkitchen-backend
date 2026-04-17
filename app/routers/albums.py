@@ -1085,6 +1085,7 @@ async def export_album_stream(
                     total_tracks=total_tracks,
                     genre=genres_str,
                     date=release_date_str,
+                    catalog_number=album_catalog_number,
                     cover_data=cover_data,
                 )
 
