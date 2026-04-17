@@ -5,6 +5,8 @@ from typing import Any
 from fastapi import HTTPException, status
 
 logger = logging.getLogger(__name__)
+
+TRACK_DETAIL_DISCUSSION_SEED_SIZE = 20
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -693,8 +695,6 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.images),
             selectinload(Track.issues).selectinload(Issue.comments).selectinload(Comment.audios),
             selectinload(Track.workflow_events),
-            selectinload(Track.discussions).selectinload(TrackDiscussion.images),
-            selectinload(Track.discussions).selectinload(TrackDiscussion.audios),
             selectinload(Track.source_versions),
             selectinload(Track.master_deliveries),
             selectinload(Track.checklist_items),
@@ -702,6 +702,26 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             selectinload(Track.peer_reviewer),
         )
     )
+
+    # Seed the discussion panel with the most recent slice; the wall view will
+    # paginate older entries on demand via /api/tracks/{id}/discussions.
+    can_see_mastering = is_mastering_participant(user, track, album)
+    suppress_internal = user.id == track.submitter_id and user.id != album.producer_id
+    recent_discussions_stmt = (
+        select(TrackDiscussion)
+        .where(TrackDiscussion.track_id == track.id)
+        .options(
+            selectinload(TrackDiscussion.images),
+            selectinload(TrackDiscussion.audios),
+        )
+        .order_by(TrackDiscussion.id.desc())
+        .limit(TRACK_DETAIL_DISCUSSION_SEED_SIZE)
+    )
+    if not can_see_mastering:
+        recent_discussions_stmt = recent_discussions_stmt.where(TrackDiscussion.phase != "mastering")
+    if suppress_internal:
+        recent_discussions_stmt = recent_discussions_stmt.where(TrackDiscussion.visibility != "internal")
+    recent_discussions = list(reversed(db.scalars(recent_discussions_stmt).all()))
 
     # Pre-fetch all user IDs we'll need to avoid N+1
     user_ids: set[int] = set()
@@ -712,7 +732,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
     for event in track.workflow_events:
         if event.actor_user_id:
             user_ids.add(event.actor_user_id)
-    for d in track.discussions:
+    for d in recent_discussions:
         user_ids.add(d.author_id)
     user_ids.discard(None)
 
@@ -786,16 +806,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
                 for a in d.audios
             ],
         )
-        for d in track.discussions
-        if not (
-            d.visibility == "internal"
-            and user.id == track.submitter_id
-            and user.id != album.producer_id
-        )
-        and not (
-            d.phase == "mastering"
-            and not is_mastering_participant(user, track, album)
-        )
+        for d in recent_discussions
     ]
     # Mirror the defensive try/except used in `_album_to_read`: a stored
     # config that no longer passes the current validator must not crash the
