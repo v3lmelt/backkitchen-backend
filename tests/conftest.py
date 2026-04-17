@@ -292,8 +292,11 @@ class Factory:
                 time_end=18.0 if marker_type == MarkerType.RANGE else None,
             )
         ]
+        from app.workflow import next_issue_local_number
+
         issue = Issue(
             track_id=track.id,
+            local_number=next_issue_local_number(self.session, track.id),
             author_id=author.id,
             phase=phase,
             workflow_cycle=workflow_cycle or track.workflow_cycle,

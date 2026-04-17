@@ -41,6 +41,7 @@ from app.workflow import (
     current_source_version,
     ensure_track_visibility,
     log_track_event,
+    next_issue_local_number,
     peer_identity_anonymize_user_ids_for_viewer,
 )
 from app.workflow_engine import (
@@ -516,6 +517,7 @@ async def create_issue(
 
     issue = Issue(
         track_id=track_id,
+        local_number=next_issue_local_number(db, track_id),
         author_id=current_user.id,
         phase=effective_phase,
         workflow_cycle=track.workflow_cycle,

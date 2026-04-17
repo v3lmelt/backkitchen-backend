@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -36,11 +36,15 @@ class IssuePhase(str, enum.Enum):
 
 class Issue(Base):
     __tablename__ = "issues"
+    __table_args__ = (
+        UniqueConstraint("track_id", "local_number", name="uq_issues_track_local_number"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     track_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("tracks.id"), nullable=False, index=True
     )
+    local_number: Mapped[int] = mapped_column(Integer, nullable=False)
     author_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     phase: Mapped[str] = mapped_column(
         String(50),

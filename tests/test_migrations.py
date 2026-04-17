@@ -8,7 +8,7 @@ from pathlib import Path
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 PRE_ADMIN_GOVERNANCE_REVISION = "f3a2b1c4d5e6"
 PRE_AUDIT_LOG_REVISION = "f4b5c6d7e8f9"
-HEAD_REVISION = "18c2d4e6f8a0"
+HEAD_REVISION = "m9n0o1p2q3r4"
 
 
 def _sqlite_url(db_path: Path) -> str:
@@ -86,6 +86,11 @@ def _create_master_like_schema(db_path: Path, revision: str) -> None:
             CREATE TABLE track_source_versions (
                 id INTEGER NOT NULL PRIMARY KEY,
                 file_path VARCHAR(500) NOT NULL
+            );
+            CREATE TABLE issues (
+                id INTEGER NOT NULL PRIMARY KEY,
+                track_id INTEGER NOT NULL,
+                created_at DATETIME NOT NULL
             );
             CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
             INSERT INTO alembic_version (version_num) VALUES ('{revision}');
