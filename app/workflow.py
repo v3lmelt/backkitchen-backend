@@ -45,6 +45,16 @@ from app.schemas.schemas import (
 )
 
 
+def next_issue_local_number(db: Session, track_id: int) -> int:
+    """Allocate the next per-track issue number (1-based, monotonic, gaps preserved)."""
+    current = db.scalar(
+        select(func.coalesce(func.max(Issue.local_number), 0)).where(
+            Issue.track_id == track_id
+        )
+    )
+    return (current or 0) + 1
+
+
 def _audio_url(audio) -> str:
     """Return the public URL for an audio attachment.
 
@@ -515,6 +525,7 @@ def build_issue_read(
     return IssueRead(
         id=issue.id,
         track_id=issue.track_id,
+        local_number=issue.local_number,
         author_id=issue.author_id,
         phase=issue.phase,
         workflow_cycle=issue.workflow_cycle,

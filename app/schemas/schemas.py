@@ -460,6 +460,7 @@ class IssueImageRead(BaseModel):
 class IssueRead(IssueBase):
     id: int
     track_id: int
+    local_number: int
     author_id: int
     phase: str
     workflow_cycle: int
