@@ -1,7 +1,7 @@
 """add local_number to issues
 
 Revision ID: m9n0o1p2q3r4
-Revises: l8m9n0o1p2q3
+Revises: 18c2d4e6f8a0
 Create Date: 2026-04-17 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = 'm9n0o1p2q3r4'
-down_revision: Union[str, None] = 'l8m9n0o1p2q3'
+down_revision: Union[str, None] = '18c2d4e6f8a0'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
