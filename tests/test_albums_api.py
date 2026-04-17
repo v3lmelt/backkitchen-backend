@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from app.models.circle import CircleMember
+from app.routers import albums as albums_router
 from app.models.issue import IssuePhase, IssueStatus
 from app.models.track import TrackStatus
 from app.models.workflow_event import WorkflowEvent
@@ -152,6 +153,72 @@ def test_get_album_not_found(client, factory, auth_headers):
     user = factory.user()
     response = client.get("/api/albums/99999", headers=auth_headers(user))
     assert response.status_code == 404
+
+
+def test_upload_album_cover_replaces_old_file(client, db_session, factory, auth_headers, upload_dir):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    covers_dir = upload_dir / "covers"
+    covers_dir.mkdir(parents=True, exist_ok=True)
+    old_file = covers_dir / "old.png"
+    old_file.write_bytes(b"old-cover")
+    album.cover_image = "covers/old.png"
+    db_session.commit()
+
+    response = client.post(
+        f"/api/albums/{album.id}/cover",
+        headers=auth_headers(producer),
+        files={"file": ("cover.png", b"new-cover", "image/png")},
+    )
+
+    db_session.expire_all()
+    refreshed_album = db_session.get(type(album), album.id)
+
+    assert response.status_code == 200
+    assert refreshed_album is not None
+    assert refreshed_album.cover_image is not None
+    assert refreshed_album.cover_image.startswith("covers/")
+    assert refreshed_album.cover_image != "covers/old.png"
+    assert old_file.exists() is False
+    assert (upload_dir / refreshed_album.cover_image).exists()
+
+
+def test_upload_album_cover_rejects_invalid_type_and_extension(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+
+    bad_type = client.post(
+        f"/api/albums/{album.id}/cover",
+        headers=auth_headers(producer),
+        files={"file": ("cover.txt", b"not-image", "text/plain")},
+    )
+    bad_extension = client.post(
+        f"/api/albums/{album.id}/cover",
+        headers=auth_headers(producer),
+        files={"file": ("cover.bmp", b"fake-image", "image/bmp")},
+    )
+
+    assert bad_type.status_code == 400
+    assert bad_extension.status_code == 400
+
+
+def test_upload_album_cover_uses_dedicated_cover_limit(client, factory, auth_headers, monkeypatch):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+
+    monkeypatch.setattr(albums_router, "MAX_ALBUM_COVER_UPLOAD_SIZE", 2 * 1024 * 1024)
+
+    response = client.post(
+        f"/api/albums/{album.id}/cover",
+        headers=auth_headers(producer),
+        files={"file": ("cover.png", b"x" * int(1.5 * 1024 * 1024), "image/png")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cover_image"].startswith("covers/")
 
 
 def test_update_album_team(client, factory, auth_headers):

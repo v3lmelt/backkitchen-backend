@@ -9,7 +9,8 @@ _INSECURE_DEFAULT_KEY = "dev-secret-key-change-in-production"
 
 # Upload size limits (bytes)
 MAX_AUDIO_UPLOAD_SIZE = 200 * 1024 * 1024  # 200 MB
-MAX_IMAGE_UPLOAD_SIZE = 10 * 1024 * 1024   # 10 MB
+MAX_IMAGE_UPLOAD_SIZE = 10 * 1024 * 1024   # 10 MB for generic image uploads
+MAX_ALBUM_COVER_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB for album covers
 
 # Audio upload constants (shared by issues and discussions routers)
 MAX_AUDIOS_PER_UPLOAD = 3

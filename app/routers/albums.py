@@ -19,7 +19,7 @@ from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
 
 from app.admin_permissions import has_admin_role
-from app.config import settings
+from app.config import MAX_ALBUM_COVER_UPLOAD_SIZE, settings
 from app.database import get_db
 from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
 from app.models.album_member import AlbumMember
@@ -616,8 +616,6 @@ async def upload_album_cover(
 ) -> AlbumRead:
     album = ensure_album_producer(album_id, current_user, db)
 
-    from app.config import MAX_IMAGE_UPLOAD_SIZE
-
     allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
     allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
     if file.content_type not in allowed_types:
@@ -637,7 +635,7 @@ async def upload_album_cover(
     cover_dir.mkdir(parents=True, exist_ok=True)
 
     dest = cover_dir / filename
-    await stream_upload(file, dest, MAX_IMAGE_UPLOAD_SIZE)
+    await stream_upload(file, dest, MAX_ALBUM_COVER_UPLOAD_SIZE)
 
     # Remove old cover file
     if album.cover_image:
