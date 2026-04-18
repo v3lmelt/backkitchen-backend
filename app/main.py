@@ -47,6 +47,9 @@ from app.routers import albums, auth, checklists, circles, discussions, issues, 
 from app.security import _decode_token, hash_password
 from app.workflow import is_album_completed, log_track_event
 
+logger = logging.getLogger(__name__)
+ws_logger = logging.getLogger("app.websocket")
+
 
 def _run_sqlite_compat_migrations() -> None:
     if not settings.DATABASE_URL.startswith("sqlite"):
@@ -79,6 +82,7 @@ def _run_sqlite_compat_migrations() -> None:
     add_column("comments", "is_status_note", "is_status_note BOOLEAN NOT NULL DEFAULT 0")
     add_column("tracks", "track_number", "track_number INTEGER")
     add_column("albums", "checklist_template", "checklist_template TEXT")
+    add_column("albums", "checklist_enabled", "checklist_enabled BOOLEAN NOT NULL DEFAULT 0")
     add_column("albums", "deadline", "deadline DATETIME")
     add_column("albums", "phase_deadlines", "phase_deadlines TEXT")
     add_column("albums", "webhook_config", "webhook_config TEXT")
@@ -88,6 +92,8 @@ def _run_sqlite_compat_migrations() -> None:
     add_column("albums", "genres", "genres TEXT")
     add_column("albums", "cover_image", "cover_image VARCHAR(500)")
     add_column("albums", "circle_id", "circle_id INTEGER REFERENCES circles(id)")
+    add_column("circles", "default_checklist_enabled", "default_checklist_enabled BOOLEAN NOT NULL DEFAULT 0")
+    add_column("track_discussion_audios", "storage_backend", "storage_backend VARCHAR(10) NOT NULL DEFAULT 'local'")
     # Existing users (before email verification feature) are grandfathered as verified
     add_column("users", "email_verified", "email_verified BOOLEAN NOT NULL DEFAULT 1")
     add_column("users", "is_admin", "is_admin BOOLEAN NOT NULL DEFAULT 0")
@@ -117,6 +123,19 @@ def _run_sqlite_compat_migrations() -> None:
             conn.execute(text("UPDATE issues SET status = 'open' WHERE lower(status) = 'will_fix' OR status = 'WILL_FIX'"))
             conn.execute(text("UPDATE issues SET status = 'disagreed' WHERE lower(status) = 'disagreed' OR status = 'DISAGREED'"))
             conn.execute(text("UPDATE issues SET status = 'resolved' WHERE lower(status) = 'resolved' OR status = 'RESOLVED'"))
+        if "albums" in columns_by_table:
+            conn.execute(
+                text("UPDATE albums SET checklist_enabled = 1 WHERE checklist_enabled IS NULL OR checklist_enabled = 0")
+            )
+        if "circles" in columns_by_table:
+            conn.execute(
+                text(
+                    "UPDATE circles SET default_checklist_enabled = 1 "
+                    "WHERE default_checklist_enabled IS NULL OR default_checklist_enabled = 0"
+                )
+            )
+        if "track_discussion_audios" in columns_by_table:
+            conn.execute(text("UPDATE track_discussion_audios SET storage_backend = 'local' WHERE storage_backend IS NULL"))
 
 
 _BACKFILL_BATCH_SIZE = 100
@@ -197,6 +216,17 @@ def _backfill_workflow_data() -> None:
                 track = db.get(Track, item.track_id)
                 if track:
                     item.workflow_cycle = track.workflow_cycle
+
+        db.execute(
+            text("UPDATE albums SET checklist_enabled = 1 WHERE checklist_enabled IS NULL OR checklist_enabled = 0")
+        )
+        db.execute(
+            text(
+                "UPDATE circles SET default_checklist_enabled = 1 "
+                "WHERE default_checklist_enabled IS NULL OR default_checklist_enabled = 0"
+            )
+        )
+        db.execute(text("UPDATE track_discussion_audios SET storage_backend = 'local' WHERE storage_backend IS NULL"))
 
         # --- Tracks missing source_versions ---
         has_versions = exists(
@@ -327,8 +357,21 @@ def _seed_demo_data() -> None:
 def _run_alembic_upgrade() -> None:
     """Run alembic upgrade head to apply pending migrations."""
     import os
+
     alembic_cfg = AlembicConfig(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
     alembic_cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "..", "alembic"))
+
+    inspector = inspect(engine)
+    user_tables = {
+        table_name
+        for table_name in inspector.get_table_names()
+        if table_name != "alembic_version"
+    }
+    if not user_tables:
+        Base.metadata.create_all(bind=engine)
+        alembic_command.stamp(alembic_cfg, "head")
+        return
+
     alembic_command.upgrade(alembic_cfg, "head")
 
 
@@ -607,11 +650,13 @@ def app_config():
 @app.websocket("/ws/tracks/{track_id}")
 async def websocket_track(websocket: WebSocket, track_id: int, token: str | None = None) -> None:
     if token is None:
+        ws_logger.info("track_ws_rejected track_id=%s reason=missing_token", track_id)
         await websocket.close(code=4001)
         return
     try:
         payload = _decode_token(token)
     except HTTPException:
+        ws_logger.info("track_ws_rejected track_id=%s reason=invalid_token", track_id)
         await websocket.close(code=4001)
         return
 
@@ -621,14 +666,17 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
     try:
         user = db.get(User, user_id)
         if user is None or user.deleted_at is not None:
+            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=missing_user", track_id, user_id)
             await websocket.close(code=4001)
             return
         track = db.get(Track, track_id)
         if track is None:
+            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=missing_track", track_id, user_id)
             await websocket.close(code=4001)
             return
         album = db.get(Album, track.album_id)
         if album is None:
+            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=missing_album", track_id, user_id)
             await websocket.close(code=4001)
             return
         # Query 2: fetch album member ids
@@ -647,6 +695,7 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
         else:
             has_access = False
         if not has_access:
+            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=forbidden", track_id, user_id)
             await websocket.close(code=4003)
             return
     finally:
@@ -654,7 +703,9 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
 
     connected = await track_manager.connect(track_id, websocket)
     if not connected:
+        ws_logger.warning("track_ws_rejected track_id=%s user_id=%s reason=capacity", track_id, user_id)
         return
+    ws_logger.info("track_ws_connected track_id=%s user_id=%s", track_id, user_id)
     try:
         while True:
             data = await websocket.receive_text()
@@ -666,16 +717,19 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
             await track_manager.broadcast(track_id, message)
     except WebSocketDisconnect:
         track_manager.disconnect(track_id, websocket)
+        ws_logger.info("track_ws_disconnected track_id=%s user_id=%s", track_id, user_id)
 
 
 @app.websocket("/ws/notifications")
 async def websocket_notifications(websocket: WebSocket, token: str | None = None) -> None:
     if token is None:
+        ws_logger.info("notification_ws_rejected reason=missing_token")
         await websocket.close(code=4001)
         return
     try:
         payload = _decode_token(token)
     except HTTPException:
+        ws_logger.info("notification_ws_rejected reason=invalid_token")
         await websocket.close(code=4001)
         return
 
@@ -684,6 +738,7 @@ async def websocket_notifications(websocket: WebSocket, token: str | None = None
     try:
         user = db.get(User, user_id)
         if user is None or user.deleted_at is not None:
+            ws_logger.info("notification_ws_rejected user_id=%s reason=missing_user", user_id)
             await websocket.close(code=4001)
             return
     finally:
@@ -691,9 +746,12 @@ async def websocket_notifications(websocket: WebSocket, token: str | None = None
 
     connected = await notification_manager.connect(user_id, websocket)
     if not connected:
+        ws_logger.warning("notification_ws_rejected user_id=%s reason=capacity", user_id)
         return
+    ws_logger.info("notification_ws_connected user_id=%s", user_id)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
         notification_manager.disconnect(user_id, websocket)
+        ws_logger.info("notification_ws_disconnected user_id=%s", user_id)

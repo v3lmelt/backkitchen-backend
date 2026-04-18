@@ -21,7 +21,55 @@ def test_create_album(client, factory, auth_headers):
     body = response.json()
     assert body["title"] == "My Album"
     assert body["producer_id"] == user.id
+    assert body["checklist_enabled"] is False
     assert any(m["user_id"] == user.id for m in body["members"])
+
+
+def test_create_album_accepts_explicit_checklist_override(client, factory, auth_headers):
+    user = factory.user(role="producer")
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(user),
+        json={"title": "Checklist Album", "checklist_enabled": True},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["checklist_enabled"] is True
+
+
+def test_create_album_inherits_circle_default_checklist_flag(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Checklist Off Circle", "description": "desc", "default_checklist_enabled": False},
+    )
+    assert circle_response.status_code == 201
+
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(producer),
+        json={"title": "Inherited Album", "circle_id": circle_response.json()["id"]},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["checklist_enabled"] is False
+
+
+def test_update_album_metadata_can_toggle_checklist_enabled(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, checklist_enabled=True)
+
+    response = client.patch(
+        f"/api/albums/{album.id}/metadata",
+        headers=auth_headers(producer),
+        json={"checklist_enabled": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["checklist_enabled"] is False
 
 
 def test_create_album_applies_team_deadlines_and_template_atomically(

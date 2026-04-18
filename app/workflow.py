@@ -436,6 +436,7 @@ def build_track_read(
         title=track.title,
         artist=None if anonymize else track.artist,
         album_id=track.album_id,
+        album_checklist_enabled=album.checklist_enabled,
         bpm=track.bpm,
         original_title=track.original_title,
         original_artist=track.original_artist,

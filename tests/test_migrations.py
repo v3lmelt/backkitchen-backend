@@ -8,7 +8,7 @@ from pathlib import Path
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 PRE_ADMIN_GOVERNANCE_REVISION = "f3a2b1c4d5e6"
 PRE_AUDIT_LOG_REVISION = "f4b5c6d7e8f9"
-HEAD_REVISION = "m9n0o1p2q3r4"
+HEAD_REVISION = "n1o2p3q4r5s6"
 
 
 def _sqlite_url(db_path: Path) -> str:
@@ -156,6 +156,23 @@ def _assert_upgrade_succeeded(db_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'admin_audit_logs'"
         ).fetchone()
         assert table == ("admin_audit_logs",)
+
+        album_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(albums)").fetchall()
+        }
+        circle_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(circles)").fetchall()
+        }
+        assert "checklist_enabled" in album_columns
+        assert "default_checklist_enabled" in circle_columns
+        discussion_audio_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'track_discussion_audios'"
+        ).fetchone()
+        if discussion_audio_table:
+            discussion_audio_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(track_discussion_audios)").fetchall()
+            }
+            assert "storage_backend" in discussion_audio_columns
 
         index_names = {
             row[0]

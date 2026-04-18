@@ -73,20 +73,24 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
     ).first()
     stored = user.password if user is not None else _DUMMY_HASH
     if not verify_password(payload.password, stored):
+        logger.info("auth_login_failed email=%s reason=invalid_credentials", payload.email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
         )
     if not user.email_verified:
+        logger.info("auth_login_failed email=%s user_id=%s reason=email_unverified", payload.email, user.id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Email not verified. Please check your inbox.",
         )
     if user.suspended_at is not None:
+        logger.info("auth_login_failed email=%s user_id=%s reason=suspended", payload.email, user.id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account suspended. Contact an administrator.",
         )
+    logger.info("auth_login_success user_id=%s email=%s", user.id, payload.email)
     return _build_auth_response(user)
 
 
@@ -121,6 +125,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> Registe
 
     token = _create_verification_token(payload.email, db)
     send_verification_email(payload.email, token)
+    logger.info("auth_register_success user_id=%s email=%s", user.id, payload.email)
 
     return RegisterResponse(email=payload.email)
 
@@ -196,9 +201,11 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
         select(User).where(User.email == payload.email, User.deleted_at.is_(None))
     ).first()
     if user is None or not user.email_verified:
+        logger.info("auth_forgot_password_ignored email=%s", payload.email)
         return
     token = _create_password_reset_token(payload.email, db)
     send_password_reset_email(payload.email, token)
+    logger.info("auth_forgot_password_sent user_id=%s email=%s", user.id, payload.email)
 
 
 @router.post("/reset-password", response_model=AuthResponse)
@@ -232,6 +239,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     record.used = True
     db.commit()
     db.refresh(user)
+    logger.info("auth_reset_password_success user_id=%s email=%s", user.id, user.email)
     return _build_auth_response(user)
 
 

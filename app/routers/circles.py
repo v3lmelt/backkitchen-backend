@@ -54,6 +54,7 @@ def _circle_to_read(circle: Circle) -> CircleRead:
         description=circle.description,
         website=circle.website,
         logo_url=circle.logo_url,
+        default_checklist_enabled=circle.default_checklist_enabled,
         created_by=circle.created_by,
         created_at=circle.created_at,
         members=members,
@@ -66,6 +67,7 @@ def _circle_to_summary(circle: Circle) -> CircleSummary:
         name=circle.name,
         description=circle.description,
         logo_url=circle.logo_url,
+        default_checklist_enabled=circle.default_checklist_enabled,
         created_by=circle.created_by,
         member_count=len(circle.members),
     )
@@ -113,6 +115,7 @@ def create_circle(
         name=data.name,
         description=data.description,
         website=data.website,
+        default_checklist_enabled=data.default_checklist_enabled,
         created_by=current_user.id,
     )
     db.add(circle)
@@ -168,6 +171,8 @@ def update_circle(
         circle.description = data.description
     if data.website is not None:
         circle.website = data.website
+    if data.default_checklist_enabled is not None:
+        circle.default_checklist_enabled = data.default_checklist_enabled
 
     db.commit()
     db.refresh(circle)

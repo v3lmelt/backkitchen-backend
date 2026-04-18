@@ -1,6 +1,6 @@
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -8,8 +8,10 @@ from app.database import get_db
 from app.models.album import Album
 from app.models.checklist import ChecklistItem
 from app.models.track import Track
+from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.schemas.schemas import (
+    ChecklistDraftRead,
     ChecklistItemRead,
     ChecklistSubmit,
     ChecklistTemplateItem,
@@ -23,6 +25,40 @@ from app.workflow_engine import get_current_step, parse_workflow_config, user_ma
 router = APIRouter(tags=["checklists"])
 
 DEFAULT_CHECKLIST_LABELS = ["Arrangement", "Balance", "Low-End", "Stereo Image", "Technical Cleanliness"]
+
+
+def _resolve_source_version(
+    track: Track,
+    db: Session,
+    *,
+    source_version_id: int | None = None,
+) -> TrackSourceVersion | None:
+    if source_version_id is None:
+        return current_source_version(track)
+    source_version = db.get(TrackSourceVersion, source_version_id)
+    if source_version is None or source_version.track_id != track.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source version not found.")
+    return source_version
+
+
+def _get_checklist_items(
+    *,
+    db: Session,
+    track_id: int,
+    source_version_id: int,
+    reviewer_id: int | None = None,
+) -> list[ChecklistItem]:
+    stmt = (
+        select(ChecklistItem)
+        .where(
+            ChecklistItem.track_id == track_id,
+            ChecklistItem.source_version_id == source_version_id,
+        )
+        .order_by(ChecklistItem.id)
+    )
+    if reviewer_id is not None:
+        stmt = stmt.where(ChecklistItem.reviewer_id == reviewer_id)
+    return list(db.scalars(stmt).all())
 
 
 @router.post(
@@ -40,6 +76,11 @@ def submit_checklist(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
+    if not album.checklist_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Checklist is disabled for this album.",
+        )
 
     config = parse_workflow_config(album)
     step = get_current_step(config, track)
@@ -111,6 +152,8 @@ def submit_checklist(
 )
 def get_checklist(
     track_id: int,
+    source_version_id: int | None = Query(default=None, ge=1),
+    reviewer_id: int | None = Query(default=None, ge=1),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[ChecklistItemRead]:
@@ -118,21 +161,86 @@ def get_checklist(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     ensure_track_visibility(track, current_user, db)
-    source_version = current_source_version(track)
+    source_version = _resolve_source_version(track, db, source_version_id=source_version_id)
     if source_version is None:
         return []
 
-    items = list(
-        db.scalars(
-            select(ChecklistItem)
-            .where(
-                ChecklistItem.track_id == track_id,
-                ChecklistItem.source_version_id == source_version.id,
-            )
-            .order_by(ChecklistItem.id)
-        ).all()
+    items = _get_checklist_items(
+        db=db,
+        track_id=track_id,
+        source_version_id=source_version.id,
+        reviewer_id=reviewer_id,
     )
     return [build_checklist_read(item) for item in items]
+
+
+@router.get(
+    "/api/tracks/{track_id}/checklist/draft",
+    response_model=ChecklistDraftRead,
+)
+def get_checklist_draft(
+    track_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChecklistDraftRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if not album.checklist_enabled:
+        return ChecklistDraftRead()
+
+    current_version = current_source_version(track)
+    if current_version is None:
+        return ChecklistDraftRead()
+
+    current_items = _get_checklist_items(
+        db=db,
+        track_id=track.id,
+        source_version_id=current_version.id,
+        reviewer_id=current_user.id,
+    )
+    if current_items:
+        return ChecklistDraftRead(
+            items=[build_checklist_read(item) for item in current_items],
+            current_source_version_id=current_version.id,
+            current_source_version_number=current_version.version_number,
+            prefilled_from_source_version_id=current_version.id,
+            prefilled_from_source_version_number=current_version.version_number,
+            prefilled_from_current_version=True,
+        )
+
+    prior_versions = sorted(
+        [
+            version
+            for version in track.source_versions
+            if version.workflow_cycle == track.workflow_cycle
+            and version.version_number < current_version.version_number
+        ],
+        key=lambda version: version.version_number,
+        reverse=True,
+    )
+    for version in prior_versions:
+        prior_items = _get_checklist_items(
+            db=db,
+            track_id=track.id,
+            source_version_id=version.id,
+            reviewer_id=current_user.id,
+        )
+        if prior_items:
+            return ChecklistDraftRead(
+                items=[build_checklist_read(item) for item in prior_items],
+                current_source_version_id=current_version.id,
+                current_source_version_number=current_version.version_number,
+                prefilled_from_source_version_id=version.id,
+                prefilled_from_source_version_number=version.version_number,
+                prefilled_from_current_version=False,
+            )
+
+    return ChecklistDraftRead(
+        current_source_version_id=current_version.id,
+        current_source_version_number=current_version.version_number,
+    )
 
 
 @router.get("/api/albums/{album_id}/checklist-template", response_model=ChecklistTemplateRead)
