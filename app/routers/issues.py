@@ -269,9 +269,9 @@ def _validate_status_transition(
 
     Submitter may:  open → resolved|disagreed (except final review)
     Status handler may: open → resolved|pending_discussion
-                        pending_discussion → open|internal_resolved
-                        internal_resolved → open
+                        pending_discussion → internal_resolved
                         resolved|disagreed → open
+    Issue creator may:  pending_discussion|internal_resolved → open
 
     Final-review issue statuses are handled by the mastering engineer.
     """
@@ -297,19 +297,19 @@ def _validate_status_transition(
     # Status handler actions
     if is_status_handler and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
         return
-    # Only the issue creator can publish an internal issue (internal state -> open)
     is_creator = user.id == issue.author_id
-    if issue.phase != IssuePhase.FINAL_REVIEW.value and is_creator and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status in (
-        IssueStatus.OPEN,
-        IssueStatus.INTERNAL_RESOLVED,
-    ):
+    if is_creator and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status == IssueStatus.OPEN:
         return
     if is_status_handler and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.INTERNAL_RESOLVED:
         return
-    if is_status_handler and old == IssueStatus.INTERNAL_RESOLVED and new_status == IssueStatus.OPEN:
-        return
     if is_status_handler and old in (IssueStatus.RESOLVED, IssueStatus.DISAGREED) and new_status == IssueStatus.OPEN:
         return
+
+    if old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status == IssueStatus.OPEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the issue creator can publish this reviewer-only issue.",
+        )
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot perform this status transition.")
 
@@ -607,7 +607,8 @@ async def create_issue(
         notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
                related_track_id=track.id, related_issue_id=issue.id,
-               background_tasks=background_tasks, album_id=track.album_id)
+               background_tasks=background_tasks, album_id=track.album_id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
     db.commit()
     db.refresh(issue)
     broadcast_track_updated(background_tasks, track.id)
@@ -846,8 +847,10 @@ async def update_issue(
         track = db.get(Track, issue.track_id)
         notify(db, [issue.author_id], "issue_status_changed", "问题状态已更新",
                f"「{issue.title}」被标记为 {new_status.value}",
+               related_track_id=track.id if track else None,
                related_issue_id=issue.id,
-               background_tasks=background_tasks, album_id=track.album_id if track else None)
+               background_tasks=background_tasks, album_id=track.album_id if track else None,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
     if (
         _is_submitter_hidden_issue_status(old_status)
@@ -864,6 +867,7 @@ async def update_issue(
             related_issue_id=issue.id,
             background_tasks=background_tasks,
             album_id=track.album_id,
+            webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name},
         )
 
     log_track_event(
@@ -1017,8 +1021,10 @@ async def add_comment(
     notify_ids = [uid for uid in dict.fromkeys(participant_ids) if uid != current_user.id]
     if notify_ids:
         notify(db, notify_ids, "new_comment", "新评论",
-               f"「{issue.title}」有新评论", related_issue_id=issue.id,
-               background_tasks=background_tasks, album_id=track.album_id)
+               f"「{track.title}」的问题「{issue.title}」有新评论",
+               related_track_id=track.id, related_issue_id=issue.id,
+               background_tasks=background_tasks, album_id=track.album_id,
+               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
     db.commit()
     db.refresh(comment)

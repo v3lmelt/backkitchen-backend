@@ -206,6 +206,7 @@ class AlbumCreate(AlbumBase):
     catalog_number: str | None = Field(default=None, max_length=50)
     circle_id: int | None = None
     circle_name: str | None = Field(default=None, max_length=200)
+    checklist_enabled: bool | None = None
     genres: list[str] | None = None
     mastering_engineer_id: int | None = None
     member_ids: list[int] = Field(default_factory=list)
@@ -221,6 +222,7 @@ class AlbumMetadataUpdate(BaseModel):
     release_date: date | None = None
     catalog_number: str | None = Field(default=None, max_length=50)
     circle_name: str | None = Field(default=None, max_length=200)
+    checklist_enabled: bool | None = None
     genres: list[str] | None = None
 
 
@@ -269,6 +271,7 @@ class AlbumRead(AlbumBase):
     catalog_number: str | None = None
     circle_id: int | None = None
     circle_name: str | None = None
+    checklist_enabled: bool
     genres: list[str] | None = None
     cover_image: str | None = None
     producer_id: int | None = None
@@ -312,18 +315,20 @@ class CircleBase(BaseModel):
 
 
 class CircleCreate(CircleBase):
-    pass
+    default_checklist_enabled: bool = False
 
 
 class CircleUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = None
     website: str | None = Field(default=None, max_length=200)
+    default_checklist_enabled: bool | None = None
 
 
 class CircleRead(CircleBase):
     id: int
     logo_url: str | None = None
+    default_checklist_enabled: bool
     created_by: int
     created_at: datetime
     members: list[CircleMemberRead] = []
@@ -336,6 +341,7 @@ class CircleSummary(BaseModel):
     name: str
     description: str | None = None
     logo_url: str | None = None
+    default_checklist_enabled: bool
     created_by: int
     member_count: int = 0
 
@@ -425,6 +431,7 @@ class TrackRead(TrackBase):
     # artist overrides TrackBase — None when the track is shown anonymised to the viewer
     artist: str | None = None
     id: int
+    album_checklist_enabled: bool | None = None
     track_number: int | None = None
     file_path: str | None = None
     duration: float | None = None
@@ -633,6 +640,15 @@ class ChecklistItemRead(ChecklistItemBase):
 
 class ChecklistSubmit(BaseModel):
     items: list[ChecklistItemBase]
+
+
+class ChecklistDraftRead(BaseModel):
+    items: list[ChecklistItemRead] = []
+    current_source_version_id: int | None = None
+    current_source_version_number: int | None = None
+    prefilled_from_source_version_id: int | None = None
+    prefilled_from_source_version_number: int | None = None
+    prefilled_from_current_version: bool = False
 
 
 class WorkflowEventRead(BaseModel):
@@ -1121,6 +1137,8 @@ class ConfirmUploadParams(BaseModel):
     object_key: str
     duration: float | None = None
     revision_notes: str | None = Field(default=None, max_length=5000)
+    resolved_issue_ids: list[int] = Field(default_factory=list)
+    resolution_note: str | None = Field(default=None, max_length=5000)
 
 
 class ConfirmTrackUploadParams(ConfirmUploadParams):

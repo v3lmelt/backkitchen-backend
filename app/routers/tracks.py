@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,8 @@ from app.config import settings
 from app.database import get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
+from app.models.comment import Comment
+from app.models.issue import Issue, IssueStatus
 from app.models.master_delivery import MasterDelivery
 from app.models.reopen_request import ReopenRequest
 from app.models.stage_assignment import StageAssignment
@@ -77,6 +80,7 @@ from app.workflow import (
 )
 
 router = APIRouter(prefix="/api/tracks", tags=["tracks"])
+logger = logging.getLogger(__name__)
 
 # Resolved once at startup to avoid a mkdir syscall on every file-serve request.
 _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
@@ -132,16 +136,170 @@ def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float 
 
 def _source_version_create(
     track: Track, user: User, file_path: str, duration: float | None,
-    *, revision_notes: str | None = None,
+    *, revision_notes: str | None = None, storage_backend: str = "local",
 ) -> TrackSourceVersion:
     return TrackSourceVersion(
         track_id=track.id,
         workflow_cycle=track.workflow_cycle,
         version_number=track.version,
         file_path=file_path,
+        storage_backend=storage_backend,
         duration=duration,
         uploaded_by_id=user.id,
         revision_notes=revision_notes,
+    )
+
+
+def _dedupe_ints(values: list[int]) -> list[int]:
+    return list(dict.fromkeys(values))
+
+
+def _status_note_visibility_for_resolution(status_value: IssueStatus) -> str:
+    if status_value in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}:
+        return "internal"
+    return "public"
+
+
+def _resolve_issues_for_revision_upload(
+    db: Session,
+    *,
+    track: Track,
+    actor: User,
+    issue_ids: list[int],
+    issue_cycle: int,
+    resolution_note: str | None,
+) -> list[int]:
+    deduped_issue_ids = _dedupe_ints(issue_ids)
+    if not deduped_issue_ids:
+        return []
+
+    issues = list(
+        db.scalars(
+            select(Issue)
+            .where(Issue.track_id == track.id, Issue.id.in_(deduped_issue_ids))
+            .order_by(Issue.id)
+        ).all()
+    )
+    issue_map = {issue.id: issue for issue in issues}
+    missing_ids = [issue_id for issue_id in deduped_issue_ids if issue_id not in issue_map]
+    if missing_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Resolved issues do not belong to this track: {missing_ids}",
+        )
+
+    wrong_cycle_ids = [
+        issue.id for issue in issues
+        if issue.workflow_cycle != issue_cycle
+    ]
+    if wrong_cycle_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Resolved issues must belong to workflow cycle {issue_cycle}: {wrong_cycle_ids}",
+        )
+
+    note = (resolution_note or "").strip()
+    resolved_ids: list[int] = []
+    for issue_id in deduped_issue_ids:
+        issue = issue_map[issue_id]
+        previous_status = issue.status
+        if previous_status != IssueStatus.RESOLVED:
+            issue.status = IssueStatus.RESOLVED
+        if note and previous_status != IssueStatus.RESOLVED:
+            db.add(
+                Comment(
+                    issue_id=issue.id,
+                    author_id=actor.id,
+                    content=note,
+                    visibility=_status_note_visibility_for_resolution(previous_status),
+                    is_status_note=True,
+                    old_status=previous_status.value,
+                    new_status=IssueStatus.RESOLVED.value,
+                )
+            )
+        resolved_ids.append(issue.id)
+
+    return resolved_ids
+
+
+def _finalize_source_version_upload(
+    db: Session,
+    *,
+    album: Album,
+    track: Track,
+    current_user: User,
+    background_tasks: BackgroundTasks,
+    file_path: str,
+    storage_backend: str,
+    duration: float | None,
+    revision_notes: str | None,
+    resolved_issue_ids: list[int],
+    resolution_note: str | None,
+) -> None:
+    issue_cycle = track.workflow_cycle
+
+    # Resolve the next step *before* mutating rejection_mode so that the
+    # engine can recognise a resubmit on a rejected+resubmittable track.
+    next_status = engine_revision_upload(album, track)
+
+    resolved_ids = _resolve_issues_for_revision_upload(
+        db,
+        track=track,
+        actor=current_user,
+        issue_ids=resolved_issue_ids,
+        issue_cycle=issue_cycle,
+        resolution_note=resolution_note,
+    )
+
+    # Resubmit path: rejected+resubmittable tracks re-enter the workflow from
+    # the first step with a fresh cycle and no reviewer assignment.
+    if (
+        track.status == TrackStatus.REJECTED
+        and track.rejection_mode == RejectionMode.RESUBMITTABLE
+    ):
+        track.workflow_cycle += 1
+        track.peer_reviewer_id = None
+        track.rejection_mode = None
+        track.workflow_variant = WorkflowVariant.STANDARD.value
+
+    previous_status = track.status
+    track.version += 1
+    track.file_path = file_path
+    track.storage_backend = storage_backend
+    track.duration = duration
+    track.status = next_status
+    prepare_review_assignments_for_stage_entry(
+        db,
+        album,
+        track,
+        next_status,
+        background_tasks,
+    )
+    db.add(
+        _source_version_create(
+            track,
+            current_user,
+            file_path,
+            duration,
+            revision_notes=revision_notes or None,
+            storage_backend=storage_backend,
+        )
+    )
+
+    event_payload: dict[str, object] = {"version": track.version, "workflow_cycle": track.workflow_cycle}
+    if resolved_ids:
+        event_payload["resolved_issue_ids"] = resolved_ids
+    if resolution_note:
+        event_payload["resolution_note"] = resolution_note
+
+    log_track_event(
+        db,
+        track,
+        current_user,
+        "source_version_uploaded",
+        from_status=previous_status,
+        to_status=next_status,
+        payload=event_payload,
     )
 
 
@@ -521,6 +679,13 @@ def request_track_upload(
 
     # Use a temp ID of 0 — the real track_id is assigned on confirm
     object_key = make_object_key("tracks/new/source", current_user.id, params.filename)
+    logger.info(
+        "track_request_upload album_id=%s user_id=%s filename=%s size=%s",
+        params.album_id,
+        current_user.id,
+        params.filename,
+        params.file_size,
+    )
     return _presign_upload(object_key, params.content_type)
 
 
@@ -580,6 +745,12 @@ def confirm_track_upload(
     )
     db.add(sv)
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
+    logger.info(
+        "track_confirm_upload track_id=%s album_id=%s user_id=%s storage_backend=r2",
+        track.id,
+        album.id,
+        current_user.id,
+    )
 
     # Notify the album producer about the new submission
     if album.producer_id and album.producer_id != current_user.id:
@@ -615,6 +786,14 @@ def request_source_version_upload(
     from app.services.r2 import make_object_key
 
     object_key = make_object_key(f"tracks/{track_id}/source", track.version + 1, params.filename)
+    logger.info(
+        "source_version_request_upload track_id=%s user_id=%s next_version=%s filename=%s size=%s",
+        track_id,
+        current_user.id,
+        track.version + 1,
+        params.filename,
+        params.file_size,
+    )
     return _presign_upload(object_key, params.content_type)
 
 
@@ -639,53 +818,29 @@ def confirm_source_version_upload(
     )
     _verify_r2_object(params.object_key)
 
-    # Resolve the next step *before* mutating rejection_mode so that the
-    # engine can recognise a resubmit on a rejected+resubmittable track.
-    next_status = engine_revision_upload(album, track)
-
-    # Resubmit path: rejected+resubmittable tracks re-enter the workflow from
-    # the first step with a fresh cycle and no reviewer assignment.
-    if (
-        track.status == TrackStatus.REJECTED
-        and track.rejection_mode == RejectionMode.RESUBMITTABLE
-    ):
-        track.workflow_cycle += 1
-        track.peer_reviewer_id = None
-        track.rejection_mode = None
-        track.workflow_variant = WorkflowVariant.STANDARD.value
-
     duration, _bitrate, _sample_rate = _extract_r2_metadata(params.object_key)
     if params.duration is not None and duration is None:
         duration = params.duration
 
-    previous_status = track.status
-    track.version += 1
-    track.file_path = params.object_key
-    track.storage_backend = "r2"
-    track.duration = duration
-    track.status = next_status
-    prepare_review_assignments_for_stage_entry(
+    _finalize_source_version_upload(
         db,
-        album,
-        track,
-        next_status,
-        background_tasks,
-    )
-    sv = TrackSourceVersion(
-        track_id=track.id,
-        workflow_cycle=track.workflow_cycle,
-        version_number=track.version,
+        album=album,
+        track=track,
+        current_user=current_user,
+        background_tasks=background_tasks,
         file_path=params.object_key,
         storage_backend="r2",
         duration=duration,
-        uploaded_by_id=current_user.id,
-        revision_notes=params.revision_notes or None,
+        revision_notes=params.revision_notes,
+        resolved_issue_ids=params.resolved_issue_ids,
+        resolution_note=params.resolution_note,
     )
-    db.add(sv)
-    log_track_event(
-        db, track, current_user, "source_version_uploaded",
-        from_status=previous_status, to_status=next_status,
-        payload={"version": track.version, "workflow_cycle": track.workflow_cycle},
+    logger.info(
+        "source_version_confirm_upload track_id=%s user_id=%s version=%s storage_backend=r2 resolved_issue_count=%s",
+        track.id,
+        current_user.id,
+        track.version,
+        len(params.resolved_issue_ids),
     )
     db.commit()
     db.refresh(track)
@@ -1502,6 +1657,8 @@ def upload_source_version(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     revision_notes: str | None = Form(default=None),
+    resolved_issue_ids: list[int] = Form(default=[]),
+    resolution_note: str | None = Form(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -1511,45 +1668,26 @@ def upload_source_version(
     album = ensure_track_visibility(track, current_user, db)
     _ensure_revision_upload_permission(track, album, current_user)
 
-    # Resolve the next step *before* mutating rejection_mode so that the
-    # engine can recognise a resubmit on a rejected+resubmittable track.
-    next_status = engine_revision_upload(album, track)
-
-    # Resubmit path: rejected+resubmittable tracks re-enter the workflow from
-    # the first step with a fresh cycle and no reviewer assignment.
-    if (
-        track.status == TrackStatus.REJECTED
-        and track.rejection_mode == RejectionMode.RESUBMITTABLE
-    ):
-        track.workflow_cycle += 1
-        track.peer_reviewer_id = None
-        track.rejection_mode = None
-        track.workflow_variant = WorkflowVariant.STANDARD.value
-
-    previous_status = track.status
     file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_v{track.version + 1}")
-    track.version += 1
-    track.file_path = file_path
-    track.storage_backend = "local"
-    track.duration = duration
-    track.status = next_status
-    prepare_review_assignments_for_stage_entry(
+    _finalize_source_version_upload(
         db,
-        album,
-        track,
-        next_status,
-        background_tasks,
+        album=album,
+        track=track,
+        current_user=current_user,
+        background_tasks=background_tasks,
+        file_path=file_path,
+        storage_backend="local",
+        duration=duration,
+        revision_notes=revision_notes,
+        resolved_issue_ids=resolved_issue_ids,
+        resolution_note=resolution_note,
     )
-    source_version = _source_version_create(track, current_user, file_path, duration, revision_notes=revision_notes or None)
-    db.add(source_version)
-    log_track_event(
-        db,
-        track,
-        current_user,
-        "source_version_uploaded",
-        from_status=previous_status,
-        to_status=next_status,
-        payload={"version": track.version, "workflow_cycle": track.workflow_cycle},
+    logger.info(
+        "source_version_upload track_id=%s user_id=%s version=%s storage_backend=local resolved_issue_count=%s",
+        track.id,
+        current_user.id,
+        track.version,
+        len(resolved_issue_ids),
     )
     db.commit()
     db.refresh(track)

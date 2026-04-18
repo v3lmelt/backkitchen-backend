@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from app.models.circle import CircleMember
+from app.routers import albums as albums_router
 from app.models.issue import IssuePhase, IssueStatus
 from app.models.track import TrackStatus
 from app.models.workflow_event import WorkflowEvent
@@ -20,7 +21,55 @@ def test_create_album(client, factory, auth_headers):
     body = response.json()
     assert body["title"] == "My Album"
     assert body["producer_id"] == user.id
+    assert body["checklist_enabled"] is False
     assert any(m["user_id"] == user.id for m in body["members"])
+
+
+def test_create_album_accepts_explicit_checklist_override(client, factory, auth_headers):
+    user = factory.user(role="producer")
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(user),
+        json={"title": "Checklist Album", "checklist_enabled": True},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["checklist_enabled"] is True
+
+
+def test_create_album_inherits_circle_default_checklist_flag(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Checklist Off Circle", "description": "desc", "default_checklist_enabled": False},
+    )
+    assert circle_response.status_code == 201
+
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(producer),
+        json={"title": "Inherited Album", "circle_id": circle_response.json()["id"]},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["checklist_enabled"] is False
+
+
+def test_update_album_metadata_can_toggle_checklist_enabled(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, checklist_enabled=True)
+
+    response = client.patch(
+        f"/api/albums/{album.id}/metadata",
+        headers=auth_headers(producer),
+        json={"checklist_enabled": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["checklist_enabled"] is False
 
 
 def test_create_album_applies_team_deadlines_and_template_atomically(
@@ -152,6 +201,72 @@ def test_get_album_not_found(client, factory, auth_headers):
     user = factory.user()
     response = client.get("/api/albums/99999", headers=auth_headers(user))
     assert response.status_code == 404
+
+
+def test_upload_album_cover_replaces_old_file(client, db_session, factory, auth_headers, upload_dir):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    covers_dir = upload_dir / "covers"
+    covers_dir.mkdir(parents=True, exist_ok=True)
+    old_file = covers_dir / "old.png"
+    old_file.write_bytes(b"old-cover")
+    album.cover_image = "covers/old.png"
+    db_session.commit()
+
+    response = client.post(
+        f"/api/albums/{album.id}/cover",
+        headers=auth_headers(producer),
+        files={"file": ("cover.png", b"new-cover", "image/png")},
+    )
+
+    db_session.expire_all()
+    refreshed_album = db_session.get(type(album), album.id)
+
+    assert response.status_code == 200
+    assert refreshed_album is not None
+    assert refreshed_album.cover_image is not None
+    assert refreshed_album.cover_image.startswith("covers/")
+    assert refreshed_album.cover_image != "covers/old.png"
+    assert old_file.exists() is False
+    assert (upload_dir / refreshed_album.cover_image).exists()
+
+
+def test_upload_album_cover_rejects_invalid_type_and_extension(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+
+    bad_type = client.post(
+        f"/api/albums/{album.id}/cover",
+        headers=auth_headers(producer),
+        files={"file": ("cover.txt", b"not-image", "text/plain")},
+    )
+    bad_extension = client.post(
+        f"/api/albums/{album.id}/cover",
+        headers=auth_headers(producer),
+        files={"file": ("cover.bmp", b"fake-image", "image/bmp")},
+    )
+
+    assert bad_type.status_code == 400
+    assert bad_extension.status_code == 400
+
+
+def test_upload_album_cover_uses_dedicated_cover_limit(client, factory, auth_headers, monkeypatch):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+
+    monkeypatch.setattr(albums_router, "MAX_ALBUM_COVER_UPLOAD_SIZE", 2 * 1024 * 1024)
+
+    response = client.post(
+        f"/api/albums/{album.id}/cover",
+        headers=auth_headers(producer),
+        files={"file": ("cover.png", b"x" * int(1.5 * 1024 * 1024), "image/png")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cover_image"].startswith("covers/")
 
 
 def test_update_album_team(client, factory, auth_headers):

@@ -120,13 +120,23 @@ def _try_dispatch_webhook(
 
     # Enrich context with data we can look up here
     ctx.setdefault("album_title", album.title)
-    if track_id:
+    resolved_track_id = track_id
+    if resolved_track_id is None and issue_id:
+        from app.models.issue import Issue
+
+        issue = db.get(Issue, issue_id)
+        if issue:
+            resolved_track_id = issue.track_id
+            ctx.setdefault("issue_title", issue.title)
+
+    if resolved_track_id:
         from app.models.track import Track
-        track = db.get(Track, track_id)
+
+        track = db.get(Track, resolved_track_id)
         if track:
             ctx.setdefault("track_title", track.title)
             from app.config import settings
-            ctx.setdefault("track_url", f"{settings.FRONTEND_URL}/tracks/{track_id}")
+            ctx.setdefault("track_url", f"{settings.FRONTEND_URL}/tracks/{resolved_track_id}")
 
     # Look up notified user display names for action_required_by
     if notified_user_ids and "action_required_by" not in ctx:
@@ -137,7 +147,7 @@ def _try_dispatch_webhook(
 
     payload = build_webhook_payload(
         event_type, title, body,
-        track_id=track_id, album_id=album_id, issue_id=issue_id,
+        track_id=resolved_track_id, album_id=album_id, issue_id=issue_id,
         context=ctx,
     )
     url = config["url"]
@@ -156,6 +166,28 @@ def _try_dispatch_webhook(
             {"name": u.display_name, "feishu_contact": u.feishu_contact}
             for u in feishu_users
         ]
+
+    payload_for_dedupe = dict(payload)
+    payload_for_dedupe.pop("timestamp", None)
+
+    dedupe_key = json.dumps(
+        {
+            "url": url,
+            "webhook_type": wh_type,
+            "payload": payload_for_dedupe,
+            "mention_users": mention_users,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    scheduled_webhooks = getattr(background_tasks, "_scheduled_webhook_keys", None)
+    if scheduled_webhooks is None:
+        scheduled_webhooks = set()
+        setattr(background_tasks, "_scheduled_webhook_keys", scheduled_webhooks)
+    if dedupe_key in scheduled_webhooks:
+        return
+    scheduled_webhooks.add(dedupe_key)
 
     background_tasks.add_task(
         _deliver_webhook_background, url, payload, album_id, event_type,

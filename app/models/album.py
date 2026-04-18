@@ -1,6 +1,6 @@
 from datetime import date, datetime, timezone
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -28,6 +28,12 @@ class Album(Base):
     genres: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON array of strings
     cover_image: Mapped[str | None] = mapped_column(String(500), nullable=True)
     checklist_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    checklist_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+    )
     deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     phase_deadlines: Mapped[str | None] = mapped_column(Text, nullable=True)
     webhook_config: Mapped[str | None] = mapped_column(Text, nullable=True)

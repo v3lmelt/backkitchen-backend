@@ -27,9 +27,29 @@ def test_create_circle_adds_creator_as_owner(client, factory, auth_headers):
     assert response.status_code == 201
     body = response.json()
     assert body["name"] == "Circle One"
+    assert body["default_checklist_enabled"] is False
     assert len(body["members"]) == 1
     assert body["members"][0]["user_id"] == producer.id
     assert body["members"][0]["role"] == "owner"
+
+
+def test_update_circle_can_toggle_default_checklist_enabled(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Before", "description": "desc"},
+    )
+    circle_id = create_response.json()["id"]
+
+    response = client.patch(
+        f"/api/circles/{circle_id}",
+        headers=auth_headers(producer),
+        json={"default_checklist_enabled": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["default_checklist_enabled"] is False
 
 
 def test_get_circle_blocks_outsider(client, db_session, factory, auth_headers):

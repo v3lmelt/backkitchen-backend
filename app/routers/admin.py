@@ -630,6 +630,7 @@ def admin_list_circles(
             name=circle.name,
             description=circle.description,
             logo_url=circle.logo_url,
+            default_checklist_enabled=circle.default_checklist_enabled,
             created_by=circle.created_by,
             member_count=len(circle.members),
         )
