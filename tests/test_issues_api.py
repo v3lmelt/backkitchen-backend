@@ -576,6 +576,47 @@ def test_add_comment_text_only(client, factory, auth_headers):
     assert body["images"] == []
 
 
+def test_add_comment_notifies_once_with_track_context(client, factory, auth_headers, monkeypatch):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    issue = factory.issue(
+        track=track, author=reviewer, phase=IssuePhase.PEER,
+        source_version_id=track.source_versions[-1].id,
+    )
+
+    calls: list[dict] = []
+
+    def capture_notify(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr("app.routers.issues.notify", capture_notify)
+
+    response = client.post(
+        f"/api/issues/{issue.id}/comments",
+        headers=auth_headers(submitter),
+        data={"content": "Just a text comment"},
+    )
+
+    assert response.status_code == 201
+    assert len(calls) == 1
+    assert calls[0]["args"][2] == "new_comment"
+    assert calls[0]["kwargs"]["related_track_id"] == track.id
+    assert calls[0]["kwargs"]["related_issue_id"] == issue.id
+    assert calls[0]["kwargs"]["webhook_context"] == {
+        "actor_id": submitter.id,
+        "actor_name": submitter.display_name,
+    }
+
+
 def test_create_issue_custom_review_step_allows_stage_assignment_reviewer(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -811,6 +852,82 @@ def test_pending_discussion_visible_after_reviewer_moves_to_open(client, db_sess
     assert visible_detail.status_code == 200
 
 
+def test_non_author_reviewer_cannot_publish_pending_discussion_issue(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer_a = factory.user(username="reviewer_a")
+    reviewer_b = factory.user(username="reviewer_b")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer_a, reviewer_b])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer_a)
+
+    db_session.add_all([
+        StageAssignment(track_id=track.id, stage_id="peer_review", user_id=reviewer_a.id, status="pending"),
+        StageAssignment(track_id=track.id, stage_id="peer_review", user_id=reviewer_b.id, status="pending"),
+    ])
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "peer_review",
+                    "label": "Peer Review",
+                    "type": "review",
+                    "ui_variant": "peer_review",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "producer_gate", "needs_revision": "peer_revision"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 2,
+                    "revision_step": "peer_revision",
+                },
+                {
+                    "id": "peer_revision",
+                    "label": "Peer Revision",
+                    "type": "revision",
+                    "assignee_role": "submitter",
+                    "order": 1,
+                    "return_to": "peer_review",
+                    "transitions": {},
+                },
+                {
+                    "id": "producer_gate",
+                    "label": "Producer Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 2,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    db_session.commit()
+
+    issue = factory.issue(
+        track=track,
+        author=reviewer_a,
+        phase=IssuePhase.PEER,
+        status=IssueStatus.PENDING_DISCUSSION,
+        source_version_id=track.source_versions[-1].id,
+    )
+
+    publish = client.patch(
+        f"/api/issues/{issue.id}",
+        headers=auth_headers(reviewer_b),
+        json={"status": "open"},
+    )
+
+    assert publish.status_code == 403
+    assert publish.json()["detail"] == "Only the issue creator can publish this reviewer-only issue."
+
+    hidden_detail = client.get(f"/api/issues/{issue.id}", headers=auth_headers(submitter))
+    assert hidden_detail.status_code == 404
+
+    hidden_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
+    assert hidden_list.status_code == 200
+    assert all(item["id"] != issue.id for item in hidden_list.json())
+
+
 def test_submitter_cannot_change_pending_discussion_status(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -894,6 +1011,82 @@ def test_internal_resolved_becomes_visible_when_published_open(client, db_sessio
 
     visible_detail = client.get(f"/api/issues/{issue.id}", headers=auth_headers(submitter))
     assert visible_detail.status_code == 200
+
+
+def test_non_author_reviewer_cannot_publish_internal_resolved_issue(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer_a = factory.user(username="reviewer_a")
+    reviewer_b = factory.user(username="reviewer_b")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer_a, reviewer_b])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer_a)
+
+    db_session.add_all([
+        StageAssignment(track_id=track.id, stage_id="peer_review", user_id=reviewer_a.id, status="pending"),
+        StageAssignment(track_id=track.id, stage_id="peer_review", user_id=reviewer_b.id, status="pending"),
+    ])
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "peer_review",
+                    "label": "Peer Review",
+                    "type": "review",
+                    "ui_variant": "peer_review",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "producer_gate", "needs_revision": "peer_revision"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 2,
+                    "revision_step": "peer_revision",
+                },
+                {
+                    "id": "peer_revision",
+                    "label": "Peer Revision",
+                    "type": "revision",
+                    "assignee_role": "submitter",
+                    "order": 1,
+                    "return_to": "peer_review",
+                    "transitions": {},
+                },
+                {
+                    "id": "producer_gate",
+                    "label": "Producer Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 2,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    db_session.commit()
+
+    issue = factory.issue(
+        track=track,
+        author=reviewer_a,
+        phase=IssuePhase.PEER,
+        status=IssueStatus.INTERNAL_RESOLVED,
+        source_version_id=track.source_versions[-1].id,
+    )
+
+    publish = client.patch(
+        f"/api/issues/{issue.id}",
+        headers=auth_headers(reviewer_b),
+        json={"status": "open"},
+    )
+
+    assert publish.status_code == 403
+    assert publish.json()["detail"] == "Only the issue creator can publish this reviewer-only issue."
+
+    hidden_detail = client.get(f"/api/issues/{issue.id}", headers=auth_headers(submitter))
+    assert hidden_detail.status_code == 404
+
+    hidden_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
+    assert hidden_list.status_code == 200
+    assert all(item["id"] != issue.id for item in hidden_list.json())
 
 
 def test_internal_resolved_not_counted_as_open_issue_for_submitter(client, db_session, factory, auth_headers):

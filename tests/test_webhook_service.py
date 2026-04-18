@@ -252,3 +252,71 @@ def test_try_dispatch_webhook_builds_background_task_with_context_and_mentions(d
     assert payload["context"]["album_title"] == album.title
     assert payload["context"]["track_title"] == track.title
     assert payload["context"]["action_required_by"] == producer.display_name
+
+
+def test_try_dispatch_webhook_resolves_track_from_issue(db_session, factory):
+    producer = factory.user(role="producer", username="producer")
+    mastering = factory.user(username="mastering")
+    reviewer = factory.user(username="reviewer")
+    submitter = factory.user(username="submitter")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer], title="Album One")
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
+    issue = factory.issue(track=track, author=reviewer, phase="peer", source_version_id=track.source_versions[-1].id)
+    album.webhook_config = json.dumps({
+        "enabled": True,
+        "url": "https://hooks.example.com/feishu",
+        "events": ["new_comment"],
+        "type": "feishu",
+    })
+    db_session.commit()
+
+    background_tasks = BackgroundTasks()
+    notifications._try_dispatch_webhook(
+        db_session,
+        background_tasks,
+        album.id,
+        "new_comment",
+        "New comment",
+        "Track-level context should still be present",
+        None,
+        issue.id,
+        [reviewer.id],
+        webhook_context={"actor_name": submitter.display_name},
+    )
+
+    assert len(background_tasks.tasks) == 1
+    payload = background_tasks.tasks[0].args[1]
+    assert payload["track_id"] == track.id
+    assert payload["context"]["track_title"] == track.title
+    assert payload["context"]["issue_title"] == issue.title
+
+
+def test_try_dispatch_webhook_dedupes_identical_background_tasks(db_session, factory):
+    producer = factory.user(role="producer", username="producer")
+    mastering = factory.user(username="mastering")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[producer], title="Album One")
+    track = factory.track(album=album, submitter=producer, status="peer_review")
+    album.webhook_config = json.dumps({
+        "enabled": True,
+        "url": "https://hooks.example.com/feishu",
+        "events": ["new_comment"],
+        "type": "feishu",
+    })
+    db_session.commit()
+
+    background_tasks = BackgroundTasks()
+    for _ in range(2):
+        notifications._try_dispatch_webhook(
+            db_session,
+            background_tasks,
+            album.id,
+            "new_comment",
+            "New comment",
+            "Please review",
+            track.id,
+            None,
+            [producer.id],
+            webhook_context={"actor_name": producer.display_name},
+        )
+
+    assert len(background_tasks.tasks) == 1

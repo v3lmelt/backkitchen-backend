@@ -80,6 +80,7 @@ def _notify_manual_assignment_needed(
     track: Track,
     step: "StepDef",
     background_tasks: BackgroundTasks | None,
+    actor: User | None = None,
 ) -> None:
     if not background_tasks or not album.producer_id:
         return
@@ -89,10 +90,11 @@ def _notify_manual_assignment_needed(
         [album.producer_id],
         "reviewer_assignment_needed",
         "需要手动指派评审人",
-        f"「{track.title}」在「{step_label}」阶段等待制作人手动指派评审人。",
+        f"「{track.title}」已进入「{step_label}」阶段，需要制作人手动指派评审人。",
         related_track_id=track.id,
         background_tasks=background_tasks,
         album_id=track.album_id,
+        webhook_context={"actor_id": actor.id, "actor_name": actor.display_name} if actor else None,
     )
 
 
@@ -104,13 +106,14 @@ def _notify_assigned_reviewers(
     background_tasks: BackgroundTasks | None,
     *,
     reopened: bool = False,
+    actor: User | None = None,
 ) -> None:
     if not reviewer_ids or not background_tasks:
         return
     step_label = _step_label_zh(step)
     title = "评审已重新开启" if reopened else "你被指派为评审人"
     body = (
-        f"「{track.title}」已重新进入「{step_label}」，请继续评审。"
+        f"「{track.title}」已重新进入「{step_label}」阶段，请继续评审。"
         if reopened
         else f"你已被指派评审「{track.title}」（{step_label}）。"
     )
@@ -123,6 +126,7 @@ def _notify_assigned_reviewers(
         related_track_id=track.id,
         background_tasks=background_tasks,
         album_id=track.album_id,
+        webhook_context={"actor_id": actor.id, "actor_name": actor.display_name} if actor else None,
     )
 
 
@@ -148,6 +152,7 @@ def _discard_internal_review_issues(
     db: Session,
     track: Track,
     background_tasks: "BackgroundTasks | None" = None,
+    actor: User | None = None,
 ) -> None:
     """Close unresolved internal-discussion issues as INTERNAL_RESOLVED.
 
@@ -179,10 +184,11 @@ def _discard_internal_review_issues(
             list(author_ids),
             "issue_status_changed",
             "内部讨论问题已自动结案",
-            f"「{track.title}」进入修订阶段，{len(pending_issues)} 个待讨论问题已自动内部结案。",
+            f"由于「{track.title}」已进入修订阶段，{len(pending_issues)} 个待讨论问题已自动内部结案。",
             related_track_id=track.id,
             background_tasks=background_tasks,
             album_id=track.album_id,
+            webhook_context={"actor_id": actor.id, "actor_name": actor.display_name} if actor else None,
         )
 
 
@@ -420,6 +426,7 @@ def assign_reviewers(
     track: Track,
     step: StepDef,
     background_tasks: BackgroundTasks | None = None,
+    actor: User | None = None,
 ) -> list[int]:
     """Assign reviewers for a review step.
 
@@ -444,7 +451,7 @@ def assign_reviewers(
                 "(need %d, have %d). Falling back to manual.",
                 track.id, step.id, count, len(candidates),
             )
-            _notify_manual_assignment_needed(db, album, track, step, background_tasks)
+            _notify_manual_assignment_needed(db, album, track, step, background_tasks, actor)
             return []
 
         # Load-balanced: pick candidates with fewest pending assignments
@@ -473,7 +480,7 @@ def assign_reviewers(
                 cancellation_reason=None,
                 assigned_at=now,
             ))
-        _notify_assigned_reviewers(db, track, step, selected, background_tasks)
+        _notify_assigned_reviewers(db, track, step, selected, background_tasks, actor=actor)
         return selected
 
     # Manual mode — no auto-assignment
@@ -483,6 +490,7 @@ def assign_reviewers(
 def assign_peer_reviewer_for_step(
     db: Session, album: Album, track: Track, step: StepDef,
     background_tasks: BackgroundTasks | None = None,
+    actor: User | None = None,
 ) -> None:
     """Handle reviewer assignment when entering a review step.
 
@@ -512,15 +520,15 @@ def assign_peer_reviewer_for_step(
         )
         db.add(assignment)
         _set_track_peer_reviewer_from_assignments(track, step, [assignment])
-        _notify_assigned_reviewers(db, track, step, [step.assignee_user_id], background_tasks)
+        _notify_assigned_reviewers(db, track, step, [step.assignee_user_id], background_tasks, actor=actor)
         return
 
     if step.assignment_mode == "manual":
         _set_track_peer_reviewer_from_assignments(track, step, [])
-        _notify_manual_assignment_needed(db, album, track, step, background_tasks)
+        _notify_manual_assignment_needed(db, album, track, step, background_tasks, actor)
         return
 
-    assigned = assign_reviewers(db, album, track, step, background_tasks)
+    assigned = assign_reviewers(db, album, track, step, background_tasks, actor)
     assignments = [
         StageAssignment(track_id=track.id, stage_id=step.id, user_id=uid, status="pending")
         for uid in assigned
@@ -534,6 +542,7 @@ def prepare_review_assignments_for_stage_entry(
     track: Track,
     stage_id: str,
     background_tasks: BackgroundTasks | None = None,
+    actor: User | None = None,
 ) -> None:
     """Ensure assignments are ready when a track enters a review stage.
 
@@ -554,7 +563,7 @@ def prepare_review_assignments_for_stage_entry(
     ).all()
 
     if not existing_assignments:
-        assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
+        assign_peer_reviewer_for_step(db, album, track, step, background_tasks, actor)
         return
 
     reopened_user_ids: list[int] = []
@@ -571,10 +580,10 @@ def prepare_review_assignments_for_stage_entry(
 
     active_assignments = [assignment for assignment in existing_assignments if assignment.status in ASSIGNMENT_ACTIVE_STATUSES]
     if not active_assignments:
-        assign_peer_reviewer_for_step(db, album, track, step, background_tasks)
+        assign_peer_reviewer_for_step(db, album, track, step, background_tasks, actor)
         return
     _set_track_peer_reviewer_from_assignments(track, step, active_assignments)
-    _notify_assigned_reviewers(db, track, step, reopened_user_ids, background_tasks, reopened=True)
+    _notify_assigned_reviewers(db, track, step, reopened_user_ids, background_tasks, reopened=True, actor=actor)
 
 
 # ---------------------------------------------------------------------------
@@ -852,10 +861,11 @@ def execute_transition(
                         ready_reviewers,
                         "workflow_review_ready_for_final_decision",
                         "同行评审已达成人数",
-                        f"「{track.title}」已达到同行评审人数要求，请评审组内讨论并提交最终结论。",
+                        f"「{track.title}」的同行评审已满足人数要求，请评审组内汇总意见并提交最终结论。",
                         related_track_id=track.id,
                         background_tasks=background_tasks,
                         album_id=track.album_id,
+                        webhook_context={"actor_id": user.id, "actor_name": user.display_name},
                     )
             return
 
@@ -866,7 +876,7 @@ def execute_transition(
             step.id,
             reason=ASSIGNMENT_CANCEL_REASON_QUORUM_MET,
         )
-        _discard_internal_review_issues(db, track, background_tasks)
+        _discard_internal_review_issues(db, track, background_tasks, user)
 
     # Producer-direct intake: skip peer review, mark variant accordingly
     if decision == "accept_producer_direct":
@@ -931,10 +941,11 @@ def execute_transition(
                 track,
                 target,
                 background_tasks,
+                user,
             )
         else:
             # Forward: auto-assign reviewers if entering a review step
-            assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks)
+            assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks, user)
 
     # Mark the current user's assignment when it wasn't already handled above.
     if step.type == "review" and pending_assignment and pending_assignment.status == "pending":
@@ -1371,7 +1382,7 @@ def execute_reopen(
     )
 
     # Auto-assign if entering a review step
-    assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks)
+    assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks, actor)
 
     # Notify relevant parties
     notify_targets = {track.submitter_id, album.producer_id}

@@ -1,15 +1,19 @@
 import copy
 import json
 from datetime import datetime, timezone
+from unittest.mock import ANY
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import select
 
+from app.models.issue import IssuePhase, IssueStatus
 from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 from app.workflow_engine import (
+    _discard_internal_review_issues,
+    _notify_assigned_reviewers,
     ASSIGNMENT_CANCEL_REASON_REASSIGNED,
     StepDef,
     assign_peer_reviewer_for_step,
@@ -18,6 +22,7 @@ from app.workflow_engine import (
     execute_delivery_confirm,
     execute_delivery_upload,
     execute_reopen,
+    execute_transition,
     migrate_tracks_on_workflow_change,
     parse_workflow_config,
 )
@@ -80,17 +85,34 @@ def test_assign_reviewers_auto_falls_back_to_manual_when_pool_is_insufficient(
         reviewer_pool=[submitter.id, reviewer.id],
         required_reviewer_count=2,
     )
-    notifications: list[tuple[list[int], str]] = []
+    notifications: list[dict] = []
 
-    def capture_notify(_db, recipients, event_type, *_args, **_kwargs):
-        notifications.append((list(recipients), event_type))
+    def capture_notify(_db, recipients, event_type, title, body, *_args, **kwargs):
+        notifications.append({
+            "recipients": list(recipients),
+            "event_type": event_type,
+            "title": title,
+            "body": body,
+            "kwargs": kwargs,
+        })
 
     monkeypatch.setattr("app.workflow_engine.notify", capture_notify)
 
-    assigned = assign_reviewers(db_session, album, track, step, BackgroundTasks())
+    assigned = assign_reviewers(db_session, album, track, step, BackgroundTasks(), actor=reviewer)
 
     assert assigned == []
-    assert notifications == [([producer.id], "reviewer_assignment_needed")]
+    assert notifications == [{
+        "recipients": [producer.id],
+        "event_type": "reviewer_assignment_needed",
+        "title": "需要手动指派评审人",
+        "body": f"「{track.title}」已进入「同行评审」阶段，需要制作人手动指派评审人。",
+        "kwargs": {
+            "related_track_id": track.id,
+            "background_tasks": ANY,
+            "album_id": track.album_id,
+            "webhook_context": {"actor_id": reviewer.id, "actor_name": reviewer.display_name},
+        },
+    }]
     assert db_session.scalars(select(StageAssignment).where(StageAssignment.track_id == track.id)).all() == []
 
 
@@ -131,14 +153,20 @@ def test_assign_peer_reviewer_for_step_honors_assignee_override(
         required_reviewer_count=1,
         assignee_user_id=new_reviewer.id,
     )
-    notifications: list[tuple[list[int], str]] = []
+    notifications: list[dict] = []
 
-    def capture_notify(_db, recipients, event_type, *_args, **_kwargs):
-        notifications.append((list(recipients), event_type))
+    def capture_notify(_db, recipients, event_type, title, body, *_args, **kwargs):
+        notifications.append({
+            "recipients": list(recipients),
+            "event_type": event_type,
+            "title": title,
+            "body": body,
+            "kwargs": kwargs,
+        })
 
     monkeypatch.setattr("app.workflow_engine.notify", capture_notify)
 
-    assign_peer_reviewer_for_step(db_session, album, track, step, BackgroundTasks())
+    assign_peer_reviewer_for_step(db_session, album, track, step, BackgroundTasks(), actor=producer)
     db_session.commit()
     db_session.refresh(track)
 
@@ -156,7 +184,185 @@ def test_assign_peer_reviewer_for_step_honors_assignee_override(
         (old_reviewer.id, "cancelled", ASSIGNMENT_CANCEL_REASON_REASSIGNED),
         (new_reviewer.id, "pending", None),
     ]
-    assert notifications == [([new_reviewer.id], "reviewer_assigned")]
+    assert notifications == [{
+        "recipients": [new_reviewer.id],
+        "event_type": "reviewer_assigned",
+        "title": "你被指派为评审人",
+        "body": f"你已被指派评审「{track.title}」（同行评审）。",
+        "kwargs": {
+            "related_track_id": track.id,
+            "background_tasks": ANY,
+            "album_id": track.album_id,
+            "webhook_context": {"actor_id": producer.id, "actor_name": producer.display_name},
+        },
+    }]
+
+
+def test_notify_assigned_reviewers_reopened_includes_actor_context(monkeypatch, factory, db_session):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
+    step = StepDef(
+        id="peer_review",
+        label="Peer Review",
+        type="review",
+        ui_variant="peer_review",
+        assignee_role="peer_reviewer",
+        order=1,
+        transitions={"pass": "__completed"},
+    )
+    notifications: list[dict] = []
+
+    def capture_notify(_db, recipients, event_type, title, body, *_args, **kwargs):
+        notifications.append({
+            "recipients": list(recipients),
+            "event_type": event_type,
+            "title": title,
+            "body": body,
+            "kwargs": kwargs,
+        })
+
+    monkeypatch.setattr("app.workflow_engine.notify", capture_notify)
+
+    _notify_assigned_reviewers(
+        db_session,
+        track,
+        step,
+        [reviewer.id],
+        BackgroundTasks(),
+        reopened=True,
+        actor=producer,
+    )
+
+    assert notifications == [{
+        "recipients": [reviewer.id],
+        "event_type": "reviewer_assigned",
+        "title": "评审已重新开启",
+        "body": f"「{track.title}」已重新进入「同行评审」阶段，请继续评审。",
+        "kwargs": {
+            "related_track_id": track.id,
+            "background_tasks": ANY,
+            "album_id": track.album_id,
+            "webhook_context": {"actor_id": producer.id, "actor_name": producer.display_name},
+        },
+    }]
+
+
+def test_discard_internal_review_issues_includes_actor_context(monkeypatch, db_session, factory):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="custom_review", peer_reviewer=reviewer)
+    issue = factory.issue(
+        track=track,
+        author=reviewer,
+        phase=IssuePhase.PEER,
+        status=IssueStatus.PENDING_DISCUSSION,
+        source_version_id=track.source_versions[-1].id,
+    )
+    notifications: list[dict] = []
+
+    def capture_notify(_db, recipients, event_type, title, body, *_args, **kwargs):
+        notifications.append({
+            "recipients": list(recipients),
+            "event_type": event_type,
+            "title": title,
+            "body": body,
+            "kwargs": kwargs,
+        })
+
+    monkeypatch.setattr("app.workflow_engine.notify", capture_notify)
+
+    _discard_internal_review_issues(db_session, track, BackgroundTasks(), actor=submitter)
+
+    assert issue.status == IssueStatus.INTERNAL_RESOLVED
+    assert notifications == [{
+        "recipients": [reviewer.id],
+        "event_type": "issue_status_changed",
+        "title": "内部讨论问题已自动结案",
+        "body": f"由于「{track.title}」已进入修订阶段，1 个待讨论问题已自动内部结案。",
+        "kwargs": {
+            "related_track_id": track.id,
+            "background_tasks": ANY,
+            "album_id": track.album_id,
+            "webhook_context": {"actor_id": submitter.id, "actor_name": submitter.display_name},
+        },
+    }]
+
+
+def test_execute_transition_review_quorum_notification_includes_actor_context(monkeypatch, db_session, factory):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer_a = factory.user(username="reviewer_a")
+    reviewer_b = factory.user(username="reviewer_b")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer_a, reviewer_b],
+        workflow_config={
+            "version": 2,
+            "steps": [
+                {
+                    "id": "custom_review",
+                    "label": "Custom Review",
+                    "type": "review",
+                    "ui_variant": "generic",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "required_reviewer_count": 2,
+                    "transitions": {"pass": "producer_gate"},
+                },
+                {
+                    "id": "producer_gate",
+                    "label": "Producer Gate",
+                    "type": "approval",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        },
+    )
+    track = factory.track(album=album, submitter=submitter, status="custom_review", peer_reviewer=None)
+    db_session.add_all([
+        StageAssignment(track_id=track.id, stage_id="custom_review", user_id=reviewer_a.id, status="completed"),
+        StageAssignment(track_id=track.id, stage_id="custom_review", user_id=reviewer_b.id, status="pending"),
+    ])
+    db_session.commit()
+
+    notifications: list[dict] = []
+
+    def capture_notify(_db, recipients, event_type, title, body, *_args, **kwargs):
+        notifications.append({
+            "recipients": list(recipients),
+            "event_type": event_type,
+            "title": title,
+            "body": body,
+            "kwargs": kwargs,
+        })
+
+    monkeypatch.setattr("app.workflow_engine.notify", capture_notify)
+
+    execute_transition(db_session, album, track, reviewer_b, "pass", BackgroundTasks())
+
+    assert notifications == [{
+        "recipients": [reviewer_a.id],
+        "event_type": "workflow_review_ready_for_final_decision",
+        "title": "同行评审已达成人数",
+        "body": f"「{track.title}」的同行评审已满足人数要求，请评审组内汇总意见并提交最终结论。",
+        "kwargs": {
+            "related_track_id": track.id,
+            "background_tasks": ANY,
+            "album_id": track.album_id,
+            "webhook_context": {"actor_id": reviewer_b.id, "actor_name": reviewer_b.display_name},
+        },
+    }]
 
 
 def test_execute_delivery_upload_respects_confirmation_requirement(factory):
