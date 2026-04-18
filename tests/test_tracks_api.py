@@ -1,11 +1,15 @@
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import select
 
 from app.config import settings
+from app.models.comment import Comment
 from app.models.discussion import TrackDiscussion, TrackDiscussionAudio
+from app.models.issue import IssueStatus
 from app.models.issue_image import IssueImage
 from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
@@ -606,6 +610,43 @@ def test_get_track_not_found(client, factory, auth_headers):
     assert response.status_code == 404
 
 
+def test_peer_review_transition_skips_checklist_gate_when_album_checklist_disabled(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer],
+        checklist_enabled=False,
+    )
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    factory.session.add(
+        StageAssignment(
+            track_id=track.id,
+            stage_id="peer_review",
+            user_id=reviewer.id,
+            status="pending",
+        )
+    )
+    factory.session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/workflow/transition",
+        headers=auth_headers(reviewer),
+        json={"decision": "pass"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "producer_gate"
+
+
 def test_upload_source_version_from_peer_revision(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -628,6 +669,88 @@ def test_upload_source_version_from_peer_revision(client, db_session, factory, a
     body = response.json()
     assert body["status"] == "peer_review"
     assert body["version"] == 2
+
+
+def test_upload_source_version_resolves_selected_issues_transactionally(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="peer_revision", peer_reviewer=reviewer)
+    issue = factory.issue(
+        track=track,
+        author=reviewer,
+        phase="peer",
+        status=IssueStatus.OPEN,
+        source_version_id=track.source_versions[-1].id,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(submitter),
+        files=[
+            ("file", ("revision.wav", b"RIFFrev", "audio/wav")),
+            ("resolved_issue_ids", (None, str(issue.id))),
+            ("resolution_note", (None, "Fixed in revision v2.")),
+        ],
+    )
+
+    assert response.status_code == 200
+    db_session.refresh(issue)
+    assert issue.status == IssueStatus.RESOLVED
+    status_note = db_session.scalars(
+        select(Comment).where(Comment.issue_id == issue.id, Comment.is_status_note.is_(True))
+    ).first()
+    assert status_note is not None
+    assert status_note.old_status == IssueStatus.OPEN.value
+    assert status_note.new_status == IssueStatus.RESOLVED.value
+    assert status_note.content == "Fixed in revision v2."
+
+
+def test_confirm_source_version_upload_resolves_selected_issues(client, db_session, factory, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "R2_ENABLED", True)
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="peer_revision", peer_reviewer=reviewer)
+    issue = factory.issue(
+        track=track,
+        author=reviewer,
+        phase="peer",
+        status=IssueStatus.OPEN,
+        source_version_id=track.source_versions[-1].id,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.r2",
+        SimpleNamespace(
+            object_exists=lambda key: True,
+            download_to_temp=lambda key: Path(factory._audio_file(stem="r2-revision", ext=".wav")),
+        ),
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions/confirm-upload",
+        headers=auth_headers(submitter),
+        json={
+            "upload_id": "upload-2",
+            "object_key": f"tracks/{track.id}/source/{track.version + 1}/revision.wav",
+            "resolved_issue_ids": [issue.id],
+            "resolution_note": "Resolved in the R2 upload.",
+        },
+    )
+
+    assert response.status_code == 200
+    db_session.refresh(issue)
+    assert issue.status == IssueStatus.RESOLVED
+    status_note = db_session.scalars(
+        select(Comment).where(Comment.issue_id == issue.id, Comment.is_status_note.is_(True))
+    ).first()
+    assert status_note is not None
+    assert status_note.content == "Resolved in the R2 upload."
 
 
 def test_upload_source_version_from_mastering_revision(client, db_session, factory, auth_headers):

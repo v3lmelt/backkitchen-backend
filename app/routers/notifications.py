@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -10,6 +12,7 @@ from app.schemas.schemas import NotificationRead
 from app.security import get_current_user
 
 router = APIRouter(tags=["notifications"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/api/notifications", response_model=list[NotificationRead])
@@ -40,6 +43,7 @@ def mark_all_read(
         .values(is_read=True)
     )
     db.commit()
+    logger.info("notifications_mark_all_read user_id=%s updated=%s", current_user.id, result.rowcount)
     if result.rowcount:
         broadcast_notifications_updated(background_tasks, [current_user.id])
     return {"updated": result.rowcount}
@@ -58,5 +62,6 @@ def mark_read(
     notif.is_read = True
     db.commit()
     db.refresh(notif)
+    logger.info("notifications_mark_read user_id=%s notification_id=%s", current_user.id, notification_id)
     broadcast_notifications_updated(background_tasks, [current_user.id])
     return notif

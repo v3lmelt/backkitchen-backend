@@ -1,7 +1,10 @@
+import sys
 from io import BytesIO
+from types import SimpleNamespace
 
 from app.models.notification import Notification
 from app.models.issue import IssuePhase, IssueStatus
+from app.models.discussion import TrackDiscussionAudio
 from app.security import create_access_token
 
 
@@ -93,6 +96,84 @@ def test_mastering_discussion_audio_uses_protected_api_url_and_supports_token_do
     assert download.status_code == 200
     assert download.content == b"RIFFdiscussion"
     assert download.headers["content-type"].startswith("audio/wav")
+
+
+def test_request_discussion_audio_upload_returns_presigned_uploads(client, factory, auth_headers, monkeypatch):
+    monkeypatch.setattr("app.routers.discussions.settings.R2_ENABLED", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.r2",
+        SimpleNamespace(
+            generate_upload_url=lambda key, content_type: f"https://upload.example.com/{key}?type={content_type}",
+            make_object_key=lambda prefix, record_id, filename: f"{prefix}/{record_id}/{filename}",
+        ),
+    )
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/discussions/request-audio-upload",
+        headers=auth_headers(mastering),
+        json={"files": [{"filename": "reference.wav", "content_type": "audio/wav", "file_size": 128}]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["uploads"][0]["object_key"] == f"discussions/{track.id}/0/reference.wav"
+    assert body["uploads"][0]["upload_url"].startswith("https://upload.example.com/discussions/")
+
+
+def test_create_mastering_discussion_accepts_r2_audio_and_resolve_json(client, db_session, factory, auth_headers, monkeypatch):
+    monkeypatch.setattr("app.routers.discussions.settings.R2_ENABLED", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.r2",
+        SimpleNamespace(
+            object_exists=lambda key: True,
+            download_to_temp=lambda key: __import__("pathlib").Path(factory._audio_file(stem="discussion-r2", ext=".wav")),
+            public_url=lambda key: f"https://cdn.example.com/{key}",
+        ),
+    )
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    create_response = client.post(
+        f"/api/tracks/{track.id}/discussions",
+        headers=auth_headers(mastering),
+        data={
+            "content": "R2 mastering reference",
+            "phase": "mastering",
+            "audio_object_keys": f"discussions/{track.id}/0/reference.wav",
+            "audio_original_filenames": "reference.wav",
+        },
+    )
+
+    assert create_response.status_code == 201
+    audio = create_response.json()["audios"][0]
+    stored_audio = db_session.get(TrackDiscussionAudio, audio["id"])
+    assert stored_audio.storage_backend == "r2"
+    assert stored_audio.file_path == f"discussions/{track.id}/0/reference.wav"
+
+    json_resolve = client.get(
+        audio["audio_url"],
+        params={"token": create_access_token(mastering), "resolve": "json"},
+    )
+    redirect_resolve = client.get(
+        audio["audio_url"],
+        params={"token": create_access_token(mastering)},
+        follow_redirects=False,
+    )
+
+    assert json_resolve.status_code == 200
+    assert json_resolve.json() == {"url": f"https://cdn.example.com/discussions/{track.id}/0/reference.wav"}
+    assert redirect_resolve.status_code == 302
+    assert redirect_resolve.headers["location"] == f"https://cdn.example.com/discussions/{track.id}/0/reference.wav"
 
 
 def test_create_discussion_rejects_non_image_upload(client, factory, auth_headers):

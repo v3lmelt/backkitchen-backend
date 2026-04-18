@@ -798,7 +798,11 @@ def execute_transition(
             detail="This delivery action must be completed from the delivery upload flow, not the workflow action bar.",
         )
 
-    if step.type == "review" and (step.ui_variant == "peer_review" or step.id == "peer_review"):
+    if (
+        album.checklist_enabled
+        and step.type == "review"
+        and (step.ui_variant == "peer_review" or step.id == "peer_review")
+    ):
         source_version = current_source_version(track)
         if source_version is None:
             raise HTTPException(

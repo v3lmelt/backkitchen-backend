@@ -371,6 +371,7 @@ def _album_to_read(album: Album, db: Session, *, summary: AlbumStats | None = No
         catalog_number=album.catalog_number,
         circle_id=album.circle_id,
         circle_name=album.circle_name,
+        checklist_enabled=album.checklist_enabled,
         genres=genres,
         cover_image=album.cover_image,
         producer_id=album.producer_id,
@@ -424,6 +425,11 @@ def create_album(
     genres = payload.genres
     album = Album(**album_data, producer_id=current_user.id)
     album.circle_name = payload.circle_name or (circle.name if circle else album.circle_name)
+    album.checklist_enabled = (
+        payload.checklist_enabled
+        if payload.checklist_enabled is not None
+        else (circle.default_checklist_enabled if circle else False)
+    )
     album.deadline = payload.deadline
     album.phase_deadlines = (
         json.dumps(payload.phase_deadlines, ensure_ascii=False)
@@ -601,6 +607,8 @@ def update_album_metadata(
     album.release_date = payload.release_date
     album.catalog_number = payload.catalog_number
     album.circle_name = payload.circle_name
+    if payload.checklist_enabled is not None:
+        album.checklist_enabled = payload.checklist_enabled
     album.genres = json.dumps(payload.genres, ensure_ascii=False) if payload.genres else None
     db.commit()
     db.refresh(album)

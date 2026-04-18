@@ -83,7 +83,11 @@ def collect_track_files(track: Track) -> tuple[list[Path], list[str]]:
             if img.file_path:
                 local_paths.append(upload_base / img.file_path)
         for audio in disc.audios:
-            if audio.file_path:
+            if not audio.file_path:
+                continue
+            if audio.storage_backend == "r2":
+                r2_keys.append(audio.file_path)
+            else:
                 local_paths.append(upload_base / audio.file_path)
 
     return local_paths, r2_keys

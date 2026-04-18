@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from app.models.comment import Comment
 from app.models.comment_audio import CommentAudio
 from app.models.comment_image import CommentImage
-from app.models.discussion import TrackDiscussion, TrackDiscussionImage
+from app.models.discussion import TrackDiscussion, TrackDiscussionAudio, TrackDiscussionImage
 from app.models.issue_audio import IssueAudio
 from app.services import cleanup
 
@@ -66,6 +66,24 @@ def test_collect_track_files_includes_local_and_r2_assets(db_session, factory, u
     db_session.add(discussion)
     db_session.flush()
     db_session.add(TrackDiscussionImage(discussion_id=discussion.id, file_path="discussion_images/discussion.png"))
+    db_session.add(
+        TrackDiscussionAudio(
+            discussion_id=discussion.id,
+            file_path="discussion_audios/local-discussion.mp3",
+            storage_backend="local",
+            original_filename="local-discussion.mp3",
+            duration=1.5,
+        )
+    )
+    db_session.add(
+        TrackDiscussionAudio(
+            discussion_id=discussion.id,
+            file_path="discussions/1/r2-discussion.mp3",
+            storage_backend="r2",
+            original_filename="r2-discussion.mp3",
+            duration=2.5,
+        )
+    )
     db_session.commit()
     db_session.refresh(track)
     db_session.refresh(delivery)
@@ -77,8 +95,10 @@ def test_collect_track_files_includes_local_and_r2_assets(db_session, factory, u
     assert upload_dir / "issue_audios/issue.mp3" in local_paths
     assert upload_dir / "comment_images/comment.png" in local_paths
     assert upload_dir / "discussion_images/discussion.png" in local_paths
+    assert upload_dir / "discussion_audios/local-discussion.mp3" in local_paths
     assert "tracks/1/source/r2.wav" in r2_keys
     assert "comment_audios/comment.mp3" in r2_keys
+    assert "discussions/1/r2-discussion.mp3" in r2_keys
 
 
 def test_cleanup_files_removes_local_files_and_r2_keys(tmp_path, monkeypatch):
