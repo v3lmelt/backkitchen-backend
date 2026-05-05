@@ -30,7 +30,7 @@ SPECIAL_TARGETS = {"__completed", "__rejected", "__rejected_resubmittable"}
 
 ASSIGNEE_ROLES = {"producer", "mastering_engineer", "peer_reviewer", "submitter"}
 
-ASSIGNMENT_MODES = ("manual", "auto")
+ASSIGNMENT_MODES = ("manual", "auto", "fixed")
 
 DEFAULT_WORKFLOW_CONFIG: dict = {
     "version": 2,
