@@ -761,6 +761,8 @@ class WebhookConfig(BaseModel):
     app_id: str = ""
     app_secret: str = ""
     filter_user_ids: list[int] = []
+    email_enabled: bool = False
+    email_events: list[str] = []
 
 
 class WebhookDeliveryRead(BaseModel):

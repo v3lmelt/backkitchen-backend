@@ -9,7 +9,10 @@ logger = logging.getLogger(__name__)
 from app.realtime import broadcast_notifications_updated
 from app.models.album import Album
 from app.models.notification import Notification
+from app.services.email import send_composer_notification_email
 from app.services.webhook import build_webhook_payload, post_webhook
+
+COMPOSER_EMAIL_EVENTS = {"new_issue", "new_comment", "revision_requested"}
 
 
 async def _deliver_webhook_background(
@@ -36,6 +39,32 @@ async def _deliver_webhook_background(
         )
     finally:
         db.close()
+
+
+def _deliver_composer_email_background(
+    email: str,
+    *,
+    subject: str,
+    title: str,
+    body: str,
+    action_url: str,
+    event_type: str,
+) -> None:
+    try:
+        send_composer_notification_email(
+            email,
+            subject=subject,
+            title=title,
+            body=body,
+            action_url=action_url,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Composer email delivery failed event_type=%s email=%s: %s",
+            event_type,
+            email,
+            exc,
+        )
 
 
 def notify(
@@ -77,6 +106,126 @@ def notify(
             related_track_id, related_issue_id, list(seen),
             webhook_context=webhook_context,
         )
+        _try_dispatch_composer_email(
+            db, background_tasks, album_id, type, title, body,
+            related_track_id, related_issue_id,
+            webhook_context=webhook_context,
+        )
+
+
+def _composer_email_event_type(event_type: str, webhook_context: dict | None = None) -> str | None:
+    context_event = (webhook_context or {}).get("composer_email_event")
+    if context_event in COMPOSER_EMAIL_EVENTS:
+        return context_event
+    if event_type in {"new_issue", "new_comment"}:
+        return event_type
+    return None
+
+
+def _composer_email_action_url(event_type: str, track_id: int, issue_id: int | None) -> str:
+    from app.config import settings
+
+    base = settings.FRONTEND_URL.rstrip("/")
+    if event_type in {"new_issue", "new_comment"} and issue_id is not None:
+        return f"{base}/issues/{issue_id}"
+    return f"{base}/tracks/{track_id}"
+
+
+def _try_dispatch_composer_email(
+    db: Session,
+    background_tasks: BackgroundTasks,
+    album_id: int,
+    event_type: str,
+    title: str,
+    body: str,
+    track_id: int | None,
+    issue_id: int | None,
+    webhook_context: dict | None = None,
+) -> None:
+    album = db.get(Album, album_id)
+    if not album or not album.webhook_config:
+        return
+    try:
+        config = json.loads(album.webhook_config)
+    except (json.JSONDecodeError, TypeError):
+        logger.error("Malformed webhook_config for album %s, skipping composer email", album_id)
+        return
+
+    composer_event = _composer_email_event_type(event_type, webhook_context)
+    if not composer_event:
+        return
+    if not config.get("email_enabled"):
+        return
+    allowed_events = config.get("email_events") or []
+    if composer_event not in allowed_events:
+        return
+
+    resolved_track_id = track_id
+    if issue_id is not None:
+        from app.models.issue import Issue, IssueStatus
+
+        issue = db.get(Issue, issue_id)
+        if issue is None:
+            return
+        if issue.status in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}:
+            return
+        resolved_track_id = issue.track_id
+    if resolved_track_id is None:
+        return
+
+    from app.models.track import Track
+    from app.models.user import User
+
+    track = db.get(Track, resolved_track_id)
+    if track is None or track.album_id != album_id or track.submitter_id is None:
+        return
+
+    submitter = db.get(User, track.submitter_id)
+    if (
+        submitter is None
+        or not submitter.email
+        or not submitter.email_verified
+        or submitter.deleted_at is not None
+        or submitter.suspended_at is not None
+    ):
+        return
+
+    actor_id = (webhook_context or {}).get("actor_id")
+    if actor_id == submitter.id:
+        return
+
+    action_url = _composer_email_action_url(composer_event, track.id, issue_id)
+    subject = f"[BackKitchen] {title}"
+    dedupe_key = json.dumps(
+        {
+            "event_type": composer_event,
+            "email": submitter.email,
+            "track_id": track.id,
+            "issue_id": issue_id,
+            "title": title,
+            "body": body,
+            "action_url": action_url,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    scheduled_emails = getattr(background_tasks, "_scheduled_composer_email_keys", None)
+    if scheduled_emails is None:
+        scheduled_emails = set()
+        setattr(background_tasks, "_scheduled_composer_email_keys", scheduled_emails)
+    if dedupe_key in scheduled_emails:
+        return
+    scheduled_emails.add(dedupe_key)
+
+    background_tasks.add_task(
+        _deliver_composer_email_background,
+        submitter.email,
+        subject=subject,
+        title=title,
+        body=body,
+        action_url=action_url,
+        event_type=composer_event,
+    )
 
 
 def _try_dispatch_webhook(

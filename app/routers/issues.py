@@ -1018,6 +1018,8 @@ async def add_comment(
     )
 
     participant_ids = [issue.author_id] + [c.author_id for c in issue.comments if c.id != comment.id]
+    if comment_visibility == "public":
+        participant_ids.append(track.submitter_id)
     notify_ids = [uid for uid in dict.fromkeys(participant_ids) if uid != current_user.id]
     if notify_ids:
         notify(db, notify_ids, "new_comment", "新评论",

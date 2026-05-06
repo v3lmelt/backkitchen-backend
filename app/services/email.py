@@ -1,4 +1,5 @@
 import logging
+from html import escape
 
 from app.config import settings
 
@@ -88,6 +89,57 @@ def send_password_reset_email(email: str, token: str) -> None:
     </a>
     <p style="color:#B8B9B6;font-size:12px;margin:24px 0 0;">
       If you did not request a password reset, you can safely ignore this email.
+    </p>
+  </div>
+</body>
+</html>
+""",
+        }
+    )
+
+
+def send_composer_notification_email(
+    email: str,
+    *,
+    subject: str,
+    title: str,
+    body: str,
+    action_url: str,
+) -> None:
+    logger.info("Composer notification email for %s: %s", email, action_url)
+
+    if not settings.RESEND_API_KEY:
+        return
+
+    import resend
+
+    resend.api_key = settings.RESEND_API_KEY
+    resend.Emails.send(
+        {
+            "from": settings.RESEND_FROM_EMAIL,
+            "to": email,
+            "subject": subject,
+            "html": f"""
+<!DOCTYPE html>
+<html>
+<body style="background:#111111;font-family:sans-serif;color:#ffffff;padding:40px 0;">
+  <div style="max-width:520px;margin:0 auto;background:#1A1A1A;border:1px solid #2E2E2E;padding:40px;">
+    <div style="margin-bottom:24px;">
+      <span style="font-family:monospace;font-size:24px;font-weight:700;color:#ffffff;">BackKitchen</span>
+    </div>
+    <h2 style="font-family:monospace;font-size:18px;font-weight:600;color:#ffffff;margin:0 0 12px;">
+      {escape(title)}
+    </h2>
+    <p style="color:#B8B9B6;font-size:14px;line-height:1.6;margin:0 0 24px;">
+      {escape(body)}
+    </p>
+    <a href="{escape(action_url, quote=True)}"
+       style="display:inline-block;background:#FF8400;color:#111111;font-family:monospace;font-size:14px;
+              font-weight:500;padding:10px 24px;border-radius:9999px;text-decoration:none;">
+      Open in BackKitchen
+    </a>
+    <p style="color:#B8B9B6;font-size:12px;line-height:1.5;margin:24px 0 0;">
+      This email was sent because composer email notifications are enabled for this album.
     </p>
   </div>
 </body>

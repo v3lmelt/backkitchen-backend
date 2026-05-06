@@ -1606,6 +1606,14 @@ def _notify_transition(
                 f"「{track.title}」已被退回，可以重新提交。",
             ),
         }.get(target, ("曲目状态变更", f"「{track.title}」状态已更新。"))
+        webhook_context = {
+            "actor_id": actor_id,
+            "actor_name": actor_name,
+            "from_step": from_label,
+            "to_step": target_labels.get(target, target),
+        }
+        if target == "__rejected_resubmittable":
+            webhook_context["composer_email_event"] = "revision_requested"
         notify(
             db,
             [track.submitter_id],
@@ -1615,12 +1623,7 @@ def _notify_transition(
             related_track_id=track.id,
             background_tasks=background_tasks,
             album_id=track.album_id,
-            webhook_context={
-                "actor_id": actor_id,
-                "actor_name": actor_name,
-                "from_step": from_label,
-                "to_step": target_labels.get(target, target),
-            },
+            webhook_context=webhook_context,
         )
         return
 
@@ -1635,6 +1638,14 @@ def _notify_transition(
     )
     target_label = _step_label_zh(target_step)
     if assignee_id:
+        webhook_context = {
+            "actor_id": actor_id,
+            "actor_name": actor_name,
+            "from_step": from_label,
+            "to_step": target_label,
+        }
+        if target_step.type == "revision" and assignee_id == track.submitter_id:
+            webhook_context["composer_email_event"] = "revision_requested"
         notify(
             db,
             [assignee_id],
@@ -1644,10 +1655,5 @@ def _notify_transition(
             related_track_id=track.id,
             background_tasks=background_tasks,
             album_id=track.album_id,
-            webhook_context={
-                "actor_id": actor_id,
-                "actor_name": actor_name,
-                "from_step": from_label,
-                "to_step": target_label,
-            },
+            webhook_context=webhook_context,
         )

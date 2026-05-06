@@ -617,6 +617,79 @@ def test_add_comment_notifies_once_with_track_context(client, factory, auth_head
     }
 
 
+def test_add_public_comment_notifies_submitter_even_when_not_prior_participant(client, factory, auth_headers, monkeypatch):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    issue = factory.issue(
+        track=track,
+        author=reviewer,
+        phase=IssuePhase.PEER,
+        source_version_id=track.source_versions[-1].id,
+    )
+
+    calls: list[dict] = []
+
+    def capture_notify(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr("app.routers.issues.notify", capture_notify)
+
+    response = client.post(
+        f"/api/issues/{issue.id}/comments",
+        headers=auth_headers(reviewer),
+        data={"content": "Please reply on this issue"},
+    )
+
+    assert response.status_code == 201
+    assert len(calls) == 1
+    assert calls[0]["args"][1] == [submitter.id]
+    assert calls[0]["args"][2] == "new_comment"
+    assert calls[0]["kwargs"]["related_track_id"] == track.id
+    assert calls[0]["kwargs"]["related_issue_id"] == issue.id
+
+
+def test_add_internal_comment_does_not_notify_submitter(client, factory, auth_headers, monkeypatch):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    issue = factory.issue(
+        track=track,
+        author=reviewer,
+        phase=IssuePhase.PEER,
+        status=IssueStatus.PENDING_DISCUSSION,
+        source_version_id=track.source_versions[-1].id,
+    )
+
+    calls: list[dict] = []
+    monkeypatch.setattr("app.routers.issues.notify", lambda *args, **kwargs: calls.append({"args": args, "kwargs": kwargs}))
+
+    response = client.post(
+        f"/api/issues/{issue.id}/comments",
+        headers=auth_headers(reviewer),
+        data={"content": "Reviewer-only note"},
+    )
+
+    assert response.status_code == 201
+    assert calls == []
+
+
 def test_create_issue_custom_review_step_allows_stage_assignment_reviewer(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
