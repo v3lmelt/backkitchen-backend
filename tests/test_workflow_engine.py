@@ -271,6 +271,83 @@ def test_fixed_review_requires_all_actual_assignees_before_final_decision(
     assert track.status == "producer_gate"
 
 
+def test_fixed_review_allows_producer_as_assigned_reviewer(
+    db_session,
+    factory,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="fixed_member")
+    workflow_config = {
+        "version": 2,
+        "steps": [
+            {
+                "id": "intake",
+                "label": "Intake",
+                "type": "approval",
+                "ui_variant": "intake",
+                "assignee_role": "producer",
+                "order": 0,
+                "transitions": {"accept": "peer_review"},
+            },
+            {
+                "id": "peer_review",
+                "label": "Peer Review",
+                "type": "review",
+                "ui_variant": "peer_review",
+                "assignee_role": "peer_reviewer",
+                "order": 1,
+                "transitions": {"pass": "producer_gate"},
+                "assignment_mode": "fixed",
+                "reviewer_pool": [producer.id, submitter.id, reviewer.id],
+                "required_reviewer_count": 2,
+            },
+            {
+                "id": "producer_gate",
+                "label": "Producer Gate",
+                "type": "approval",
+                "ui_variant": "producer_gate",
+                "assignee_role": "producer",
+                "order": 2,
+                "transitions": {"approve": "__completed"},
+            },
+        ],
+    }
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer],
+        workflow_config=workflow_config,
+        checklist_enabled=False,
+    )
+    track = factory.track(album=album, submitter=submitter, status="intake", peer_reviewer=None)
+
+    execute_transition(db_session, album, track, producer, "accept", BackgroundTasks())
+
+    assignments = db_session.scalars(
+        select(StageAssignment)
+        .where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id == "peer_review",
+        )
+        .order_by(StageAssignment.user_id.asc())
+    ).all()
+    assert track.status == "peer_review"
+    assert track.peer_reviewer_id == producer.id
+    assert [(item.user_id, item.status) for item in assignments] == [
+        (producer.id, "pending"),
+        (reviewer.id, "pending"),
+    ]
+
+    execute_transition(db_session, album, track, producer, "pass", BackgroundTasks())
+    assert track.status == "peer_review"
+    execute_transition(db_session, album, track, reviewer, "pass", BackgroundTasks())
+    assert track.status == "peer_review"
+    execute_transition(db_session, album, track, producer, "pass", BackgroundTasks())
+    assert track.status == "producer_gate"
+
+
 def test_execute_reopen_to_fixed_review_rebuilds_target_assignments(
     db_session,
     factory,

@@ -297,6 +297,57 @@ def test_upload_master_delivery_increments_delivery_number(client, db_session, f
     assert sorted(delivery.delivery_number for delivery in deliveries) == [1, 2]
 
 
+def test_final_review_reject_to_mastering_keeps_cycle_and_clears_approvals(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="final_review", workflow_cycle=3)
+    delivery = factory.master_delivery(
+        track=track,
+        uploaded_by=mastering,
+        workflow_cycle=3,
+        delivery_number=1,
+    )
+    delivery.producer_approved_at = datetime.now(timezone.utc)
+    delivery.submitter_approved_at = datetime.now(timezone.utc)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/workflow/transition",
+        headers=auth_headers(producer),
+        json={"decision": "reject_to_mastering"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "mastering"
+    assert body["workflow_cycle"] == 3
+    db_session.refresh(delivery)
+    assert delivery.producer_approved_at is None
+    assert delivery.submitter_approved_at is None
+
+    upload_response = client.post(
+        f"/api/tracks/{track.id}/master-deliveries",
+        headers=auth_headers(mastering),
+        files={"file": ("master-v2.mp3", b"ID3master-v2", "audio/mpeg")},
+    )
+
+    assert upload_response.status_code == 200
+    deliveries = db_session.scalars(
+        select(MasterDelivery).where(MasterDelivery.track_id == track.id)
+    ).all()
+    assert sorted((item.workflow_cycle, item.delivery_number) for item in deliveries) == [
+        (3, 1),
+        (3, 2),
+    ]
+
+
 def test_track_playback_preference_defaults_to_zero_gain(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")

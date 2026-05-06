@@ -229,6 +229,20 @@ def _cancel_active_review_assignments(
     )
 
 
+def _clear_current_cycle_master_delivery_approvals(db: Session, track: Track) -> None:
+    db.execute(
+        update(MasterDelivery)
+        .where(
+            MasterDelivery.track_id == track.id,
+            MasterDelivery.workflow_cycle == track.workflow_cycle,
+        )
+        .values(
+            producer_approved_at=None,
+            submitter_approved_at=None,
+        )
+    )
+
+
 def _discard_internal_review_issues(
     db: Session,
     track: Track,
@@ -629,6 +643,7 @@ def assign_peer_reviewer_for_step(
         db.add(assignment)
         _set_track_peer_reviewer_from_assignments(track, step, [assignment])
         _notify_assigned_reviewers(db, track, step, [step.assignee_user_id], background_tasks, actor=actor)
+        db.flush()
         return
 
     if step.assignment_mode == "manual":
@@ -642,6 +657,7 @@ def assign_peer_reviewer_for_step(
         for uid in assigned
     ]
     _set_track_peer_reviewer_from_assignments(track, step, assignments)
+    db.flush()
 
 
 def prepare_review_assignments_for_stage_entry(
@@ -1016,6 +1032,8 @@ def execute_transition(
                 detail=f"Workflow config error: target step '{target}' not found.",
             )
         track.status = target
+        if decision.startswith("reject_to_") and should_new_cycle(steps, target_step):
+            _clear_current_cycle_master_delivery_approvals(db, track)
         # Backward ``reject_to_*`` transitions should preserve the original
         # reviewer instead of re-running auto-assignment: reopen any
         # StageAssignment records for the target step so the same user(s)
