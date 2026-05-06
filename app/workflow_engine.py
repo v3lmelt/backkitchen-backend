@@ -41,8 +41,55 @@ ASSIGNMENT_CANCEL_REASON_REASSIGNED = "reassigned"
 REVIEW_FORWARD_DECISIONS = {"pass", "approve"}
 
 
-def _review_requires_group_finalization(step: "StepDef") -> bool:
-    return step.type == "review" and max(1, step.required_reviewer_count or 1) > 1
+def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
+    seen: set[int] = set()
+    result: list[int] = []
+    for user_id in user_ids:
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        result.append(user_id)
+    return result
+
+
+def _required_reviews_for_assignments(
+    step: "StepDef",
+    assignments: list["StageAssignment"] | None = None,
+) -> int:
+    if step.assignment_mode == "fixed" and assignments is not None:
+        return max(1, len(assignments))
+    return max(1, step.required_reviewer_count or 1)
+
+
+def _review_requires_group_finalization(
+    step: "StepDef",
+    assignments: list["StageAssignment"] | None = None,
+) -> bool:
+    return step.type == "review" and _required_reviews_for_assignments(step, assignments) > 1
+
+
+def _should_prefer_assignment(candidate: StageAssignment, current: StageAssignment) -> bool:
+    if candidate.status == "pending" and current.status != "pending":
+        return True
+    if candidate.status != "pending" and current.status == "pending":
+        return False
+    if candidate.assigned_at != current.assigned_at:
+        return candidate.assigned_at > current.assigned_at
+    return candidate.id > current.id
+
+
+def _dedupe_assignments_by_user(assignments: list[StageAssignment]) -> list[StageAssignment]:
+    selected: dict[int, StageAssignment] = {}
+    user_order: list[int] = []
+    for assignment in assignments:
+        current = selected.get(assignment.user_id)
+        if current is None:
+            selected[assignment.user_id] = assignment
+            user_order.append(assignment.user_id)
+            continue
+        if _should_prefer_assignment(assignment, current):
+            selected[assignment.user_id] = assignment
+    return [selected[user_id] for user_id in user_order]
 
 
 def _review_active_assignments(
@@ -50,7 +97,7 @@ def _review_active_assignments(
     track_id: int,
     stage_id: str,
 ) -> list[StageAssignment]:
-    return list(
+    assignments = list(
         db.scalars(
             select(StageAssignment)
             .where(
@@ -61,6 +108,7 @@ def _review_active_assignments(
             .order_by(StageAssignment.assigned_at.asc(), StageAssignment.id.asc())
         ).all()
     )
+    return _dedupe_assignments_by_user(assignments)
 
 
 def _set_track_peer_reviewer_from_assignments(
@@ -130,6 +178,25 @@ def _notify_assigned_reviewers(
     )
 
 
+def _cancel_review_assignments(
+    db: Session,
+    track_id: int,
+    stage_id: str,
+    *,
+    reason: str,
+    statuses: tuple[str, ...],
+) -> None:
+    db.execute(
+        update(StageAssignment)
+        .where(
+            StageAssignment.track_id == track_id,
+            StageAssignment.stage_id == stage_id,
+            StageAssignment.status.in_(statuses),
+        )
+        .values(status="cancelled", cancellation_reason=reason)
+    )
+
+
 def _cancel_pending_review_assignments(
     db: Session,
     track_id: int,
@@ -137,14 +204,42 @@ def _cancel_pending_review_assignments(
     *,
     reason: str,
 ) -> None:
+    _cancel_review_assignments(
+        db,
+        track_id,
+        stage_id,
+        reason=reason,
+        statuses=("pending",),
+    )
+
+
+def _cancel_active_review_assignments(
+    db: Session,
+    track_id: int,
+    stage_id: str,
+    *,
+    reason: str,
+) -> None:
+    _cancel_review_assignments(
+        db,
+        track_id,
+        stage_id,
+        reason=reason,
+        statuses=ASSIGNMENT_ACTIVE_STATUSES,
+    )
+
+
+def _clear_current_cycle_master_delivery_approvals(db: Session, track: Track) -> None:
     db.execute(
-        update(StageAssignment)
+        update(MasterDelivery)
         .where(
-            StageAssignment.track_id == track_id,
-            StageAssignment.stage_id == stage_id,
-            StageAssignment.status == "pending",
+            MasterDelivery.track_id == track.id,
+            MasterDelivery.workflow_cycle == track.workflow_cycle,
         )
-        .values(status="cancelled", cancellation_reason=reason)
+        .values(
+            producer_approved_at=None,
+            submitter_approved_at=None,
+        )
     )
 
 
@@ -227,7 +322,7 @@ class StepDef:
     # Approval-specific
     allow_permanent_reject: bool = False
     # Review-specific
-    assignment_mode: str = "manual"  # "manual" | "auto"
+    assignment_mode: str = "manual"  # "manual" | "auto" | "fixed"
     reviewer_pool: list[int] | None = None
     required_reviewer_count: int = 1
     # Approval/delivery assignee override
@@ -431,16 +526,43 @@ def assign_reviewers(
     """Assign reviewers for a review step.
 
     Returns list of assigned user IDs.  For ``auto`` mode, uses load-balanced
-    selection from the reviewer pool.  Falls back to manual (notify producer)
-    if the pool is insufficient.
+    selection from the reviewer pool.  For ``fixed`` mode, assigns every
+    fixed reviewer except the track submitter.  Falls back to manual (notify
+    producer) if no reviewer can be assigned.
     """
     if step.type != "review":
         return []
 
-    count = step.required_reviewer_count
+    count = max(1, step.required_reviewer_count or 1)
+
+    if step.assignment_mode == "fixed":
+        pool = _dedupe_user_ids(step.reviewer_pool or [])
+        selected = [uid for uid in pool if uid != track.submitter_id]
+
+        if not selected:
+            logger.warning(
+                "Fixed reviewer pool empty after excluding submitter for track %d step '%s'. "
+                "Falling back to manual.",
+                track.id, step.id,
+            )
+            _notify_manual_assignment_needed(db, album, track, step, background_tasks, actor)
+            return []
+
+        now = datetime.now(timezone.utc)
+        for uid in selected:
+            db.add(StageAssignment(
+                track_id=track.id,
+                stage_id=step.id,
+                user_id=uid,
+                status="pending",
+                cancellation_reason=None,
+                assigned_at=now,
+            ))
+        _notify_assigned_reviewers(db, track, step, selected, background_tasks, actor=actor)
+        return selected
 
     if step.assignment_mode == "auto":
-        pool = step.reviewer_pool or []
+        pool = _dedupe_user_ids(step.reviewer_pool or [])
         # Exclude track author from pool
         candidates = [uid for uid in pool if uid != track.submitter_id]
 
@@ -521,6 +643,7 @@ def assign_peer_reviewer_for_step(
         db.add(assignment)
         _set_track_peer_reviewer_from_assignments(track, step, [assignment])
         _notify_assigned_reviewers(db, track, step, [step.assignee_user_id], background_tasks, actor=actor)
+        db.flush()
         return
 
     if step.assignment_mode == "manual":
@@ -534,6 +657,7 @@ def assign_peer_reviewer_for_step(
         for uid in assigned
     ]
     _set_track_peer_reviewer_from_assignments(track, step, assignments)
+    db.flush()
 
 
 def prepare_review_assignments_for_stage_entry(
@@ -616,10 +740,11 @@ def get_allowed_transitions(
             None,
         )
         completed_reviews = sum(1 for assignment in review_assignments if assignment.status == "completed")
-        quorum_reached = completed_reviews >= max(1, step.required_reviewer_count or 1)
+        required_reviews = _required_reviews_for_assignments(step, review_assignments)
+        quorum_reached = completed_reviews >= required_reviews
         if user_pending_assignment is None and not (
             user_completed_assignment is not None
-            and _review_requires_group_finalization(step)
+            and _review_requires_group_finalization(step, review_assignments)
             and quorum_reached
         ):
             return []
@@ -768,6 +893,8 @@ def execute_transition(
             (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "completed"),
             None,
         )
+        required_reviews = _required_reviews_for_assignments(step, review_assignments)
+        review_requires_group_finalization = _review_requires_group_finalization(step, review_assignments)
         completed_reviews = sum(1 for assignment in review_assignments if assignment.status == "completed")
         quorum_reached = completed_reviews >= required_reviews
         if pending_assignment is None and not (
@@ -905,6 +1032,8 @@ def execute_transition(
                 detail=f"Workflow config error: target step '{target}' not found.",
             )
         track.status = target
+        if decision.startswith("reject_to_") and should_new_cycle(steps, target_step):
+            _clear_current_cycle_master_delivery_approvals(db, track)
         # Backward ``reject_to_*`` transitions should preserve the original
         # reviewer instead of re-running auto-assignment: reopen any
         # StageAssignment records for the target step so the same user(s)
@@ -1163,7 +1292,7 @@ def migrate_tracks_on_workflow_change(
         if current_step is None or current_step.type != "review":
             continue
 
-        if current_step.assignment_mode == "auto":
+        if current_step.assignment_mode in {"auto", "fixed"}:
             existing = db.scalar(
                 select(func.count(StageAssignment.id)).where(
                     StageAssignment.track_id == track.id,
@@ -1369,6 +1498,14 @@ def execute_reopen(
             )
         )
 
+    if target_step.type == "review":
+        _cancel_active_review_assignments(
+            db,
+            track.id,
+            target_step.id,
+            reason=ASSIGNMENT_CANCEL_REASON_REASSIGNED,
+        )
+
     db.flush()
     db.expire_all()
 
@@ -1421,8 +1558,9 @@ _DEFAULT_STEP_LABELS_ZH: dict[str, str] = {
     "intake": "接收审核",
     "peer_review": "同行评审",
     "peer_revision": "同行修订",
-    "producer_gate": "制作人审核",
-    "producer_revision": "制作人修订",
+    "producer_gate": "主催审批",
+    "producer_revision": "主催修订",
+    "producer_gate_revision": "主催修订",
     "mastering": "母带制作",
     "mastering_revision": "母带修订",
     "final_review": "终审",
@@ -1468,6 +1606,14 @@ def _notify_transition(
                 f"「{track.title}」已被退回，可以重新提交。",
             ),
         }.get(target, ("曲目状态变更", f"「{track.title}」状态已更新。"))
+        webhook_context = {
+            "actor_id": actor_id,
+            "actor_name": actor_name,
+            "from_step": from_label,
+            "to_step": target_labels.get(target, target),
+        }
+        if target == "__rejected_resubmittable":
+            webhook_context["composer_email_event"] = "revision_requested"
         notify(
             db,
             [track.submitter_id],
@@ -1477,12 +1623,7 @@ def _notify_transition(
             related_track_id=track.id,
             background_tasks=background_tasks,
             album_id=track.album_id,
-            webhook_context={
-                "actor_id": actor_id,
-                "actor_name": actor_name,
-                "from_step": from_label,
-                "to_step": target_labels.get(target, target),
-            },
+            webhook_context=webhook_context,
         )
         return
 
@@ -1497,6 +1638,14 @@ def _notify_transition(
     )
     target_label = _step_label_zh(target_step)
     if assignee_id:
+        webhook_context = {
+            "actor_id": actor_id,
+            "actor_name": actor_name,
+            "from_step": from_label,
+            "to_step": target_label,
+        }
+        if target_step.type == "revision" and assignee_id == track.submitter_id:
+            webhook_context["composer_email_event"] = "revision_requested"
         notify(
             db,
             [assignee_id],
@@ -1506,10 +1655,5 @@ def _notify_transition(
             related_track_id=track.id,
             background_tasks=background_tasks,
             album_id=track.album_id,
-            webhook_context={
-                "actor_id": actor_id,
-                "actor_name": actor_name,
-                "from_step": from_label,
-                "to_step": target_label,
-            },
+            webhook_context=webhook_context,
         )

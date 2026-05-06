@@ -7,7 +7,7 @@ from pathlib import Path
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from app.ws_manager import manager as track_manager
 from app.ws_manager import notification_manager
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,10 +45,115 @@ from app.models import (  # noqa: F401
 from app.routers import admin as admin_router
 from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users, workflow_templates
 from app.security import _decode_token, hash_password
-from app.workflow import is_album_completed, log_track_event
+from app.workflow import ensure_track_visibility, log_track_event
 
 logger = logging.getLogger(__name__)
 ws_logger = logging.getLogger("app.websocket")
+
+
+async def _close_websocket(websocket: WebSocket, code: int) -> None:
+    try:
+        await websocket.close(code=code)
+    except RuntimeError:
+        # The connection may already have been closed by the ASGI server.
+        return
+
+
+def _resolve_websocket_user(db, payload: dict) -> tuple[int | None, User | None, str | None]:
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        return None, None, "invalid_subject"
+
+    user = db.get(User, user_id)
+    if user is None or user.deleted_at is not None:
+        return user_id, None, "missing_user"
+    if user.suspended_at is not None:
+        return user_id, None, "suspended_user"
+    try:
+        token_session_version = int(payload.get("sv", 0))
+    except (TypeError, ValueError):
+        return user_id, None, "invalid_session_version"
+    if token_session_version != max(int(user.session_version or 1), 1):
+        return user_id, None, "revoked_token"
+    return user_id, user, None
+
+
+async def _authorize_track_websocket(websocket: WebSocket, track_id: int, token: str | None) -> int | None:
+    if token is None:
+        ws_logger.info("track_ws_rejected track_id=%s reason=missing_token", track_id)
+        await _close_websocket(websocket, 4001)
+        return None
+    try:
+        payload = _decode_token(token)
+    except HTTPException:
+        ws_logger.info("track_ws_rejected track_id=%s reason=invalid_token", track_id)
+        await _close_websocket(websocket, 4001)
+        return None
+
+    user_id: int | None = None
+    db = None
+    try:
+        db = SessionLocal()
+        user_id, user, reason = _resolve_websocket_user(db, payload)
+        if user is None:
+            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=%s", track_id, user_id, reason)
+            await _close_websocket(websocket, 4001)
+            return None
+
+        track = db.get(Track, track_id)
+        if track is None:
+            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=missing_track", track_id, user_id)
+            await _close_websocket(websocket, 4001)
+            return None
+
+        try:
+            ensure_track_visibility(track, user, db)
+        except HTTPException as exc:
+            close_code = 4003 if exc.status_code == status.HTTP_403_FORBIDDEN else 4001
+            reason = "forbidden" if close_code == 4003 else "inaccessible_track"
+            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=%s", track_id, user_id, reason)
+            await _close_websocket(websocket, close_code)
+            return None
+        return user_id
+    except Exception:
+        ws_logger.exception("track_ws_rejected track_id=%s user_id=%s reason=unexpected_error", track_id, user_id)
+        await _close_websocket(websocket, 1011)
+        return None
+    finally:
+        if db is not None:
+            db.close()
+
+
+async def _authorize_notification_websocket(websocket: WebSocket, token: str | None) -> int | None:
+    if token is None:
+        ws_logger.info("notification_ws_rejected reason=missing_token")
+        await _close_websocket(websocket, 4001)
+        return None
+    try:
+        payload = _decode_token(token)
+    except HTTPException:
+        ws_logger.info("notification_ws_rejected reason=invalid_token")
+        await _close_websocket(websocket, 4001)
+        return None
+
+    user_id: int | None = None
+    db = None
+    try:
+        db = SessionLocal()
+        user_id, user, reason = _resolve_websocket_user(db, payload)
+        if user is None:
+            ws_logger.info("notification_ws_rejected user_id=%s reason=%s", user_id, reason)
+            await _close_websocket(websocket, 4001)
+            return None
+        return user_id
+    except Exception:
+        ws_logger.exception("notification_ws_rejected user_id=%s reason=unexpected_error", user_id)
+        await _close_websocket(websocket, 1011)
+        return None
+    finally:
+        if db is not None:
+            db.close()
 
 
 def _run_sqlite_compat_migrations() -> None:
@@ -649,57 +754,9 @@ def app_config():
 
 @app.websocket("/ws/tracks/{track_id}")
 async def websocket_track(websocket: WebSocket, track_id: int, token: str | None = None) -> None:
-    if token is None:
-        ws_logger.info("track_ws_rejected track_id=%s reason=missing_token", track_id)
-        await websocket.close(code=4001)
+    user_id = await _authorize_track_websocket(websocket, track_id, token)
+    if user_id is None:
         return
-    try:
-        payload = _decode_token(token)
-    except HTTPException:
-        ws_logger.info("track_ws_rejected track_id=%s reason=invalid_token", track_id)
-        await websocket.close(code=4001)
-        return
-
-    # Verify user has access to this track's album.
-    user_id = int(payload["sub"])
-    db = SessionLocal()
-    try:
-        user = db.get(User, user_id)
-        if user is None or user.deleted_at is not None:
-            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=missing_user", track_id, user_id)
-            await websocket.close(code=4001)
-            return
-        track = db.get(Track, track_id)
-        if track is None:
-            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=missing_track", track_id, user_id)
-            await websocket.close(code=4001)
-            return
-        album = db.get(Album, track.album_id)
-        if album is None:
-            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=missing_album", track_id, user_id)
-            await websocket.close(code=4001)
-            return
-        # Query 2: fetch album member ids
-        member_ids: set[int] = set(
-            db.scalars(
-                select(AlbumMember.user_id).where(AlbumMember.album_id == album.id)
-            ).all()
-        )
-        is_privileged = user.id in (album.producer_id, album.mastering_engineer_id)
-        is_track_stakeholder = user.id in (track.submitter_id, track.peer_reviewer_id)
-        is_member = user.id in member_ids
-        if is_privileged or is_track_stakeholder:
-            has_access = True
-        elif is_member:
-            has_access = is_album_completed(db, album.id)
-        else:
-            has_access = False
-        if not has_access:
-            ws_logger.info("track_ws_rejected track_id=%s user_id=%s reason=forbidden", track_id, user_id)
-            await websocket.close(code=4003)
-            return
-    finally:
-        db.close()
 
     connected = await track_manager.connect(track_id, websocket)
     if not connected:
@@ -722,27 +779,9 @@ async def websocket_track(websocket: WebSocket, track_id: int, token: str | None
 
 @app.websocket("/ws/notifications")
 async def websocket_notifications(websocket: WebSocket, token: str | None = None) -> None:
-    if token is None:
-        ws_logger.info("notification_ws_rejected reason=missing_token")
-        await websocket.close(code=4001)
+    user_id = await _authorize_notification_websocket(websocket, token)
+    if user_id is None:
         return
-    try:
-        payload = _decode_token(token)
-    except HTTPException:
-        ws_logger.info("notification_ws_rejected reason=invalid_token")
-        await websocket.close(code=4001)
-        return
-
-    user_id = int(payload["sub"])
-    db = SessionLocal()
-    try:
-        user = db.get(User, user_id)
-        if user is None or user.deleted_at is not None:
-            ws_logger.info("notification_ws_rejected user_id=%s reason=missing_user", user_id)
-            await websocket.close(code=4001)
-            return
-    finally:
-        db.close()
 
     connected = await notification_manager.connect(user_id, websocket)
     if not connected:

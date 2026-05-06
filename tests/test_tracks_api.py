@@ -297,6 +297,57 @@ def test_upload_master_delivery_increments_delivery_number(client, db_session, f
     assert sorted(delivery.delivery_number for delivery in deliveries) == [1, 2]
 
 
+def test_final_review_reject_to_mastering_keeps_cycle_and_clears_approvals(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="final_review", workflow_cycle=3)
+    delivery = factory.master_delivery(
+        track=track,
+        uploaded_by=mastering,
+        workflow_cycle=3,
+        delivery_number=1,
+    )
+    delivery.producer_approved_at = datetime.now(timezone.utc)
+    delivery.submitter_approved_at = datetime.now(timezone.utc)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/workflow/transition",
+        headers=auth_headers(producer),
+        json={"decision": "reject_to_mastering"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "mastering"
+    assert body["workflow_cycle"] == 3
+    db_session.refresh(delivery)
+    assert delivery.producer_approved_at is None
+    assert delivery.submitter_approved_at is None
+
+    upload_response = client.post(
+        f"/api/tracks/{track.id}/master-deliveries",
+        headers=auth_headers(mastering),
+        files={"file": ("master-v2.mp3", b"ID3master-v2", "audio/mpeg")},
+    )
+
+    assert upload_response.status_code == 200
+    deliveries = db_session.scalars(
+        select(MasterDelivery).where(MasterDelivery.track_id == track.id)
+    ).all()
+    assert sorted((item.workflow_cycle, item.delivery_number) for item in deliveries) == [
+        (3, 1),
+        (3, 2),
+    ]
+
+
 def test_track_playback_preference_defaults_to_zero_gain(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -572,13 +623,59 @@ def test_producer_can_direct_reopen_completed_track_to_mastering(client, factory
     response = client.post(
         f"/api/tracks/{track.id}/reopen",
         headers=auth_headers(producer),
-        json={"target_stage_id": "mastering"},
+        json={"target_stage_id": "mastering", "mastering_notes": "Please keep the dynamics."},
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "mastering"
     assert body["workflow_cycle"] == track.workflow_cycle + 1
+    assert body["mastering_notes"] == "Please keep the dynamics."
+
+
+def test_assign_reviewer_allows_album_producer_and_mastering_engineer(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "peer_review",
+                    "label": "Peer Review",
+                    "type": "review",
+                    "ui_variant": "peer_review",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "producer_gate"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": 2,
+                },
+                {
+                    "id": "producer_gate",
+                    "label": "Producer Gate",
+                    "type": "approval",
+                    "ui_variant": "producer_gate",
+                    "assignee_role": "producer",
+                    "order": 1,
+                    "transitions": {"approve": "__completed"},
+                },
+            ],
+        }
+    )
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/assign-reviewer",
+        headers=auth_headers(producer),
+        json={"user_ids": [producer.id, mastering.id]},
+    )
+
+    assert response.status_code == 200
+    assert {item["user_id"] for item in response.json()} == {producer.id, mastering.id}
 
 
 def test_get_track_detail(client, factory, auth_headers):

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from fastapi import BackgroundTasks
 
 from app import notifications
+from app.models.issue import IssuePhase, IssueStatus
 from app.models.notification import Notification
 from app.models.webhook_delivery import WebhookDelivery
 from app.services import webhook
@@ -320,3 +321,178 @@ def test_try_dispatch_webhook_dedupes_identical_background_tasks(db_session, fac
         )
 
     assert len(background_tasks.tasks) == 1
+
+
+def test_try_dispatch_composer_email_schedules_issue_email(db_session, factory):
+    producer = factory.user(role="producer", username="producer")
+    mastering = factory.user(username="mastering")
+    submitter = factory.user(username="submitter", email="composer@example.com", email_verified=True)
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
+    issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER)
+    album.webhook_config = json.dumps({
+        "email_enabled": True,
+        "email_events": ["new_issue"],
+    })
+    db_session.commit()
+
+    background_tasks = BackgroundTasks()
+    notifications._try_dispatch_composer_email(
+        db_session,
+        background_tasks,
+        album.id,
+        "new_issue",
+        "New issue",
+        "Please fix this track.",
+        None,
+        issue.id,
+        webhook_context={"actor_id": reviewer.id},
+    )
+
+    assert len(background_tasks.tasks) == 1
+    task = background_tasks.tasks[0]
+    assert task.func is notifications._deliver_composer_email_background
+    assert task.args[0] == "composer@example.com"
+    assert task.kwargs["event_type"] == "new_issue"
+    assert task.kwargs["subject"] == "[BackKitchen] New issue"
+    assert task.kwargs["action_url"].endswith(f"/issues/{issue.id}")
+
+
+def test_try_dispatch_composer_email_uses_revision_event_and_track_link(db_session, factory):
+    producer = factory.user(role="producer", username="producer")
+    mastering = factory.user(username="mastering")
+    submitter = factory.user(username="submitter", email="composer@example.com", email_verified=True)
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="peer_revision")
+    album.webhook_config = json.dumps({
+        "email_enabled": True,
+        "email_events": ["revision_requested"],
+    })
+    db_session.commit()
+
+    background_tasks = BackgroundTasks()
+    notifications._try_dispatch_composer_email(
+        db_session,
+        background_tasks,
+        album.id,
+        "track_status_changed",
+        "Track returned for revision",
+        "Please upload a revised version.",
+        track.id,
+        None,
+        webhook_context={"actor_id": producer.id, "composer_email_event": "revision_requested"},
+    )
+
+    assert len(background_tasks.tasks) == 1
+    task = background_tasks.tasks[0]
+    assert task.kwargs["event_type"] == "revision_requested"
+    assert task.kwargs["action_url"].endswith(f"/tracks/{track.id}")
+
+
+def test_try_dispatch_composer_email_respects_disabled_config_and_event_filter(db_session, factory):
+    producer = factory.user(role="producer", username="producer")
+    mastering = factory.user(username="mastering")
+    submitter = factory.user(username="submitter", email="composer@example.com", email_verified=True)
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
+    issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER)
+
+    background_tasks = BackgroundTasks()
+    album.webhook_config = json.dumps({
+        "email_enabled": False,
+        "email_events": ["new_issue"],
+    })
+    db_session.commit()
+    notifications._try_dispatch_composer_email(
+        db_session,
+        background_tasks,
+        album.id,
+        "new_issue",
+        "New issue",
+        "Please fix this track.",
+        track.id,
+        issue.id,
+        webhook_context={"actor_id": reviewer.id},
+    )
+
+    album.webhook_config = json.dumps({
+        "email_enabled": True,
+        "email_events": ["new_comment"],
+    })
+    db_session.commit()
+    notifications._try_dispatch_composer_email(
+        db_session,
+        background_tasks,
+        album.id,
+        "new_issue",
+        "New issue",
+        "Please fix this track.",
+        track.id,
+        issue.id,
+        webhook_context={"actor_id": reviewer.id},
+    )
+
+    assert background_tasks.tasks == []
+
+
+def test_try_dispatch_composer_email_skips_actor_unverified_and_hidden_issue(db_session, factory):
+    producer = factory.user(role="producer", username="producer")
+    mastering = factory.user(username="mastering")
+    submitter = factory.user(username="submitter", email="composer@example.com", email_verified=False)
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
+    issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER)
+    hidden_issue = factory.issue(
+        track=track,
+        author=reviewer,
+        phase=IssuePhase.PEER,
+        status=IssueStatus.PENDING_DISCUSSION,
+    )
+    album.webhook_config = json.dumps({
+        "email_enabled": True,
+        "email_events": ["new_issue", "new_comment"],
+    })
+    db_session.commit()
+
+    background_tasks = BackgroundTasks()
+    notifications._try_dispatch_composer_email(
+        db_session,
+        background_tasks,
+        album.id,
+        "new_issue",
+        "New issue",
+        "Please fix this track.",
+        track.id,
+        issue.id,
+        webhook_context={"actor_id": reviewer.id},
+    )
+
+    submitter.email_verified = True
+    db_session.commit()
+    notifications._try_dispatch_composer_email(
+        db_session,
+        background_tasks,
+        album.id,
+        "new_issue",
+        "New issue",
+        "Please fix this track.",
+        track.id,
+        issue.id,
+        webhook_context={"actor_id": submitter.id},
+    )
+    notifications._try_dispatch_composer_email(
+        db_session,
+        background_tasks,
+        album.id,
+        "new_comment",
+        "New comment",
+        "Please reply.",
+        track.id,
+        hidden_issue.id,
+        webhook_context={"actor_id": reviewer.id},
+    )
+
+    assert background_tasks.tasks == []

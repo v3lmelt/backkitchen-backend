@@ -406,8 +406,12 @@ def _validate_manual_reviewer_selection(
     if track.submitter_id in user_ids:
         raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
 
-    valid_member_ids = get_album_member_ids(db, album.id)
-    invalid_user_ids = [uid for uid in user_ids if uid not in valid_member_ids]
+    valid_reviewer_ids = get_album_member_ids(db, album.id)
+    if album.producer_id is not None:
+        valid_reviewer_ids.add(album.producer_id)
+    if album.mastering_engineer_id is not None:
+        valid_reviewer_ids.add(album.mastering_engineer_id)
+    invalid_user_ids = [uid for uid in user_ids if uid not in valid_reviewer_ids]
     if invalid_user_ids:
         raise HTTPException(
             status_code=400,
@@ -1587,7 +1591,7 @@ def reopen_track(
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
     """Producer or mastering engineer directly reopens a completed track."""
-    from app.workflow_engine import execute_reopen
+    from app.workflow_engine import execute_reopen, get_step_by_id, get_steps, parse_workflow_config
 
     track = db.get(Track, track_id)
     if track is None:
@@ -1597,6 +1601,19 @@ def reopen_track(
         raise HTTPException(status_code=409, detail="Only completed tracks can be reopened.")
     if current_user.id not in (album.producer_id, album.mastering_engineer_id) and not has_admin_role(current_user, "operator"):
         raise HTTPException(status_code=403, detail="Only the producer or mastering engineer can directly reopen.")
+
+    config = parse_workflow_config(album)
+    target_step = get_step_by_id(get_steps(config), payload.target_stage_id)
+    if (
+        payload.mastering_notes is not None
+        and target_step is not None
+        and (
+            target_step.ui_variant == "mastering"
+            or "master" in target_step.id
+            or "mastering" in target_step.id
+        )
+    ):
+        track.mastering_notes = payload.mastering_notes.strip() or None
 
     execute_reopen(db, album, track, current_user, payload.target_stage_id, background_tasks)
     db.commit()

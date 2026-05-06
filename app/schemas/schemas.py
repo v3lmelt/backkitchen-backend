@@ -761,6 +761,8 @@ class WebhookConfig(BaseModel):
     app_id: str = ""
     app_secret: str = ""
     filter_user_ids: list[int] = []
+    email_enabled: bool = False
+    email_events: list[str] = []
 
 
 class WebhookDeliveryRead(BaseModel):
@@ -808,7 +810,7 @@ class WorkflowStepDefSchema(BaseModel):
     # Approval-specific
     allow_permanent_reject: bool | None = None
     # Review-specific
-    assignment_mode: Literal["manual", "auto"] | None = None
+    assignment_mode: Literal["manual", "auto", "fixed"] | None = None
     reviewer_pool: list[int] | None = None
     required_reviewer_count: int | None = Field(default=None, ge=1)
     # Approval/delivery override
@@ -1054,6 +1056,7 @@ class ReopenRequestCreate(BaseModel):
 
 class DirectReopenRequest(BaseModel):
     target_stage_id: str = Field(..., min_length=1, max_length=50)
+    mastering_notes: str | None = Field(default=None, max_length=5000)
 
 
 class ReopenDecisionRequest(BaseModel):
