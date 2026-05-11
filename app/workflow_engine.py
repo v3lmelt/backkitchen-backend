@@ -39,7 +39,10 @@ ASSIGNMENT_ACTIVE_STATUSES = ("pending", "completed")
 ASSIGNMENT_CANCEL_REASON_QUORUM_MET = "quorum_met"
 ASSIGNMENT_CANCEL_REASON_REASSIGNED = "reassigned"
 ASSIGNMENT_CANCEL_REASON_SUPERSEDED = "superseded"
+ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED = "revision_requested"
 REVIEW_FORWARD_DECISIONS = {"pass", "approve"}
+REVIEW_REVISION_POLICY_FIRST_REQUEST = "first_revision_request"
+DIRECT_REVISION_REQUEST_DECISION = "request_revision_now"
 
 
 def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
@@ -67,6 +70,27 @@ def _review_requires_group_finalization(
     assignments: list["StageAssignment"] | None = None,
 ) -> bool:
     return step.type == "review" and _required_reviews_for_assignments(step, assignments) > 1
+
+
+def _review_revision_target(step: "StepDef", steps: list["StepDef"]) -> str | None:
+    if step.type != "review":
+        return None
+    if step.revision_step:
+        return step.revision_step
+    for target in step.transitions.values():
+        target_step = get_step_by_id(steps, target)
+        if target_step and target_step.type == "revision":
+            return target
+    return None
+
+
+def _review_revision_decision(step: "StepDef", revision_target: str | None) -> str | None:
+    if not revision_target:
+        return None
+    for decision, target in step.transitions.items():
+        if target == revision_target:
+            return decision
+    return None
 
 
 def _should_prefer_assignment(candidate: StageAssignment, current: StageAssignment) -> bool:
@@ -343,6 +367,7 @@ class StepDef:
     assignment_mode: str = "manual"  # "manual" | "auto" | "fixed"
     reviewer_pool: list[int] | None = None
     required_reviewer_count: int = 1
+    revision_decision_policy: str | None = None
     # Approval/delivery assignee override
     assignee_user_id: int | None = None
     # Delivery-specific
@@ -404,6 +429,7 @@ def get_steps(config: dict) -> list[StepDef]:
             assignment_mode=s.get("assignment_mode", "manual"),
             reviewer_pool=s.get("reviewer_pool"),
             required_reviewer_count=s.get("required_reviewer_count", 1),
+            revision_decision_policy=s.get("revision_decision_policy"),
             assignee_user_id=s.get("assignee_user_id"),
             require_confirmation=s.get("require_confirmation", False),
             actor_roles=s.get("actor_roles"),
@@ -714,7 +740,11 @@ def prepare_review_assignments_for_stage_entry(
         if assignment.status in ASSIGNMENT_ACTIVE_STATUSES
         or (
             assignment.status == "cancelled"
-            and assignment.cancellation_reason in {None, ASSIGNMENT_CANCEL_REASON_QUORUM_MET}
+            and assignment.cancellation_reason in {
+                None,
+                ASSIGNMENT_CANCEL_REASON_QUORUM_MET,
+                ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED,
+            }
         )
     ]
     canonical_assignments = _dedupe_assignments_by_user(reopenable_assignments)
@@ -752,6 +782,9 @@ def get_allowed_transitions(
     if step is None:
         return []
 
+    steps = get_steps(config)
+    configured_transitions_allowed = True
+
     # Review steps use assignment state rather than the legacy role fallback.
     if step.type == "review":
         if db is None:
@@ -770,36 +803,79 @@ def get_allowed_transitions(
         completed_reviews = sum(1 for assignment in review_assignments if assignment.status == "completed")
         required_reviews = _required_reviews_for_assignments(step, review_assignments)
         quorum_reached = completed_reviews >= required_reviews
-        if user_pending_assignment is None and not (
+        can_finalize_group_review = (
             user_completed_assignment is not None
             and _review_requires_group_finalization(step, review_assignments)
             and quorum_reached
-        ):
+        )
+        configured_transitions_allowed = user_pending_assignment is not None or can_finalize_group_review
+        revision_target = _review_revision_target(step, steps)
+        revision_decision = _review_revision_decision(step, revision_target)
+        can_request_direct_revision = (
+            step.revision_decision_policy == REVIEW_REVISION_POLICY_FIRST_REQUEST
+            and revision_target is not None
+            and revision_decision is not None
+            and (
+                user_pending_assignment is not None
+                or user_completed_assignment is not None
+                and user_completed_assignment.decision == revision_decision
+            )
+        )
+        if user_pending_assignment is None and not (
+            can_finalize_group_review
+        ) and not can_request_direct_revision:
             return []
     elif not user_matches_role(user, album, track, step):
         return []
 
-    steps = get_steps(config)
-
     options: list[TransitionOption] = []
-    for decision, target in step.transitions.items():
-        if not _is_delivery_transition_user_visible(step, decision):
-            continue
-        # Hide transitions whose target step has a lower order than the
-        # current step when they are not explicit rollback actions. This
-        # guards stale forward transitions after step reordering (e.g.
-        # peer_review before intake) while still allowing configured
-        # ``reject_to_*`` rollback targets.
-        if target not in SPECIAL_TARGETS:
-            target_step = get_step_by_id(steps, target)
-            if (
-                target_step
-                and target_step.order < step.order
-                and not decision.startswith("reject_to_")
-            ):
+    if configured_transitions_allowed:
+        for decision, target in step.transitions.items():
+            if not _is_delivery_transition_user_visible(step, decision):
                 continue
-        label = decision.replace("_", " ").title()
-        options.append(TransitionOption(decision=decision, target=target, label=label))
+            # Hide transitions whose target step has a lower order than the
+            # current step when they are not explicit rollback actions. This
+            # guards stale forward transitions after step reordering (e.g.
+            # peer_review before intake) while still allowing configured
+            # ``reject_to_*`` rollback targets.
+            if target not in SPECIAL_TARGETS:
+                target_step = get_step_by_id(steps, target)
+                if (
+                    target_step
+                    and target_step.order < step.order
+                    and not decision.startswith("reject_to_")
+                ):
+                    continue
+            label = decision.replace("_", " ").title()
+            options.append(TransitionOption(decision=decision, target=target, label=label))
+
+    if step.type == "review" and db is not None:
+        review_assignments = _review_active_assignments(db, track.id, step.id)
+        user_pending_assignment = next(
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "pending"),
+            None,
+        )
+        user_completed_assignment = next(
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "completed"),
+            None,
+        )
+        revision_target = _review_revision_target(step, steps)
+        revision_decision = _review_revision_decision(step, revision_target)
+        if (
+            step.revision_decision_policy == REVIEW_REVISION_POLICY_FIRST_REQUEST
+            and revision_target is not None
+            and revision_decision is not None
+            and (
+                user_pending_assignment is not None
+                or user_completed_assignment is not None
+                and user_completed_assignment.decision == revision_decision
+            )
+        ):
+            options.append(TransitionOption(
+                decision=DIRECT_REVISION_REQUEST_DECISION,
+                target=revision_target,
+                label="Request Revision Now",
+            ))
 
     return options
 
@@ -897,6 +973,10 @@ def execute_transition(
             detail=f"Track is in unknown state '{track.status}'.",
         )
 
+    steps = get_steps(config)
+    is_direct_revision_request = decision == DIRECT_REVISION_REQUEST_DECISION
+    revision_target = _review_revision_target(step, steps)
+    revision_decision = _review_revision_decision(step, revision_target)
     review_assignments: list[StageAssignment] = []
     pending_assignment: StageAssignment | None = None
     completed_assignment: StageAssignment | None = None
@@ -925,11 +1005,22 @@ def execute_transition(
         review_requires_group_finalization = _review_requires_group_finalization(step, review_assignments)
         completed_reviews = sum(1 for assignment in review_assignments if assignment.status == "completed")
         quorum_reached = completed_reviews >= required_reviews
+        can_request_direct_revision = (
+            is_direct_revision_request
+            and step.revision_decision_policy == REVIEW_REVISION_POLICY_FIRST_REQUEST
+            and revision_target is not None
+            and revision_decision is not None
+            and (
+                pending_assignment is not None
+                or completed_assignment is not None
+                and completed_assignment.decision == revision_decision
+            )
+        )
         if pending_assignment is None and not (
             completed_assignment is not None
             and review_requires_group_finalization
             and quorum_reached
-        ):
+        ) and not can_request_direct_revision:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You are not authorised to act on this step.",
@@ -940,12 +1031,36 @@ def execute_transition(
             detail="You are not authorised to act on this step.",
         )
 
-    if decision not in step.transitions:
+    if is_direct_revision_request:
+        if step.type != "review":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid decision '{decision}' for step '{step.id}'.",
+            )
+        if step.revision_decision_policy != REVIEW_REVISION_POLICY_FIRST_REQUEST:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Direct revision requests are not enabled for this review step.",
+            )
+        if revision_target is None or revision_decision is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This review step has no revision target.",
+            )
+        if completed_assignment is not None and pending_assignment is None and completed_assignment.decision != revision_decision:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only an existing revision request can be used for direct revision.",
+            )
+        target = revision_target
+    elif decision not in step.transitions:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid decision '{decision}' for step '{step.id}'. "
             f"Valid: {list(step.transitions.keys())}",
         )
+    else:
+        target = step.transitions[decision]
 
     if not _is_delivery_transition_user_visible(step, decision):
         raise HTTPException(
@@ -977,22 +1092,26 @@ def execute_transition(
                 detail="Submit the peer review checklist before finishing the review.",
             )
 
-    target = step.transitions[decision]
     previous_status = track.status
-    steps = get_steps(config)
+    is_revision_suggestion = (
+        step.type == "review"
+        and step.revision_decision_policy == REVIEW_REVISION_POLICY_FIRST_REQUEST
+        and revision_decision is not None
+        and decision == revision_decision
+    )
 
     # NOTE: SQLite serialises all writes via a single-writer lock, so concurrent
     # reviewer submissions are safe — each transaction sees a consistent snapshot
     # of `completed_reviews`.  If migrating to PostgreSQL, add SELECT … FOR UPDATE
     # on the StageAssignment rows to prevent the same race under MVCC.
-    if step.type == "review" and pending_assignment is not None:
+    if step.type == "review" and pending_assignment is not None and not is_direct_revision_request:
         pending_assignment.status = "completed"
         pending_assignment.decision = decision
         pending_assignment.completed_at = datetime.now(timezone.utc)
         db.flush()
 
         finished_reviews = completed_reviews + 1
-        if review_requires_group_finalization:
+        if review_requires_group_finalization or is_revision_suggestion:
             log_track_event(
                 db, track, user,
                 "workflow_review_progress",
@@ -1028,14 +1147,25 @@ def execute_transition(
                     )
             return
 
+    if is_direct_revision_request and pending_assignment is not None:
+        pending_assignment.status = "completed"
+        pending_assignment.decision = revision_decision
+        pending_assignment.completed_at = datetime.now(timezone.utc)
+        db.flush()
+
     if step.type == "review":
         _cancel_pending_review_assignments(
             db,
             track.id,
             step.id,
-            reason=ASSIGNMENT_CANCEL_REASON_QUORUM_MET,
+            reason=(
+                ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED
+                if is_direct_revision_request
+                else ASSIGNMENT_CANCEL_REASON_QUORUM_MET
+            ),
         )
-        _discard_internal_review_issues(db, track, background_tasks, user)
+        if not is_direct_revision_request:
+            _discard_internal_review_issues(db, track, background_tasks, user)
 
     # Producer-direct intake: skip peer review, mark variant accordingly
     if decision == "accept_producer_direct":
@@ -1093,7 +1223,7 @@ def execute_transition(
     # Mark the current user's assignment when it wasn't already handled above.
     if step.type == "review" and pending_assignment and pending_assignment.status == "pending":
         pending_assignment.status = "completed"
-        pending_assignment.decision = decision
+        pending_assignment.decision = revision_decision if is_direct_revision_request else decision
         pending_assignment.completed_at = datetime.now(timezone.utc)
 
     log_track_event(
