@@ -49,6 +49,7 @@ from app.schemas.schemas import (
     WorkflowTransitionRequest,
 )
 from app.workflow_engine import (
+    ASSIGNMENT_ACTIVE_STATUSES,
     compute_reopen_resets,
     prepare_review_assignments_for_stage_entry,
     execute_transition as engine_execute_transition,
@@ -1320,13 +1321,14 @@ def assign_reviewer(
         reviewer_limit=reviewer_limit,
     )
 
-    # Batch-fetch existing pending assignments to avoid N+1
+    # Batch-fetch existing active assignments to avoid N+1 and preserve the
+    # one-active-assignment-per-reviewer invariant.
     already_assigned = set(db.scalars(
         select(StageAssignment.user_id).where(
             StageAssignment.track_id == track_id,
             StageAssignment.stage_id == step.id,
             StageAssignment.user_id.in_(selected_user_ids),
-            StageAssignment.status == "pending",
+            StageAssignment.status.in_(ASSIGNMENT_ACTIVE_STATUSES),
         )
     ).all())
 

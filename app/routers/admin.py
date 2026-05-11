@@ -52,8 +52,11 @@ from app.services.cleanup import cleanup_files, collect_track_files
 from app.workflow import build_track_read, log_track_event
 from app.workflow_engine import (
     ASSIGNMENT_CANCEL_REASON_REASSIGNED,
-    _cancel_pending_review_assignments,
+    _cancel_active_review_assignments,
+    get_step_by_id,
+    get_steps,
     parse_workflow_config,
+    prepare_review_assignments_for_stage_entry,
 )
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -917,6 +920,7 @@ def admin_audit_log(
 def admin_force_status(
     track_id: int,
     payload: AdminForceStatus,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin(ADMIN_ROLE_OPERATOR)),
 ) -> TrackRead:
@@ -940,6 +944,16 @@ def admin_force_status(
     before = _track_snapshot(track)
     old_status = track.status
     track.status = payload.new_status
+    target_step = get_step_by_id(get_steps(config), payload.new_status)
+    if target_step is not None and target_step.type == "review":
+        prepare_review_assignments_for_stage_entry(
+            db,
+            album,
+            track,
+            target_step.id,
+            background_tasks,
+            actor=admin,
+        )
     log_track_event(
         db,
         track,
@@ -1001,7 +1015,7 @@ def admin_reassign(
     old_reviewer_id = track.peer_reviewer_id
     track.peer_reviewer_id = payload.user_ids[0]
 
-    _cancel_pending_review_assignments(
+    _cancel_active_review_assignments(
         db,
         track.id,
         track.status,

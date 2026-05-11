@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 ASSIGNMENT_ACTIVE_STATUSES = ("pending", "completed")
 ASSIGNMENT_CANCEL_REASON_QUORUM_MET = "quorum_met"
 ASSIGNMENT_CANCEL_REASON_REASSIGNED = "reassigned"
+ASSIGNMENT_CANCEL_REASON_SUPERSEDED = "superseded"
 REVIEW_FORWARD_DECISIONS = {"pass", "approve"}
 
 
@@ -90,6 +91,23 @@ def _dedupe_assignments_by_user(assignments: list[StageAssignment]) -> list[Stag
         if _should_prefer_assignment(assignment, current):
             selected[assignment.user_id] = assignment
     return [selected[user_id] for user_id in user_order]
+
+
+def _mark_superseded_active_assignments(
+    assignments: list[StageAssignment],
+    canonical_assignments: list[StageAssignment],
+) -> None:
+    canonical_ids = {
+        assignment.id
+        for assignment in canonical_assignments
+        if assignment.id is not None
+    }
+    for assignment in assignments:
+        if assignment.id in canonical_ids:
+            continue
+        if assignment.status in ASSIGNMENT_ACTIVE_STATUSES:
+            assignment.status = "cancelled"
+            assignment.cancellation_reason = ASSIGNMENT_CANCEL_REASON_SUPERSEDED
 
 
 def _review_active_assignments(
@@ -623,7 +641,7 @@ def assign_peer_reviewer_for_step(
     if step.type != "review":
         return
 
-    _cancel_pending_review_assignments(
+    _cancel_active_review_assignments(
         db,
         track.id,
         step.id,
@@ -690,12 +708,22 @@ def prepare_review_assignments_for_stage_entry(
         assign_peer_reviewer_for_step(db, album, track, step, background_tasks, actor)
         return
 
-    reopened_user_ids: list[int] = []
-    for assignment in existing_assignments:
-        if assignment.status == "completed" or (
+    reopenable_assignments = [
+        assignment
+        for assignment in existing_assignments
+        if assignment.status in ASSIGNMENT_ACTIVE_STATUSES
+        or (
             assignment.status == "cancelled"
             and assignment.cancellation_reason in {None, ASSIGNMENT_CANCEL_REASON_QUORUM_MET}
-        ):
+        )
+    ]
+    canonical_assignments = _dedupe_assignments_by_user(reopenable_assignments)
+    _mark_superseded_active_assignments(existing_assignments, canonical_assignments)
+    db.flush()
+
+    reopened_user_ids: list[int] = []
+    for assignment in canonical_assignments:
+        if assignment.status in {"completed", "cancelled"}:
             assignment.status = "pending"
             assignment.completed_at = None
             assignment.decision = None
@@ -1050,24 +1078,6 @@ def execute_transition(
                         ChecklistItem.source_version_id == source.id,
                     )
                 )
-            # Force-reset all assignments for the target review step via
-            # bulk SQL UPDATE so reviewers must re-review from scratch.
-            db.execute(
-                update(StageAssignment)
-                .where(
-                    StageAssignment.track_id == track.id,
-                    StageAssignment.stage_id == target,
-                    StageAssignment.status.in_(("completed", "cancelled")),
-                )
-                .values(
-                    status="pending",
-                    completed_at=None,
-                    decision=None,
-                    cancellation_reason=None,
-                )
-            )
-            # Expire cached ORM state so subsequent reads see the reset.
-            db.expire_all()
             prepare_review_assignments_for_stage_entry(
                 db,
                 album,
@@ -1498,16 +1508,7 @@ def execute_reopen(
             )
         )
 
-    if target_step.type == "review":
-        _cancel_active_review_assignments(
-            db,
-            track.id,
-            target_step.id,
-            reason=ASSIGNMENT_CANCEL_REASON_REASSIGNED,
-        )
-
     db.flush()
-    db.expire_all()
 
     log_track_event(
         db, track, actor,
@@ -1522,8 +1523,17 @@ def execute_reopen(
         },
     )
 
-    # Auto-assign if entering a review step
-    assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks, actor)
+    if target_step.type == "review":
+        prepare_review_assignments_for_stage_entry(
+            db,
+            album,
+            track,
+            target_step.id,
+            background_tasks,
+            actor,
+        )
+    else:
+        assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks, actor)
 
     # Notify relevant parties
     notify_targets = {track.submitter_id, album.producer_id}

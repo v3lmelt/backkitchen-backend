@@ -4,12 +4,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 PRE_ADMIN_GOVERNANCE_REVISION = "f3a2b1c4d5e6"
 PRE_AUDIT_LOG_REVISION = "f4b5c6d7e8f9"
 PRE_TRACK_DELETE_INTEGRITY_REVISION = "n1o2p3q4r5s6"
-HEAD_REVISION = "p2q3r4s5t6u7"
+PRE_ASSIGNMENT_DEDUPE_REVISION = "p2q3r4s5t6u7"
+HEAD_REVISION = "q3r4s5t6u7v8"
 
 
 def _sqlite_url(db_path: Path) -> str:
@@ -263,6 +266,86 @@ def _create_track_delete_integrity_schema(db_path: Path) -> None:
         conn.close()
 
 
+def _create_duplicate_active_assignment_schema(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            f"""
+            CREATE TABLE users (
+                id INTEGER NOT NULL PRIMARY KEY,
+                created_at DATETIME NOT NULL
+            );
+            INSERT INTO users (id, created_at) VALUES
+                (1, '2026-05-11 00:00:00'),
+                (2, '2026-05-11 00:00:00');
+
+            CREATE TABLE tracks (
+                id INTEGER NOT NULL PRIMARY KEY,
+                created_at DATETIME NOT NULL
+            );
+            INSERT INTO tracks (id, created_at) VALUES (1, '2026-05-11 01:00:00');
+
+            CREATE TABLE stage_assignments (
+                id INTEGER NOT NULL PRIMARY KEY,
+                track_id INTEGER NOT NULL,
+                stage_id VARCHAR(50) NOT NULL,
+                user_id INTEGER NOT NULL,
+                status VARCHAR(20) NOT NULL,
+                assigned_at DATETIME NOT NULL,
+                completed_at DATETIME,
+                decision VARCHAR(50),
+                cancellation_reason VARCHAR(30),
+                FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            INSERT INTO stage_assignments (
+                id, track_id, stage_id, user_id, status, assigned_at, completed_at, decision, cancellation_reason
+            ) VALUES
+                (1, 1, 'peer_review', 1, 'completed', '2026-05-11 02:00:00', '2026-05-11 02:05:00', 'pass', NULL),
+                (2, 1, 'peer_review', 1, 'completed', '2026-05-11 03:00:00', '2026-05-11 03:05:00', 'pass', NULL),
+                (3, 1, 'peer_review', 2, 'completed', '2026-05-11 04:00:00', '2026-05-11 04:05:00', 'pass', NULL),
+                (4, 1, 'peer_review', 2, 'pending', '2026-05-11 05:00:00', NULL, NULL, NULL),
+                (5, 1, 'peer_review', 2, 'completed', '2026-05-11 06:00:00', '2026-05-11 06:05:00', 'pass', NULL),
+                (6, 1, 'peer_review', 1, 'cancelled', '2026-05-11 07:00:00', NULL, NULL, 'reassigned');
+
+            CREATE TABLE issues (
+                id INTEGER NOT NULL PRIMARY KEY,
+                track_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                FOREIGN KEY(track_id) REFERENCES tracks(id)
+            );
+            CREATE TABLE comments (
+                id INTEGER NOT NULL PRIMARY KEY,
+                issue_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                FOREIGN KEY(issue_id) REFERENCES issues(id)
+            );
+            CREATE TABLE issue_images (
+                id INTEGER NOT NULL PRIMARY KEY,
+                issue_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                FOREIGN KEY(issue_id) REFERENCES issues(id)
+            );
+            CREATE TABLE issue_audios (
+                id INTEGER NOT NULL PRIMARY KEY,
+                issue_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                FOREIGN KEY(issue_id) REFERENCES issues(id)
+            );
+            INSERT INTO issues (id, track_id, title) VALUES (1, 1, 'Keep issue');
+            INSERT INTO comments (id, issue_id, content) VALUES (1, 1, 'Keep comment');
+            INSERT INTO issue_images (id, issue_id, file_path) VALUES (1, 1, 'image.png');
+            INSERT INTO issue_audios (id, issue_id, file_path) VALUES (1, 1, 'audio.wav');
+
+            CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
+            INSERT INTO alembic_version (version_num) VALUES ('{PRE_ASSIGNMENT_DEDUPE_REVISION}');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _assert_upgrade_succeeded(db_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
@@ -382,5 +465,68 @@ def test_track_delete_integrity_migration_cleans_stale_links(tmp_path: Path) -> 
             (3, None),
             (4, 1),
         ]
+    finally:
+        conn.close()
+
+
+def test_active_assignment_dedupe_migration_cleans_duplicates_and_preserves_issues(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "active-assignment-dedupe.db"
+    _create_duplicate_active_assignment_schema(db_path)
+
+    result = _run_upgrade(db_path)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            HEAD_REVISION,
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute(
+            """
+            SELECT id, user_id, status, cancellation_reason
+            FROM stage_assignments
+            ORDER BY id
+            """
+        ).fetchall() == [
+            (1, 1, "cancelled", "superseded"),
+            (2, 1, "completed", None),
+            (3, 2, "cancelled", "superseded"),
+            (4, 2, "pending", None),
+            (5, 2, "cancelled", "superseded"),
+            (6, 1, "cancelled", "reassigned"),
+        ]
+        assert conn.execute(
+            """
+            SELECT track_id, stage_id, user_id, COUNT(*)
+            FROM stage_assignments
+            WHERE status IN ('pending', 'completed')
+            GROUP BY track_id, stage_id, user_id
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall() == []
+        assert conn.execute("SELECT * FROM issues").fetchall() == [
+            (1, 1, "Keep issue"),
+        ]
+        assert conn.execute("SELECT * FROM comments").fetchall() == [
+            (1, 1, "Keep comment"),
+        ]
+        assert conn.execute("SELECT * FROM issue_images").fetchall() == [
+            (1, 1, "image.png"),
+        ]
+        assert conn.execute("SELECT * FROM issue_audios").fetchall() == [
+            (1, 1, "audio.wav"),
+        ]
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO stage_assignments (
+                    track_id, stage_id, user_id, status, assigned_at
+                ) VALUES (1, 'peer_review', 1, 'pending', '2026-05-11 08:00:00')
+                """
+            )
     finally:
         conn.close()
