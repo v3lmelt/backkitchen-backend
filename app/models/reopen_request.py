@@ -30,6 +30,6 @@ class ReopenRequest(Base):
     )
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    track: Mapped["Track"] = relationship("Track", foreign_keys=[track_id])  # noqa: F821
+    track: Mapped["Track"] = relationship("Track", back_populates="reopen_requests", foreign_keys=[track_id])  # noqa: F821
     requested_by: Mapped["User"] = relationship("User", foreign_keys=[requested_by_id])  # noqa: F821
     decided_by: Mapped["User | None"] = relationship("User", foreign_keys=[decided_by_id])  # noqa: F821

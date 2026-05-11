@@ -931,6 +931,41 @@ def test_delete_track_removes_audio_file(client, db_session, factory, auth_heade
     assert not audio_path.exists()
 
 
+def test_delete_track_removes_review_assignments_before_track_id_can_be_reused(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
+    album_id = album.id
+    submitter_id = submitter.id
+    track_id = track.id
+    db_session.add(
+        StageAssignment(
+            track_id=track_id,
+            stage_id="peer_review",
+            user_id=reviewer.id,
+            status="completed",
+            decision="needs_revision",
+        )
+    )
+    db_session.commit()
+
+    response = client.delete(f"/api/tracks/{track_id}", headers=auth_headers(submitter))
+
+    assert response.status_code == 204
+    db_session.expire_all()
+    assert db_session.scalars(select(StageAssignment).where(StageAssignment.track_id == track_id)).all() == []
+
+    db_session.expunge_all()
+    replacement = factory.track(
+        album=db_session.get(type(album), album_id),
+        submitter=db_session.get(type(submitter), submitter_id),
+    )
+    assert db_session.scalars(select(StageAssignment).where(StageAssignment.track_id == replacement.id)).all() == []
+
+
 def test_delete_track_removes_issue_images_and_discussion_audios(client, db_session, factory, auth_headers, upload_dir):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
