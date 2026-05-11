@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -8,6 +8,16 @@ from app.database import Base
 
 class StageAssignment(Base):
     __tablename__ = "stage_assignments"
+    __table_args__ = (
+        Index(
+            "uq_stage_assignments_active_track_stage_user",
+            "track_id",
+            "stage_id",
+            "user_id",
+            unique=True,
+            sqlite_where=text("status IN ('pending', 'completed')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     track_id: Mapped[int] = mapped_column(

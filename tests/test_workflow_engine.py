@@ -15,6 +15,7 @@ from app.workflow_engine import (
     _discard_internal_review_issues,
     _notify_assigned_reviewers,
     ASSIGNMENT_CANCEL_REASON_REASSIGNED,
+    ASSIGNMENT_CANCEL_REASON_SUPERSEDED,
     StepDef,
     assign_peer_reviewer_for_step,
     assign_reviewers,
@@ -348,7 +349,7 @@ def test_fixed_review_allows_producer_as_assigned_reviewer(
     assert track.status == "producer_gate"
 
 
-def test_execute_reopen_to_fixed_review_rebuilds_target_assignments(
+def test_execute_reopen_to_fixed_review_reopens_target_assignments(
     db_session,
     factory,
 ):
@@ -441,18 +442,118 @@ def test_execute_reopen_to_fixed_review_rebuilds_target_assignments(
 
     assert track.status == "peer_review"
     assert track.peer_reviewer_id == reviewer_a.id
-    assert [(item.status, item.cancellation_reason) for item in old_assignments] == [
-        ("cancelled", ASSIGNMENT_CANCEL_REASON_REASSIGNED),
-        ("cancelled", ASSIGNMENT_CANCEL_REASON_REASSIGNED),
-    ]
+    assert old_assignments == active_assignments
     assert len(active_assignments) == 2
+    assert {item.id for item in active_assignments} == old_assignment_ids
     assert {item.user_id for item in active_assignments} == {reviewer_a.id, reviewer_b.id}
     assert all(item.status == "pending" for item in active_assignments)
+    assert all(item.cancellation_reason is None for item in active_assignments)
     assert all(item.decision is None for item in active_assignments)
     assert all(item.completed_at is None for item in active_assignments)
 
 
-def test_duplicate_assignment_history_does_not_allow_early_review_finalization(
+def test_prepare_review_assignments_reopens_one_canonical_assignment_per_reviewer(
+    db_session,
+    factory,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer_a = factory.user(username="reviewer_a")
+    reviewer_b = factory.user(username="reviewer_b")
+    workflow_config = {
+        "version": 2,
+        "steps": [
+            {
+                "id": "peer_review",
+                "label": "Peer Review",
+                "type": "review",
+                "ui_variant": "peer_review",
+                "assignee_role": "peer_reviewer",
+                "order": 0,
+                "transitions": {"pass": "producer_gate"},
+                "required_reviewer_count": 2,
+            },
+            {
+                "id": "producer_gate",
+                "label": "Producer Gate",
+                "type": "approval",
+                "assignee_role": "producer",
+                "order": 1,
+                "transitions": {"approve": "__completed"},
+            },
+        ],
+    }
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer_a, reviewer_b],
+        workflow_config=workflow_config,
+        checklist_enabled=False,
+    )
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer_a)
+    old_time = datetime.now(timezone.utc) - timedelta(days=2)
+    mid_time = datetime.now(timezone.utc) - timedelta(days=1)
+    new_time = datetime.now(timezone.utc)
+    db_session.add_all([
+        StageAssignment(
+            track_id=track.id,
+            stage_id="peer_review",
+            user_id=reviewer_a.id,
+            status="completed",
+            decision="pass",
+            assigned_at=old_time,
+            completed_at=old_time,
+        ),
+        StageAssignment(
+            track_id=track.id,
+            stage_id="peer_review",
+            user_id=reviewer_a.id,
+            status="cancelled",
+            cancellation_reason="quorum_met",
+            assigned_at=mid_time,
+        ),
+        StageAssignment(
+            track_id=track.id,
+            stage_id="peer_review",
+            user_id=reviewer_b.id,
+            status="pending",
+            assigned_at=new_time,
+        ),
+    ])
+    db_session.commit()
+
+    execute_reopen(db_session, album, track, producer, "peer_review")
+    db_session.commit()
+
+    assignments = db_session.scalars(
+        select(StageAssignment)
+        .where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id == "peer_review",
+        )
+        .order_by(StageAssignment.user_id.asc(), StageAssignment.assigned_at.asc())
+    ).all()
+    active_assignments = [
+        assignment
+        for assignment in assignments
+        if assignment.status in ("pending", "completed")
+    ]
+
+    assert len(active_assignments) == 2
+    assert {assignment.user_id for assignment in active_assignments} == {
+        reviewer_a.id,
+        reviewer_b.id,
+    }
+    assert all(assignment.status == "pending" for assignment in active_assignments)
+    assert [
+        assignment.cancellation_reason
+        for assignment in assignments
+        if assignment.status == "cancelled"
+    ] == [ASSIGNMENT_CANCEL_REASON_SUPERSEDED]
+
+
+def test_multi_reviewer_assignments_do_not_allow_early_review_finalization(
     db_session,
     factory,
 ):
@@ -494,27 +595,8 @@ def test_duplicate_assignment_history_does_not_allow_early_review_finalization(
         checklist_enabled=False,
     )
     track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer_a)
-    old_time = datetime.now(timezone.utc) - timedelta(days=1)
     new_time = datetime.now(timezone.utc)
     db_session.add_all([
-        StageAssignment(
-            track_id=track.id,
-            stage_id="peer_review",
-            user_id=reviewer_a.id,
-            status="completed",
-            decision="pass",
-            assigned_at=old_time,
-            completed_at=old_time,
-        ),
-        StageAssignment(
-            track_id=track.id,
-            stage_id="peer_review",
-            user_id=reviewer_b.id,
-            status="completed",
-            decision="pass",
-            assigned_at=old_time,
-            completed_at=old_time,
-        ),
         StageAssignment(
             track_id=track.id,
             stage_id="peer_review",
@@ -568,7 +650,13 @@ def test_assign_peer_reviewer_for_step_honors_assignee_override(
         user_id=old_reviewer.id,
         status="pending",
     )
-    db_session.add(existing)
+    completed = StageAssignment(
+        track_id=track.id,
+        stage_id="peer_review",
+        user_id=new_reviewer.id,
+        status="completed",
+    )
+    db_session.add_all([existing, completed])
     db_session.commit()
 
     step = StepDef(
@@ -612,6 +700,7 @@ def test_assign_peer_reviewer_for_step_honors_assignee_override(
     assert track.peer_reviewer_id == new_reviewer.id
     assert [(item.user_id, item.status, item.cancellation_reason) for item in assignments] == [
         (old_reviewer.id, "cancelled", ASSIGNMENT_CANCEL_REASON_REASSIGNED),
+        (new_reviewer.id, "cancelled", ASSIGNMENT_CANCEL_REASON_REASSIGNED),
         (new_reviewer.id, "pending", None),
     ]
     assert notifications == [{

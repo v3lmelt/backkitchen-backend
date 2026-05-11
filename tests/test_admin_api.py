@@ -1,5 +1,10 @@
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+
 from app.models.circle import Circle, CircleMember
 from app.models.reopen_request import ReopenRequest
+from app.models.stage_assignment import StageAssignment
 from app.models.track import TrackStatus
 
 
@@ -237,3 +242,155 @@ def test_dashboard_exposes_reopen_and_audit_metrics(client, db_session, factory,
     assert body["pending_reopen_requests"] == 1
     assert body["suspended_users"] == 1
     assert body["recent_audits"][0]["action"] == "user_suspended"
+
+
+def test_admin_force_status_prepares_review_assignments_without_duplicate_active_rows(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    admin_user = factory.user(username="admin", admin_role="operator", is_admin=True)
+    producer = factory.user(username="producer", role="producer")
+    mastering = factory.user(username="master", role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer_a = factory.user(username="reviewer-a")
+    reviewer_b = factory.user(username="reviewer-b")
+    workflow_config = {
+        "version": 2,
+        "steps": [
+            {
+                "id": "peer_review",
+                "label": "Peer Review",
+                "type": "review",
+                "ui_variant": "peer_review",
+                "assignee_role": "peer_reviewer",
+                "order": 0,
+                "required_reviewer_count": 2,
+                "transitions": {"pass": "mastering"},
+            },
+            {
+                "id": "mastering",
+                "label": "Mastering",
+                "type": "delivery",
+                "assignee_role": "mastering_engineer",
+                "order": 1,
+                "transitions": {},
+            },
+        ],
+    }
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer_a, reviewer_b],
+        workflow_config=workflow_config,
+        checklist_enabled=False,
+    )
+    track = factory.track(album=album, submitter=submitter, status="mastering", peer_reviewer=reviewer_a)
+    now = datetime.now(timezone.utc)
+    db_session.add_all([
+        StageAssignment(
+            track_id=track.id,
+            stage_id="peer_review",
+            user_id=reviewer_a.id,
+            status="completed",
+            decision="pass",
+            assigned_at=now,
+            completed_at=now,
+        ),
+        StageAssignment(
+            track_id=track.id,
+            stage_id="peer_review",
+            user_id=reviewer_b.id,
+            status="pending",
+            assigned_at=now,
+        ),
+    ])
+    db_session.commit()
+
+    response = client.post(
+        f"/api/admin/tracks/{track.id}/force-status",
+        headers=auth_headers(admin_user),
+        json={"new_status": "peer_review", "reason": "Recheck reviews"},
+    )
+
+    assert response.status_code == 200
+    assignments = db_session.scalars(
+        select(StageAssignment)
+        .where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id == "peer_review",
+            StageAssignment.status.in_(["pending", "completed"]),
+        )
+        .order_by(StageAssignment.user_id.asc())
+    ).all()
+    assert len(assignments) == 2
+    assert {assignment.user_id for assignment in assignments} == {
+        reviewer_a.id,
+        reviewer_b.id,
+    }
+    assert all(assignment.status == "pending" for assignment in assignments)
+
+
+def test_admin_reassign_cancels_completed_and_pending_assignments_before_new_assignment(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    admin_user = factory.user(username="admin", admin_role="operator", is_admin=True)
+    producer = factory.user(username="producer", role="producer")
+    mastering = factory.user(username="master", role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer_a = factory.user(username="reviewer-a")
+    reviewer_b = factory.user(username="reviewer-b")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer_a, reviewer_b],
+        checklist_enabled=False,
+    )
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer_a)
+    now = datetime.now(timezone.utc)
+    old_completed = StageAssignment(
+        track_id=track.id,
+        stage_id="peer_review",
+        user_id=reviewer_a.id,
+        status="completed",
+        decision="pass",
+        assigned_at=now,
+        completed_at=now,
+    )
+    old_pending = StageAssignment(
+        track_id=track.id,
+        stage_id="peer_review",
+        user_id=reviewer_b.id,
+        status="pending",
+        assigned_at=now,
+    )
+    db_session.add_all([old_completed, old_pending])
+    db_session.commit()
+
+    response = client.post(
+        f"/api/admin/tracks/{track.id}/reassign",
+        headers=auth_headers(admin_user),
+        json={"user_ids": [reviewer_a.id], "reason": "Restart review"},
+    )
+
+    assert response.status_code == 200
+    assignments = db_session.scalars(
+        select(StageAssignment)
+        .where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id == "peer_review",
+        )
+        .order_by(StageAssignment.id.asc())
+    ).all()
+    assert [
+        (assignment.user_id, assignment.status, assignment.cancellation_reason)
+        for assignment in assignments
+    ] == [
+        (reviewer_a.id, "cancelled", "reassigned"),
+        (reviewer_b.id, "cancelled", "reassigned"),
+        (reviewer_a.id, "pending", None),
+    ]
