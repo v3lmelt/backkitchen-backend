@@ -29,6 +29,7 @@ from app.models.webhook_delivery import WebhookDelivery
 from app.models.workflow_event import WorkflowEvent
 from app.models.workflow_template import WorkflowTemplate
 from app.routers.albums import _album_to_read
+from app.services.track_delete import prepare_track_hard_delete
 from app.schemas.schemas import (
     AdminActivityLogEntry,
     AdminAuditLogRead,
@@ -1305,8 +1306,9 @@ def admin_delete_track(
         before=before,
         after=None,
         album_id=album.id,
-        track_id=track.id,
+        track_id=None,
     )
+    prepare_track_hard_delete(db, track.id)
     db.delete(track)
     db.commit()
     cleanup_files(local_paths, r2_keys)

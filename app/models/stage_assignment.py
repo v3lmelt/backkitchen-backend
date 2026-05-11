@@ -27,5 +27,5 @@ class StageAssignment(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    track: Mapped["Track"] = relationship("Track", foreign_keys=[track_id])  # noqa: F821
+    track: Mapped["Track"] = relationship("Track", back_populates="stage_assignments", foreign_keys=[track_id])  # noqa: F821
     user: Mapped["User"] = relationship("User", foreign_keys=[user_id])  # noqa: F821

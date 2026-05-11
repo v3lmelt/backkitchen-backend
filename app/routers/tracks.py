@@ -63,6 +63,7 @@ from app.notifications import notify
 from app.realtime import broadcast_track_updated
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.audio import extract_audio_metadata
+from app.services.track_delete import prepare_track_hard_delete
 from app.services.upload import stream_upload_sync
 from app.workflow import (
     build_track_detail,
@@ -1911,6 +1912,7 @@ def delete_track(
         raise HTTPException(status_code=403, detail="Only the submitter or producer can delete this track.")
     # Collect all file paths before cascade-deleting DB records
     local_paths, r2_keys = collect_track_files(track)
+    prepare_track_hard_delete(db, track.id)
     db.delete(track)
     db.commit()
     cleanup_files(local_paths, r2_keys)

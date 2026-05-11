@@ -123,6 +123,21 @@ class Track(Base):
         cascade="all, delete-orphan",
         order_by="TrackDiscussion.created_at",
     )
+    stage_assignments: Mapped[list["StageAssignment"]] = relationship(  # noqa: F821
+        "StageAssignment",
+        back_populates="track",
+        cascade="all, delete-orphan",
+    )
+    reopen_requests: Mapped[list["ReopenRequest"]] = relationship(  # noqa: F821
+        "ReopenRequest",
+        back_populates="track",
+        cascade="all, delete-orphan",
+    )
+    playback_preferences: Mapped[list["TrackPlaybackPreference"]] = relationship(  # noqa: F821
+        "TrackPlaybackPreference",
+        back_populates="track",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return f"<Track(id={self.id}, title='{self.title}', status='{self.status}')>"

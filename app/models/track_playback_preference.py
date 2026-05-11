@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
@@ -30,3 +30,5 @@ class TrackPlaybackPreference(Base):
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+
+    track: Mapped["Track"] = relationship("Track", back_populates="playback_preferences")  # noqa: F821

@@ -9,7 +9,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +41,12 @@ def db_engine(tmp_path: Path):
         connect_args={"check_same_thread": False},
         echo=False,
     )
+    @event.listens_for(engine, "connect")
+    def set_sqlite_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     Base.metadata.create_all(bind=engine)
     yield engine
     Base.metadata.drop_all(bind=engine)
