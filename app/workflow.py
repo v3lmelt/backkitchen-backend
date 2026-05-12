@@ -7,7 +7,8 @@ from fastapi import HTTPException, status
 logger = logging.getLogger(__name__)
 
 TRACK_DETAIL_DISCUSSION_SEED_SIZE = 20
-from sqlalchemy import case, func, select
+ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED = "revision_requested"
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.admin_permissions import has_admin_role
@@ -269,7 +270,14 @@ def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
         select(StageAssignment.id).where(
             StageAssignment.track_id == track.id,
             StageAssignment.user_id == user.id,
-            StageAssignment.status.in_(["pending", "completed"]),
+            or_(
+                StageAssignment.status.in_(["pending", "completed"]),
+                (
+                    StageAssignment.status == "cancelled"
+                ) & (
+                    StageAssignment.cancellation_reason == ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED
+                ),
+            ),
         )
     )
     if assignment_id is not None:

@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -33,6 +33,8 @@ from app.schemas.schemas import (
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.upload import stream_upload
+
+ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED = "revision_requested"
 from app.workflow import (
     build_comment_read,
     build_issue_detail_for_user,
@@ -217,7 +219,14 @@ def _phase_reviewer_ids(issue: Issue, track: Track, album: Album, db: Session) -
                 select(StageAssignment.user_id).where(
                     StageAssignment.track_id == track.id,
                     StageAssignment.stage_id.in_(matching_stage_ids),
-                    StageAssignment.status.in_(["pending", "completed"]),
+                    or_(
+                        StageAssignment.status.in_(["pending", "completed"]),
+                        (
+                            StageAssignment.status == "cancelled"
+                        ) & (
+                            StageAssignment.cancellation_reason == ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED
+                        ),
+                    ),
                 )
             ).all()
         )

@@ -813,6 +813,7 @@ class WorkflowStepDefSchema(BaseModel):
     assignment_mode: Literal["manual", "auto", "fixed"] | None = None
     reviewer_pool: list[int] | None = None
     required_reviewer_count: int | None = Field(default=None, ge=1)
+    revision_decision_policy: Literal["quorum_final", "first_revision_request"] | None = None
     # Approval/delivery override
     assignee_user_id: int | None = None
     # Delivery-specific
@@ -906,6 +907,17 @@ class WorkflowConfigSchema(BaseModel):
                     raise ValueError(
                         f"Step '{step.id}' revision_step '{step.revision_step}' "
                         f"must be of type 'revision'"
+                    )
+            if step.revision_decision_policy == "first_revision_request":
+                if step.type != "review":
+                    raise ValueError(
+                        f"Step '{step.id}' can only use revision_decision_policy "
+                        "on review steps"
+                    )
+                if not step.revision_step:
+                    raise ValueError(
+                        f"Step '{step.id}' first_revision_request policy requires "
+                        "a revision_step"
                     )
 
         # Forward transitions must not target steps with a lower order.
