@@ -45,6 +45,9 @@ class Track(Base):
     submitter_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("users.id"), nullable=True, index=True
     )
+    proxy_uploader_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True, index=True
+    )
     peer_reviewer_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("users.id"), nullable=True, index=True
     )
@@ -54,6 +57,7 @@ class Track(Base):
     bpm: Mapped[str | None] = mapped_column(String(100), nullable=True)
     original_title: Mapped[str | None] = mapped_column(String(200), nullable=True)
     original_artist: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    external_submitter_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     track_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(
         String(50),
@@ -89,6 +93,9 @@ class Track(Base):
     album: Mapped["Album"] = relationship("Album", back_populates="tracks")  # noqa: F821
     submitter: Mapped["User | None"] = relationship(  # noqa: F821
         "User", foreign_keys=[submitter_id]
+    )
+    proxy_uploader: Mapped["User | None"] = relationship(  # noqa: F821
+        "User", foreign_keys=[proxy_uploader_id]
     )
     peer_reviewer: Mapped["User | None"] = relationship(  # noqa: F821
         "User", foreign_keys=[peer_reviewer_id]

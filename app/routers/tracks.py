@@ -152,6 +152,40 @@ def _source_version_create(
     )
 
 
+def _validate_proxy_submission(
+    *,
+    album: Album,
+    current_user: User,
+    proxy_submission: bool,
+    external_submitter_name: str | None,
+) -> tuple[str | None, int | None]:
+    external_name = (external_submitter_name or "").strip()
+    if not proxy_submission:
+        if external_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Enable proxy submission before setting an external submitter.",
+            )
+        return None, None
+
+    if album.producer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the album producer can upload on behalf of an external submitter.",
+        )
+    if not external_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="External submitter name is required for proxy submission.",
+        )
+    if len(external_name) > 100:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="External submitter name must be at most 100 characters.",
+        )
+    return external_name, current_user.id
+
+
 def _dedupe_ints(values: list[int]) -> list[int]:
     return list(dict.fromkeys(values))
 
@@ -550,6 +584,8 @@ def create_track(
     original_title: str | None = Form(default=None),
     original_artist: str | None = Form(default=None),
     author_notes: str | None = Form(default=None),
+    proxy_submission: bool = Form(default=False),
+    external_submitter_name: str | None = Form(default=None),
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db),
@@ -559,6 +595,12 @@ def create_track(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
+    external_name, proxy_uploader_id = _validate_proxy_submission(
+        album=album,
+        current_user=current_user,
+        proxy_submission=proxy_submission,
+        external_submitter_name=external_submitter_name,
+    )
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(title)}_v1")
     max_num = db.scalar(
@@ -571,9 +613,11 @@ def create_track(
         artist=artist,
         album_id=album_id,
         submitter_id=current_user.id,
+        proxy_uploader_id=proxy_uploader_id,
         bpm=bpm or None,
         original_title=original_title or None,
         original_artist=original_artist or None,
+        external_submitter_name=external_name,
         author_notes=author_notes or None,
         track_number=max_num + 1,
         file_path=file_path,
@@ -680,6 +724,12 @@ def request_track_upload(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
+    _validate_proxy_submission(
+        album=album,
+        current_user=current_user,
+        proxy_submission=params.proxy_submission,
+        external_submitter_name=params.external_submitter_name,
+    )
 
     from app.services.r2 import make_object_key
 
@@ -708,6 +758,12 @@ def confirm_track_upload(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
+    external_name, proxy_uploader_id = _validate_proxy_submission(
+        album=album,
+        current_user=current_user,
+        proxy_submission=params.proxy_submission,
+        external_submitter_name=params.external_submitter_name,
+    )
 
     _validate_r2_object_key(params.object_key, expected_prefix=f"tracks/new/source/{current_user.id}")
     _verify_r2_object(params.object_key)
@@ -726,9 +782,11 @@ def confirm_track_upload(
         artist=params.artist,
         album_id=params.album_id,
         submitter_id=current_user.id,
+        proxy_uploader_id=proxy_uploader_id,
         bpm=params.bpm or None,
         original_title=params.original_title or None,
         original_artist=params.original_artist or None,
+        external_submitter_name=external_name,
         author_notes=params.author_notes or None,
         track_number=max_num + 1,
         file_path=params.object_key,

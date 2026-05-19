@@ -441,9 +441,12 @@ class TrackRead(TrackBase):
     version: int
     workflow_cycle: int
     submitter_id: int | None = None
+    proxy_uploader_id: int | None = None
     peer_reviewer_id: int | None = None
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
+    external_submitter_name: str | None = None
+    is_proxy_submission: bool = False
     author_notes: str | None = None
     mastering_notes: str | None = None
     is_public: bool = False
@@ -453,6 +456,7 @@ class TrackRead(TrackBase):
     issue_count: int = 0
     open_issue_count: int = 0
     submitter: UserRead | None = None
+    proxy_uploader: UserRead | None = None
     peer_reviewer: UserRead | None = None
     current_source_version: TrackSourceVersionRead | None = None
     current_master_delivery: MasterDeliveryRead | None = None
@@ -1138,6 +1142,8 @@ class RequestTrackUploadParams(RequestUploadParams):
     original_title: str | None = None
     original_artist: str | None = None
     author_notes: str | None = Field(default=None, max_length=5000)
+    proxy_submission: bool = False
+    external_submitter_name: str | None = Field(default=None, max_length=100)
 
 
 class PresignedUploadResponse(BaseModel):
@@ -1164,6 +1170,8 @@ class ConfirmTrackUploadParams(ConfirmUploadParams):
     original_title: str | None = None
     original_artist: str | None = None
     author_notes: str | None = Field(default=None, max_length=5000)
+    proxy_submission: bool = False
+    external_submitter_name: str | None = Field(default=None, max_length=100)
 
 
 class RequestCommentAudioUploadParams(BaseModel):

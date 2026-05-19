@@ -457,9 +457,12 @@ def build_track_read(
         version=track.version,
         workflow_cycle=track.workflow_cycle,
         submitter_id=track.submitter_id,
+        proxy_uploader_id=track.proxy_uploader_id,
         peer_reviewer_id=track.peer_reviewer_id,
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
+        external_submitter_name=None if anonymize else track.external_submitter_name,
+        is_proxy_submission=False if anonymize else bool(track.external_submitter_name and track.proxy_uploader_id),
         created_at=track.created_at,
         updated_at=track.updated_at,
         issue_count=len(visible_issues),
@@ -468,6 +471,11 @@ def build_track_read(
             None
             if anonymize
             else _mask_user_read_if_needed(_user_read(track.submitter), anonymize_user_ids)
+        ),
+        proxy_uploader=(
+            None
+            if anonymize
+            else _mask_user_read_if_needed(_user_read(track.proxy_uploader), anonymize_user_ids)
         ),
         peer_reviewer=(
             None
@@ -708,6 +716,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             selectinload(Track.master_deliveries),
             selectinload(Track.checklist_items),
             selectinload(Track.submitter),
+            selectinload(Track.proxy_uploader),
             selectinload(Track.peer_reviewer),
         )
     )
