@@ -308,7 +308,7 @@ def _validate_status_transition(
     if is_status_handler and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
         return
     is_creator = user.id == issue.author_id
-    if is_creator and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status == IssueStatus.OPEN:
+    if (is_creator or is_status_handler) and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status == IssueStatus.OPEN:
         return
     if is_status_handler and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.INTERNAL_RESOLVED:
         return
@@ -318,7 +318,7 @@ def _validate_status_transition(
     if old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status == IssueStatus.OPEN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the issue creator can publish this reviewer-only issue.",
+            detail="Only the issue creator or assigned reviewers can publish this reviewer-only issue.",
         )
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot perform this status transition.")
