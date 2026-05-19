@@ -159,6 +159,14 @@ def test_post_webhook_rejected_url_persists_failure(db_session, factory, monkeyp
 def test_notify_dedupes_notifications_and_schedules_broadcast_and_webhook(db_session, factory, monkeypatch):
     first = factory.user(username="first")
     second = factory.user(username="second")
+    producer = factory.user(role="producer", username="producer")
+    mastering = factory.user(username="mastering")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[first, second],
+    )
+    track = factory.track(album=album, submitter=first)
 
     broadcast_calls: list[list[int | None]] = []
     webhook_calls: list[dict] = []
@@ -184,20 +192,20 @@ def test_notify_dedupes_notifications_and_schedules_broadcast_and_webhook(db_ses
         "track_status_changed",
         "Title",
         "Body",
-        related_track_id=123,
+        related_track_id=track.id,
         background_tasks=BackgroundTasks(),
-        album_id=77,
+        album_id=album.id,
         webhook_context={"actor_id": first.id},
     )
     db_session.flush()
 
-    rows = db_session.query(Notification).filter_by(related_track_id=123).all()
+    rows = db_session.query(Notification).filter_by(related_track_id=track.id).all()
 
     assert {row.user_id for row in rows} == {first.id, second.id}
     assert len(broadcast_calls) == 1
     assert set(broadcast_calls[0]) == {first.id, second.id}
     assert len(webhook_calls) == 1
-    assert webhook_calls[0]["album_id"] == 77
+    assert webhook_calls[0]["album_id"] == album.id
     assert set(webhook_calls[0]["notified_user_ids"]) == {first.id, second.id}
     assert webhook_calls[0]["webhook_context"] == {"actor_id": first.id}
 

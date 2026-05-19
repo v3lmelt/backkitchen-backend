@@ -372,6 +372,7 @@ def _album_to_read(album: Album, db: Session, *, summary: AlbumStats | None = No
         circle_id=album.circle_id,
         circle_name=album.circle_name,
         checklist_enabled=album.checklist_enabled,
+        quick_followup_enabled=album.quick_followup_enabled,
         genres=genres,
         cover_image=album.cover_image,
         producer_id=album.producer_id,
@@ -609,6 +610,8 @@ def update_album_metadata(
     album.circle_name = payload.circle_name
     if payload.checklist_enabled is not None:
         album.checklist_enabled = payload.checklist_enabled
+    if payload.quick_followup_enabled is not None:
+        album.quick_followup_enabled = payload.quick_followup_enabled
     album.genres = json.dumps(payload.genres, ensure_ascii=False) if payload.genres else None
     db.commit()
     db.refresh(album)

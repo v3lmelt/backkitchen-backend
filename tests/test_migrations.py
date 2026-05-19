@@ -12,7 +12,7 @@ PRE_ADMIN_GOVERNANCE_REVISION = "f3a2b1c4d5e6"
 PRE_AUDIT_LOG_REVISION = "f4b5c6d7e8f9"
 PRE_TRACK_DELETE_INTEGRITY_REVISION = "n1o2p3q4r5s6"
 PRE_ASSIGNMENT_DEDUPE_REVISION = "p2q3r4s5t6u7"
-HEAD_REVISION = "q3r4s5t6u7v8"
+HEAD_REVISION = "s5t6u7v8w9x0"
 
 
 def _sqlite_url(db_path: Path) -> str:
@@ -369,7 +369,23 @@ def _assert_upgrade_succeeded(db_path: Path) -> None:
             row[1] for row in conn.execute("PRAGMA table_info(circles)").fetchall()
         }
         assert "checklist_enabled" in album_columns
+        assert "quick_followup_enabled" in album_columns
         assert "default_checklist_enabled" in circle_columns
+        source_followup_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'source_followup_requests'"
+        ).fetchone()
+        assert source_followup_table == ("source_followup_requests",)
+        source_followup_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(source_followup_requests)").fetchall()
+        }
+        assert {
+            "track_id",
+            "requested_by_id",
+            "applied_source_version_id",
+            "previous_status",
+            "staged_file_path",
+            "staged_storage_backend",
+        }.issubset(source_followup_columns)
         discussion_audio_table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'track_discussion_audios'"
         ).fetchone()

@@ -291,42 +291,12 @@ def _discard_internal_review_issues(
     background_tasks: "BackgroundTasks | None" = None,
     actor: User | None = None,
 ) -> None:
-    """Close unresolved internal-discussion issues as INTERNAL_RESOLVED.
+    """Retain reviewer-only discussion issues when the workflow advances.
 
-    Previously these were deleted outright, which silently removed reviewer
-    feedback.  Now they are resolved internally and their authors are notified.
+    Pending internal discussions remain explicit so reviewers can publish,
+    resolve, or keep discussing them after the track moves to another stage.
     """
-    from app.models.issue import Issue, IssueStatus as _IssueStatus
-
-    pending_issues = list(
-        db.scalars(
-            select(Issue).where(
-                Issue.track_id == track.id,
-                Issue.workflow_cycle == track.workflow_cycle,
-                Issue.status == _IssueStatus.PENDING_DISCUSSION,
-            )
-        ).all()
-    )
-    if not pending_issues:
-        return
-
-    author_ids: set[int] = set()
-    for issue in pending_issues:
-        issue.status = _IssueStatus.INTERNAL_RESOLVED
-        author_ids.add(issue.author_id)
-
-    if background_tasks and author_ids:
-        notify(
-            db,
-            list(author_ids),
-            "issue_status_changed",
-            "内部讨论问题已自动结案",
-            f"由于「{track.title}」已进入修订阶段，{len(pending_issues)} 个待讨论问题已自动内部结案。",
-            related_track_id=track.id,
-            background_tasks=background_tasks,
-            album_id=track.album_id,
-            webhook_context={"actor_id": actor.id, "actor_name": actor.display_name} if actor else None,
-        )
+    return None
 
 
 def _is_delivery_transition_user_visible(step: "StepDef", decision: str) -> bool:

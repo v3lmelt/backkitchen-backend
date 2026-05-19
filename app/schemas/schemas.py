@@ -222,6 +222,7 @@ class AlbumCreate(AlbumBase):
     circle_id: int | None = None
     circle_name: str | None = Field(default=None, max_length=200)
     checklist_enabled: bool | None = None
+    quick_followup_enabled: bool = False
     genres: list[str] | None = None
     mastering_engineer_id: int | None = None
     member_ids: list[int] = Field(default_factory=list)
@@ -238,6 +239,7 @@ class AlbumMetadataUpdate(BaseModel):
     catalog_number: str | None = Field(default=None, max_length=50)
     circle_name: str | None = Field(default=None, max_length=200)
     checklist_enabled: bool | None = None
+    quick_followup_enabled: bool | None = None
     genres: list[str] | None = None
 
 
@@ -287,6 +289,7 @@ class AlbumRead(AlbumBase):
     circle_id: int | None = None
     circle_name: str | None = None
     checklist_enabled: bool
+    quick_followup_enabled: bool
     genres: list[str] | None = None
     cover_image: str | None = None
     producer_id: int | None = None
@@ -412,6 +415,26 @@ class MasterDeliveryRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class SourceFollowupRequestRead(BaseModel):
+    id: int
+    track_id: int
+    requested_by_id: int
+    decided_by_id: int | None = None
+    applied_source_version_id: int | None = None
+    previous_status: str
+    target_stage_id: str | None = None
+    reason: str
+    status: str
+    staged_storage_backend: str
+    staged_duration: float | None = None
+    created_at: datetime
+    decided_at: datetime | None = None
+    requested_by: UserRead | None = None
+    decided_by: UserRead | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class TrackBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     artist: str = Field(..., min_length=1, max_length=100)
@@ -475,6 +498,7 @@ class TrackRead(TrackBase):
     peer_reviewer: UserRead | None = None
     current_source_version: TrackSourceVersionRead | None = None
     current_master_delivery: MasterDeliveryRead | None = None
+    pending_source_followup_request: SourceFollowupRequestRead | None = None
     allowed_actions: list[str] = []
     workflow_step: "WorkflowStepDefSchema | None" = None
     workflow_transitions: list[dict[str, str]] | None = None
@@ -1119,6 +1143,11 @@ class ReopenRequestRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class SourceFollowupDecisionRequest(BaseModel):
+    decision: Literal["approve", "reject"]
+    target_stage_id: str | None = Field(default=None, max_length=50)
+
+
 # ── Workflow template schemas ────────────────────────────────────────────────
 
 
@@ -1183,6 +1212,13 @@ class ConfirmUploadParams(BaseModel):
     revision_notes: str | None = Field(default=None, max_length=5000)
     resolved_issue_ids: list[int] = Field(default_factory=list)
     resolution_note: str | None = Field(default=None, max_length=5000)
+
+
+class ConfirmSourceFollowupUploadParams(BaseModel):
+    upload_id: str
+    object_key: str
+    duration: float | None = None
+    reason: str = Field(..., min_length=1, max_length=2000)
 
 
 class ConfirmTrackUploadParams(ConfirmUploadParams):

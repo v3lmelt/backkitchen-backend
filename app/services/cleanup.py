@@ -49,6 +49,11 @@ def collect_track_files(track: Track) -> tuple[list[Path], list[str]]:
     for sv in track.source_versions:
         _add(sv.file_path, sv.storage_backend)
 
+    # Draft quick follow-up source uploads
+    for req in track.source_followup_requests:
+        if req.status != "applied":
+            _add(req.staged_file_path, req.staged_storage_backend)
+
     # All master delivery audio files
     for md in track.master_deliveries:
         _add(md.file_path, md.storage_backend)

@@ -12,6 +12,7 @@ from app.models.discussion import TrackDiscussion, TrackDiscussionAudio
 from app.models.issue import IssuePhase, IssueStatus
 from app.models.issue_image import IssueImage
 from app.models.master_delivery import MasterDelivery
+from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_playback_preference import TrackPlaybackPreference
@@ -735,6 +736,228 @@ def test_producer_can_direct_reopen_completed_track_to_mastering(client, factory
     assert body["status"] == "mastering"
     assert body["workflow_cycle"] == track.workflow_cycle + 1
     assert body["mastering_notes"] == "Please keep the dynamics."
+
+
+def test_submitter_can_stage_source_followup_when_album_allows_it(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Need to replace a render with clipped intro."},
+        files={"file": ("followup.wav", b"RIFFfollowup", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == TrackStatus.SOURCE_FOLLOWUP_PENDING.value
+    assert body["pending_source_followup_request"]["reason"] == "Need to replace a render with clipped intro."
+    assert "cancel_source_followup" in body["allowed_actions"]
+
+    db_session.refresh(track)
+    assert track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value
+    req = db_session.scalar(select(SourceFollowupRequest).where(SourceFollowupRequest.track_id == track.id))
+    assert req is not None
+    assert req.previous_status == "peer_review"
+    assert req.status == "pending"
+    assert Path(req.staged_file_path).exists()
+    versions = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
+    ).all()
+    assert len(versions) == 1
+
+
+def test_source_followup_approval_applies_new_source_and_invalidates_old_master(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.COMPLETED,
+        workflow_cycle=3,
+    )
+    factory.master_delivery(track=track, uploaded_by=mastering, workflow_cycle=3)
+    original_cycle = track.workflow_cycle
+
+    request_response = client.post(
+        f"/api/tracks/{track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Need a cleaner source before remastering."},
+        files={"file": ("clean.wav", b"RIFFclean", "audio/wav")},
+    )
+    assert request_response.status_code == 200
+    request_id = request_response.json()["pending_source_followup_request"]["id"]
+    req = db_session.get(SourceFollowupRequest, request_id)
+    assert req is not None
+    staged_file_path = req.staged_file_path
+
+    decision_response = client.post(
+        f"/api/tracks/source-followups/{request_id}/decide",
+        headers=auth_headers(producer),
+        json={"decision": "approve", "target_stage_id": "mastering"},
+    )
+
+    assert decision_response.status_code == 200
+    body = decision_response.json()
+    assert body["status"] == "mastering"
+    assert body["version"] == 2
+    assert body["workflow_cycle"] == original_cycle + 1
+    assert body["current_master_delivery"] is None
+    assert body["pending_source_followup_request"] is None
+
+    db_session.refresh(track)
+    db_session.refresh(req)
+    assert track.file_path == staged_file_path
+    assert req.status == "applied"
+    assert req.target_stage_id == "mastering"
+    versions = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
+    ).all()
+    latest = max(versions, key=lambda item: item.version_number)
+    assert len(versions) == 2
+    assert latest.file_path == staged_file_path
+    assert latest.workflow_cycle == original_cycle + 1
+    assert latest.revision_notes == "Need a cleaner source before remastering."
+    assert req.applied_source_version_id == latest.id
+
+
+def test_source_followup_rejection_restores_previous_status_and_deletes_draft(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+
+    request_response = client.post(
+        f"/api/tracks/{track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Wrong export bounced."},
+        files={"file": ("wrong.wav", b"RIFFwrong", "audio/wav")},
+    )
+    assert request_response.status_code == 200
+    request_id = request_response.json()["pending_source_followup_request"]["id"]
+    req = db_session.get(SourceFollowupRequest, request_id)
+    assert req is not None
+    staged_file_path = req.staged_file_path
+    assert Path(staged_file_path).exists()
+
+    decision_response = client.post(
+        f"/api/tracks/source-followups/{request_id}/decide",
+        headers=auth_headers(producer),
+        json={"decision": "reject"},
+    )
+
+    assert decision_response.status_code == 200
+    assert decision_response.json()["status"] == "peer_review"
+    assert decision_response.json()["pending_source_followup_request"] is None
+    assert not Path(staged_file_path).exists()
+
+    db_session.refresh(req)
+    assert req.status == "rejected"
+    versions = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
+    ).all()
+    assert len(versions) == 1
+
+
+def test_source_followup_requires_album_switch_and_non_revision_stage(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    disabled_album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    disabled_track = factory.track(album=disabled_album, submitter=submitter, status="peer_review")
+
+    disabled_response = client.post(
+        f"/api/tracks/{disabled_track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Try outside enabled album."},
+        files={"file": ("followup.wav", b"RIFFfollowup", "audio/wav")},
+    )
+    assert disabled_response.status_code == 403
+
+    enabled_album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    revision_track = factory.track(album=enabled_album, submitter=submitter, status="peer_revision")
+
+    revision_response = client.post(
+        f"/api/tracks/{revision_track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Revision should use the normal upload flow."},
+        files={"file": ("revision.wav", b"RIFFrevision", "audio/wav")},
+    )
+    assert revision_response.status_code == 409
+
+
+def test_mastering_engineer_can_only_approve_mastering_related_source_followup_target(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.COMPLETED)
+    request_response = client.post(
+        f"/api/tracks/{track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Mastering engineer should choose a mastering return target."},
+        files={"file": ("followup.wav", b"RIFFfollowup", "audio/wav")},
+    )
+    assert request_response.status_code == 200
+    request_id = request_response.json()["pending_source_followup_request"]["id"]
+
+    peer_target_response = client.post(
+        f"/api/tracks/source-followups/{request_id}/decide",
+        headers=auth_headers(mastering),
+        json={"decision": "approve", "target_stage_id": "peer_review"},
+    )
+
+    assert peer_target_response.status_code == 403
+    req = db_session.get(SourceFollowupRequest, request_id)
+    assert req is not None
+    assert req.status == "pending"
 
 
 def test_assign_reviewer_allows_album_producer_and_mastering_engineer(client, db_session, factory, auth_headers):

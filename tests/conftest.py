@@ -173,6 +173,7 @@ class Factory:
         title: str | None = None,
         workflow_config: dict | None = None,
         checklist_enabled: bool = True,
+        quick_followup_enabled: bool = False,
     ) -> Album:
         effective_workflow = (
             workflow_config
@@ -186,6 +187,7 @@ class Factory:
             producer_id=producer.id,
             mastering_engineer_id=mastering_engineer.id,
             checklist_enabled=checklist_enabled,
+            quick_followup_enabled=quick_followup_enabled,
             workflow_config=json.dumps(effective_workflow, ensure_ascii=False),
         )
         self.session.add(album)

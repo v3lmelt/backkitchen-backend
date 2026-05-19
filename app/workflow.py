@@ -22,6 +22,8 @@ from app.models.comment_image import CommentImage
 from app.models.issue import Issue, IssueStatus
 from app.models.discussion import TrackDiscussion
 from app.models.master_delivery import MasterDelivery
+from app.models.reopen_request import ReopenRequest
+from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
@@ -490,6 +492,9 @@ def current_master_delivery(track: Track) -> MasterDelivery | None:
     ]
     if current_cycle_deliveries:
         return max(current_cycle_deliveries, key=lambda item: item.delivery_number)
+    latest_source = current_source_version(track)
+    if latest_source is not None and latest_source.workflow_cycle == track.workflow_cycle:
+        return None
     # Fallback: after a reopen the workflow_cycle increments and the new cycle
     # has no deliveries yet.  Return the latest delivery from any previous
     # cycle so the old mastering audio remains playable and viewable.
@@ -503,7 +508,22 @@ def track_allowed_actions(
     from app.workflow_engine import get_allowed_action_names, parse_workflow_config
 
     config = _wf_config or parse_workflow_config(album)
-    return get_allowed_action_names(config, track, user, album, db=db)
+    actions = get_allowed_action_names(config, track, user, album, db=db)
+    if db is None:
+        return actions
+
+    pending_followup = _pending_source_followup_request(db, track.id)
+    if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
+        if pending_followup:
+            if pending_followup.requested_by_id == user.id:
+                actions.append("cancel_source_followup")
+            if user.id in {album.producer_id, album.mastering_engineer_id}:
+                actions.append("decide_source_followup")
+        return actions
+
+    if _can_request_source_followup(db, config, track, user, album):
+        actions.append("request_source_followup")
+    return actions
 
 
 def _user_read(user: User | None) -> UserRead | None:
@@ -540,6 +560,48 @@ def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead
     if delivery is None:
         return None
     return MasterDeliveryRead.model_validate(delivery)
+
+
+def _pending_source_followup_request(db: Session, track_id: int) -> SourceFollowupRequest | None:
+    return db.scalar(
+        select(SourceFollowupRequest)
+        .where(
+            SourceFollowupRequest.track_id == track_id,
+            SourceFollowupRequest.status == "pending",
+        )
+        .order_by(SourceFollowupRequest.created_at.desc())
+    )
+
+
+def _can_request_source_followup(
+    db: Session,
+    wf_config: dict,
+    track: Track,
+    user: User,
+    album: Album,
+) -> bool:
+    if not album.quick_followup_enabled:
+        return False
+    if track.archived_at is not None:
+        return False
+    if track.submitter_id != user.id:
+        return False
+    if track.status in {TrackStatus.REJECTED.value, TrackStatus.SOURCE_FOLLOWUP_PENDING.value}:
+        return False
+    from app.workflow_engine import get_current_step
+
+    step = get_current_step(wf_config, track)
+    if step is not None and step.type == "revision":
+        return False
+    pending_reopen = db.scalar(
+        select(ReopenRequest.id).where(
+            ReopenRequest.track_id == track.id,
+            ReopenRequest.status == "pending",
+        )
+    )
+    if pending_reopen is not None:
+        return False
+    return _pending_source_followup_request(db, track.id) is None
 
 
 def _issue_visible_to_user(issue: Issue, track: Track, user: User) -> bool:
@@ -662,6 +724,9 @@ def build_track_read(
         ),
         current_source_version=_source_version_read(current_source),
         current_master_delivery=_master_delivery_read(current_master),
+        pending_source_followup_request=(
+            None if anonymize else _pending_source_followup_request(db, track.id)
+        ),
         allowed_actions=track_allowed_actions(track, user, album, _wf_config=wf_config, db=db),
         workflow_step=workflow_step,
         workflow_transitions=workflow_transitions,

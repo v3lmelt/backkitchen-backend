@@ -19,6 +19,7 @@ class TrackStatus(str, enum.Enum):
     """
 
     FINAL_REVIEW = "final_review"
+    SOURCE_FOLLOWUP_PENDING = "source_followup_pending"
     COMPLETED = "completed"
     REJECTED = "rejected"
 
@@ -137,6 +138,11 @@ class Track(Base):
     )
     reopen_requests: Mapped[list["ReopenRequest"]] = relationship(  # noqa: F821
         "ReopenRequest",
+        back_populates="track",
+        cascade="all, delete-orphan",
+    )
+    source_followup_requests: Mapped[list["SourceFollowupRequest"]] = relationship(  # noqa: F821
+        "SourceFollowupRequest",
         back_populates="track",
         cascade="all, delete-orphan",
     )
