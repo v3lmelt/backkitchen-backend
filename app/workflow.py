@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -21,6 +22,8 @@ from app.models.comment_image import CommentImage
 from app.models.issue import Issue, IssueStatus
 from app.models.discussion import TrackDiscussion
 from app.models.master_delivery import MasterDelivery
+from app.models.reopen_request import ReopenRequest
+from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
@@ -41,12 +44,15 @@ from app.schemas.schemas import (
     IssueMarkerRead,
     IssueRead,
     MasterDeliveryRead,
+    MentionCandidatesRead,
     TrackDetailResponse,
     TrackRead,
     TrackSourceVersionRead,
     UserRead,
     WorkflowEventRead,
 )
+
+USER_MENTION_PATTERN = re.compile(r"(?<![\w])@user:(\d{1,9})(?![\w])")
 
 
 def next_issue_local_number(db: Session, track_id: int) -> int:
@@ -74,9 +80,183 @@ def discussion_audio_file_url(audio_id: int) -> str:
     return f"/api/discussion-audios/{audio_id}/file"
 
 
+def extract_user_mention_ids(text: str | None) -> list[int]:
+    """Return unique @user:ID mentions in first-seen order."""
+    if not text:
+        return []
+    seen: set[int] = set()
+    result: list[int] = []
+    for match in USER_MENTION_PATTERN.finditer(text):
+        user_id = int(match.group(1))
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        result.append(user_id)
+    return result
+
+
 def get_album_member_ids(db: Session, album_id: int) -> set[int]:
     rows = db.scalars(select(AlbumMember).where(AlbumMember.album_id == album_id)).all()
     return {row.user_id for row in rows}
+
+
+def _mention_candidate_ids(db: Session, track: Track, album: Album) -> list[int]:
+    ordered: list[int] = []
+    seen: set[int] = set()
+
+    def add(user_id: int | None) -> None:
+        if user_id is None or user_id in seen:
+            return
+        seen.add(user_id)
+        ordered.append(user_id)
+
+    add(track.submitter_id)
+    add(album.producer_id)
+    add(album.mastering_engineer_id)
+    add(track.peer_reviewer_id)
+
+    for user_id in db.scalars(
+        select(AlbumMember.user_id).where(AlbumMember.album_id == album.id)
+    ).all():
+        add(user_id)
+
+    for user_id in db.scalars(
+        select(StageAssignment.user_id).where(
+            StageAssignment.track_id == track.id,
+            or_(
+                StageAssignment.status.in_(["pending", "completed"]),
+                (
+                    StageAssignment.status == "cancelled"
+                ) & (
+                    StageAssignment.cancellation_reason == ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED
+                ),
+            ),
+        )
+    ).all():
+        add(user_id)
+
+    return ordered
+
+
+def _active_users_by_id(db: Session, user_ids: list[int]) -> dict[int, User]:
+    if not user_ids:
+        return {}
+    users = db.scalars(select(User).where(User.id.in_(user_ids))).all()
+    return {
+        user.id: user
+        for user in users
+        if user.deleted_at is None and user.suspended_at is None
+    }
+
+
+def _can_user_see_general_track_area(
+    user_id: int,
+    track: Track,
+    album: Album,
+    album_member_ids: set[int],
+    assignment_ids: set[int],
+) -> bool:
+    if user_id in {track.submitter_id, track.peer_reviewer_id, album.producer_id, album.mastering_engineer_id}:
+        return True
+    if user_id in assignment_ids:
+        return True
+    return user_id in album_member_ids and (track.status == TrackStatus.COMPLETED or track.is_public)
+
+
+def _candidate_user_reads(
+    db: Session,
+    ordered_ids: list[int],
+    *,
+    include_ids: set[int],
+    anonymize_user_ids: set[int],
+) -> list[UserRead]:
+    users_by_id = _active_users_by_id(db, ordered_ids)
+    result: list[UserRead] = []
+    for user_id in ordered_ids:
+        if user_id not in include_ids:
+            continue
+        user = users_by_id.get(user_id)
+        if user is None:
+            continue
+        result.append(_mask_user_read_if_needed(_user_read(user), anonymize_user_ids))
+    return [item for item in result if item is not None]
+
+
+def build_mention_candidates(
+    db: Session,
+    track: Track,
+    album: Album,
+    viewer: User,
+    anonymize_user_ids: set[int] | None = None,
+) -> MentionCandidatesRead:
+    """Build per-context @user candidates visible to the current viewer."""
+    anonymize = anonymize_user_ids or peer_identity_anonymize_user_ids_for_viewer(db, track, album, viewer)
+    ordered_ids = _mention_candidate_ids(db, track, album)
+    album_member_ids = get_album_member_ids(db, album.id)
+    assignment_ids = set(
+        db.scalars(
+            select(StageAssignment.user_id).where(
+                StageAssignment.track_id == track.id,
+                or_(
+                    StageAssignment.status.in_(["pending", "completed"]),
+                    (
+                        StageAssignment.status == "cancelled"
+                    ) & (
+                        StageAssignment.cancellation_reason == ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED
+                    ),
+                ),
+            )
+        ).all()
+    )
+    general_ids = {
+        user_id
+        for user_id in ordered_ids
+        if _can_user_see_general_track_area(user_id, track, album, album_member_ids, assignment_ids)
+    }
+
+    viewer_can_see_mastering = is_mastering_participant(viewer, track, album)
+    mastering_ids = (
+        ({track.submitter_id, album.producer_id, album.mastering_engineer_id} & set(ordered_ids))
+        if viewer_can_see_mastering
+        else set()
+    )
+    mastering_ids.discard(None)
+
+    viewer_can_see_internal_issue = viewer.id != track.submitter_id
+    issue_internal_ids = set(general_ids)
+    issue_internal_ids.discard(track.submitter_id)
+    if not viewer_can_see_internal_issue:
+        issue_internal_ids.clear()
+
+    return MentionCandidatesRead(
+        general=_candidate_user_reads(db, ordered_ids, include_ids=general_ids, anonymize_user_ids=anonymize),
+        mastering=_candidate_user_reads(db, ordered_ids, include_ids=mastering_ids, anonymize_user_ids=anonymize),
+        issue_public=_candidate_user_reads(db, ordered_ids, include_ids=general_ids, anonymize_user_ids=anonymize),
+        issue_internal=_candidate_user_reads(db, ordered_ids, include_ids=issue_internal_ids, anonymize_user_ids=anonymize),
+    )
+
+
+def allowed_user_mention_ids(
+    text: str | None,
+    db: Session,
+    track: Track,
+    album: Album,
+    viewer: User,
+    *,
+    context: str,
+) -> list[int]:
+    mentioned_ids = extract_user_mention_ids(text)
+    if not mentioned_ids:
+        return []
+    candidates = build_mention_candidates(db, track, album, viewer)
+    candidate_map = {
+        "general": candidates.general,
+        "mastering": candidates.mastering,
+        "issue_public": candidates.issue_public,
+        "issue_internal": candidates.issue_internal,
+    }
+    allowed_ids = {user.id for user in candidate_map.get(context, [])}
+    return [user_id for user_id in mentioned_ids if user_id in allowed_ids and user_id != viewer.id]
 
 
 def get_all_album_member_ids(db: Session, album_id: int | None = None) -> dict[int, set[int]]:
@@ -312,6 +492,9 @@ def current_master_delivery(track: Track) -> MasterDelivery | None:
     ]
     if current_cycle_deliveries:
         return max(current_cycle_deliveries, key=lambda item: item.delivery_number)
+    latest_source = current_source_version(track)
+    if latest_source is not None and latest_source.workflow_cycle == track.workflow_cycle:
+        return None
     # Fallback: after a reopen the workflow_cycle increments and the new cycle
     # has no deliveries yet.  Return the latest delivery from any previous
     # cycle so the old mastering audio remains playable and viewable.
@@ -325,7 +508,22 @@ def track_allowed_actions(
     from app.workflow_engine import get_allowed_action_names, parse_workflow_config
 
     config = _wf_config or parse_workflow_config(album)
-    return get_allowed_action_names(config, track, user, album, db=db)
+    actions = get_allowed_action_names(config, track, user, album, db=db)
+    if db is None:
+        return actions
+
+    pending_followup = _pending_source_followup_request(db, track.id)
+    if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
+        if pending_followup:
+            if pending_followup.requested_by_id == user.id:
+                actions.append("cancel_source_followup")
+            if user.id in {album.producer_id, album.mastering_engineer_id}:
+                actions.append("decide_source_followup")
+        return actions
+
+    if _can_request_source_followup(db, config, track, user, album):
+        actions.append("request_source_followup")
+    return actions
 
 
 def _user_read(user: User | None) -> UserRead | None:
@@ -362,6 +560,48 @@ def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead
     if delivery is None:
         return None
     return MasterDeliveryRead.model_validate(delivery)
+
+
+def _pending_source_followup_request(db: Session, track_id: int) -> SourceFollowupRequest | None:
+    return db.scalar(
+        select(SourceFollowupRequest)
+        .where(
+            SourceFollowupRequest.track_id == track_id,
+            SourceFollowupRequest.status == "pending",
+        )
+        .order_by(SourceFollowupRequest.created_at.desc())
+    )
+
+
+def _can_request_source_followup(
+    db: Session,
+    wf_config: dict,
+    track: Track,
+    user: User,
+    album: Album,
+) -> bool:
+    if not album.quick_followup_enabled:
+        return False
+    if track.archived_at is not None:
+        return False
+    if track.submitter_id != user.id:
+        return False
+    if track.status in {TrackStatus.REJECTED.value, TrackStatus.SOURCE_FOLLOWUP_PENDING.value}:
+        return False
+    from app.workflow_engine import get_current_step
+
+    step = get_current_step(wf_config, track)
+    if step is not None and step.type == "revision":
+        return False
+    pending_reopen = db.scalar(
+        select(ReopenRequest.id).where(
+            ReopenRequest.track_id == track.id,
+            ReopenRequest.status == "pending",
+        )
+    )
+    if pending_reopen is not None:
+        return False
+    return _pending_source_followup_request(db, track.id) is None
 
 
 def _issue_visible_to_user(issue: Issue, track: Track, user: User) -> bool:
@@ -457,9 +697,12 @@ def build_track_read(
         version=track.version,
         workflow_cycle=track.workflow_cycle,
         submitter_id=track.submitter_id,
+        proxy_uploader_id=track.proxy_uploader_id,
         peer_reviewer_id=track.peer_reviewer_id,
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
+        external_submitter_name=None if anonymize else track.external_submitter_name,
+        is_proxy_submission=False if anonymize else bool(track.external_submitter_name and track.proxy_uploader_id),
         created_at=track.created_at,
         updated_at=track.updated_at,
         issue_count=len(visible_issues),
@@ -469,6 +712,11 @@ def build_track_read(
             if anonymize
             else _mask_user_read_if_needed(_user_read(track.submitter), anonymize_user_ids)
         ),
+        proxy_uploader=(
+            None
+            if anonymize
+            else _mask_user_read_if_needed(_user_read(track.proxy_uploader), anonymize_user_ids)
+        ),
         peer_reviewer=(
             None
             if anonymize
@@ -476,6 +724,9 @@ def build_track_read(
         ),
         current_source_version=_source_version_read(current_source),
         current_master_delivery=_master_delivery_read(current_master),
+        pending_source_followup_request=(
+            None if anonymize else _pending_source_followup_request(db, track.id)
+        ),
         allowed_actions=track_allowed_actions(track, user, album, _wf_config=wf_config, db=db),
         workflow_step=workflow_step,
         workflow_transitions=workflow_transitions,
@@ -708,6 +959,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             selectinload(Track.master_deliveries),
             selectinload(Track.checklist_items),
             selectinload(Track.submitter),
+            selectinload(Track.proxy_uploader),
             selectinload(Track.peer_reviewer),
         )
     )
@@ -850,6 +1102,13 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         master_deliveries=[MasterDeliveryRead.model_validate(d) for d in track.master_deliveries],
         discussions=discussions,
         workflow_config=wf_config_schema,
+        mention_candidates=build_mention_candidates(
+            db,
+            track,
+            album,
+            user,
+            anonymize_user_ids=anonymize_user_ids,
+        ),
     )
 
 

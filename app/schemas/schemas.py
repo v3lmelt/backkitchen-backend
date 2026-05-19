@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.issue import IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.track import RejectionMode, TrackStatus
@@ -83,14 +83,26 @@ class AdminActivityLogEntry(BaseModel):
     album_title: str | None = None
 
 
-class AdminForceStatus(BaseModel):
+class AdminOptionalReasonMixin(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
+
+
+class AdminForceStatus(AdminOptionalReasonMixin):
     new_status: str = Field(..., min_length=1, max_length=50)
-    reason: str = Field(..., min_length=1, max_length=500)
 
 
-class AdminReassign(BaseModel):
+class AdminReassign(AdminOptionalReasonMixin):
     user_ids: list[int] = Field(..., min_length=1)
-    reason: str = Field(..., min_length=1, max_length=500)
 
 
 class AdminReasonPayload(BaseModel):
@@ -102,9 +114,12 @@ class AdminTransferOwnershipRequest(BaseModel):
     reason: str = Field(..., min_length=1, max_length=500)
 
 
-class AdminTrackReopen(BaseModel):
+class AdminTrackReopen(AdminOptionalReasonMixin):
     target_stage_id: str = Field(..., min_length=1, max_length=50)
-    reason: str = Field(..., min_length=1, max_length=500)
+
+
+class AdminOptionalReasonPayload(AdminOptionalReasonMixin):
+    pass
 
 
 class AdminReopenDecision(BaseModel):
@@ -207,6 +222,7 @@ class AlbumCreate(AlbumBase):
     circle_id: int | None = None
     circle_name: str | None = Field(default=None, max_length=200)
     checklist_enabled: bool | None = None
+    quick_followup_enabled: bool = False
     genres: list[str] | None = None
     mastering_engineer_id: int | None = None
     member_ids: list[int] = Field(default_factory=list)
@@ -223,6 +239,7 @@ class AlbumMetadataUpdate(BaseModel):
     catalog_number: str | None = Field(default=None, max_length=50)
     circle_name: str | None = Field(default=None, max_length=200)
     checklist_enabled: bool | None = None
+    quick_followup_enabled: bool | None = None
     genres: list[str] | None = None
 
 
@@ -272,6 +289,7 @@ class AlbumRead(AlbumBase):
     circle_id: int | None = None
     circle_name: str | None = None
     checklist_enabled: bool
+    quick_followup_enabled: bool
     genres: list[str] | None = None
     cover_image: str | None = None
     producer_id: int | None = None
@@ -397,6 +415,26 @@ class MasterDeliveryRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class SourceFollowupRequestRead(BaseModel):
+    id: int
+    track_id: int
+    requested_by_id: int
+    decided_by_id: int | None = None
+    applied_source_version_id: int | None = None
+    previous_status: str
+    target_stage_id: str | None = None
+    reason: str
+    status: str
+    staged_storage_backend: str
+    staged_duration: float | None = None
+    created_at: datetime
+    decided_at: datetime | None = None
+    requested_by: UserRead | None = None
+    decided_by: UserRead | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class TrackBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     artist: str = Field(..., min_length=1, max_length=100)
@@ -441,9 +479,12 @@ class TrackRead(TrackBase):
     version: int
     workflow_cycle: int
     submitter_id: int | None = None
+    proxy_uploader_id: int | None = None
     peer_reviewer_id: int | None = None
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
+    external_submitter_name: str | None = None
+    is_proxy_submission: bool = False
     author_notes: str | None = None
     mastering_notes: str | None = None
     is_public: bool = False
@@ -453,9 +494,11 @@ class TrackRead(TrackBase):
     issue_count: int = 0
     open_issue_count: int = 0
     submitter: UserRead | None = None
+    proxy_uploader: UserRead | None = None
     peer_reviewer: UserRead | None = None
     current_source_version: TrackSourceVersionRead | None = None
     current_master_delivery: MasterDeliveryRead | None = None
+    pending_source_followup_request: SourceFollowupRequestRead | None = None
     allowed_actions: list[str] = []
     workflow_step: "WorkflowStepDefSchema | None" = None
     workflow_transitions: list[dict[str, str]] | None = None
@@ -670,6 +713,7 @@ class TrackDetailResponse(BaseModel):
     master_deliveries: list[MasterDeliveryRead] = []
     discussions: list["DiscussionRead"] = []
     workflow_config: "WorkflowConfigSchema | None" = None
+    mention_candidates: "MentionCandidatesRead" = Field(default_factory=lambda: MentionCandidatesRead())
 
 
 class NotificationRead(BaseModel):
@@ -730,6 +774,13 @@ class DiscussionRead(BaseModel):
     audios: list[DiscussionAudioRead] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class MentionCandidatesRead(BaseModel):
+    general: list[UserRead] = Field(default_factory=list)
+    mastering: list[UserRead] = Field(default_factory=list)
+    issue_public: list[UserRead] = Field(default_factory=list)
+    issue_internal: list[UserRead] = Field(default_factory=list)
 
 
 class DiscussionUpdate(BaseModel):
@@ -1092,6 +1143,11 @@ class ReopenRequestRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class SourceFollowupDecisionRequest(BaseModel):
+    decision: Literal["approve", "reject"]
+    target_stage_id: str | None = Field(default=None, max_length=50)
+
+
 # ── Workflow template schemas ────────────────────────────────────────────────
 
 
@@ -1138,6 +1194,8 @@ class RequestTrackUploadParams(RequestUploadParams):
     original_title: str | None = None
     original_artist: str | None = None
     author_notes: str | None = Field(default=None, max_length=5000)
+    proxy_submission: bool = False
+    external_submitter_name: str | None = Field(default=None, max_length=100)
 
 
 class PresignedUploadResponse(BaseModel):
@@ -1156,6 +1214,13 @@ class ConfirmUploadParams(BaseModel):
     resolution_note: str | None = Field(default=None, max_length=5000)
 
 
+class ConfirmSourceFollowupUploadParams(BaseModel):
+    upload_id: str
+    object_key: str
+    duration: float | None = None
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+
 class ConfirmTrackUploadParams(ConfirmUploadParams):
     album_id: int
     title: str
@@ -1164,6 +1229,8 @@ class ConfirmTrackUploadParams(ConfirmUploadParams):
     original_title: str | None = None
     original_artist: str | None = None
     author_notes: str | None = Field(default=None, max_length=5000)
+    proxy_submission: bool = False
+    external_submitter_name: str | None = Field(default=None, max_length=100)
 
 
 class RequestCommentAudioUploadParams(BaseModel):

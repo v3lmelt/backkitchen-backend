@@ -12,7 +12,6 @@ from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 from app.workflow_engine import (
-    _discard_internal_review_issues,
     _notify_assigned_reviewers,
     ASSIGNMENT_CANCEL_REASON_REASSIGNED,
     ASSIGNMENT_CANCEL_REASON_SUPERSEDED,
@@ -770,13 +769,18 @@ def test_notify_assigned_reviewers_reopened_includes_actor_context(monkeypatch, 
     }]
 
 
-def test_discard_internal_review_issues_includes_actor_context(monkeypatch, db_session, factory):
+def test_review_transition_preserves_pending_discussion_issues(monkeypatch, db_session, factory):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user(username="submitter")
     reviewer = factory.user(username="reviewer")
-    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
-    track = factory.track(album=album, submitter=submitter, status="custom_review", peer_reviewer=reviewer)
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer],
+        checklist_enabled=False,
+    )
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
     issue = factory.issue(
         track=track,
         author=reviewer,
@@ -784,6 +788,13 @@ def test_discard_internal_review_issues_includes_actor_context(monkeypatch, db_s
         status=IssueStatus.PENDING_DISCUSSION,
         source_version_id=track.source_versions[-1].id,
     )
+    db_session.add(StageAssignment(
+        track_id=track.id,
+        stage_id="peer_review",
+        user_id=reviewer.id,
+        status="pending",
+    ))
+    db_session.commit()
     notifications: list[dict] = []
 
     def capture_notify(_db, recipients, event_type, title, body, *_args, **kwargs):
@@ -797,21 +808,11 @@ def test_discard_internal_review_issues_includes_actor_context(monkeypatch, db_s
 
     monkeypatch.setattr("app.workflow_engine.notify", capture_notify)
 
-    _discard_internal_review_issues(db_session, track, BackgroundTasks(), actor=submitter)
+    execute_transition(db_session, album, track, reviewer, "needs_revision", BackgroundTasks())
 
-    assert issue.status == IssueStatus.INTERNAL_RESOLVED
-    assert notifications == [{
-        "recipients": [reviewer.id],
-        "event_type": "issue_status_changed",
-        "title": "内部讨论问题已自动结案",
-        "body": f"由于「{track.title}」已进入修订阶段，1 个待讨论问题已自动内部结案。",
-        "kwargs": {
-            "related_track_id": track.id,
-            "background_tasks": ANY,
-            "album_id": track.album_id,
-            "webhook_context": {"actor_id": submitter.id, "actor_name": submitter.display_name},
-        },
-    }]
+    assert track.status == "peer_revision"
+    assert issue.status == IssueStatus.PENDING_DISCUSSION
+    assert all(notification["event_type"] != "issue_status_changed" for notification in notifications)
 
 
 def test_execute_transition_review_quorum_notification_includes_actor_context(monkeypatch, db_session, factory):

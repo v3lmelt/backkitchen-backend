@@ -17,6 +17,7 @@ from app.models.master_delivery import MasterDelivery
 from app.models.notification import Notification
 from app.models.password_reset import PasswordResetToken
 from app.models.reopen_request import ReopenRequest
+from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_playback_preference import TrackPlaybackPreference
@@ -53,6 +54,7 @@ __all__ = [
     "PasswordResetToken",
     "ReopenRequest",
     "RejectionMode",
+    "SourceFollowupRequest",
     "StageAssignment",
     "Track",
     "TrackPlaybackPreference",

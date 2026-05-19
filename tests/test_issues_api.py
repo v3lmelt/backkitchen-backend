@@ -925,7 +925,7 @@ def test_pending_discussion_visible_after_reviewer_moves_to_open(client, db_sess
     assert visible_detail.status_code == 200
 
 
-def test_non_author_reviewer_cannot_publish_pending_discussion_issue(client, db_session, factory, auth_headers):
+def test_non_author_reviewer_can_publish_pending_discussion_issue(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user(username="submitter")
@@ -990,15 +990,15 @@ def test_non_author_reviewer_cannot_publish_pending_discussion_issue(client, db_
         json={"status": "open"},
     )
 
-    assert publish.status_code == 403
-    assert publish.json()["detail"] == "Only the issue creator can publish this reviewer-only issue."
+    assert publish.status_code == 200
+    assert publish.json()["status"] == IssueStatus.OPEN.value
 
-    hidden_detail = client.get(f"/api/issues/{issue.id}", headers=auth_headers(submitter))
-    assert hidden_detail.status_code == 404
+    visible_detail = client.get(f"/api/issues/{issue.id}", headers=auth_headers(submitter))
+    assert visible_detail.status_code == 200
 
-    hidden_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
-    assert hidden_list.status_code == 200
-    assert all(item["id"] != issue.id for item in hidden_list.json())
+    visible_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
+    assert visible_list.status_code == 200
+    assert any(item["id"] == issue.id for item in visible_list.json())
 
 
 def test_submitter_cannot_change_pending_discussion_status(client, db_session, factory, auth_headers):
@@ -1086,7 +1086,7 @@ def test_internal_resolved_becomes_visible_when_published_open(client, db_sessio
     assert visible_detail.status_code == 200
 
 
-def test_non_author_reviewer_cannot_publish_internal_resolved_issue(client, db_session, factory, auth_headers):
+def test_non_author_reviewer_can_publish_internal_resolved_issue(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     submitter = factory.user(username="submitter")
@@ -1151,15 +1151,15 @@ def test_non_author_reviewer_cannot_publish_internal_resolved_issue(client, db_s
         json={"status": "open"},
     )
 
-    assert publish.status_code == 403
-    assert publish.json()["detail"] == "Only the issue creator can publish this reviewer-only issue."
+    assert publish.status_code == 200
+    assert publish.json()["status"] == IssueStatus.OPEN.value
 
-    hidden_detail = client.get(f"/api/issues/{issue.id}", headers=auth_headers(submitter))
-    assert hidden_detail.status_code == 404
+    visible_detail = client.get(f"/api/issues/{issue.id}", headers=auth_headers(submitter))
+    assert visible_detail.status_code == 200
 
-    hidden_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
-    assert hidden_list.status_code == 200
-    assert all(item["id"] != issue.id for item in hidden_list.json())
+    visible_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
+    assert visible_list.status_code == 200
+    assert any(item["id"] == issue.id for item in visible_list.json())
 
 
 def test_internal_resolved_not_counted_as_open_issue_for_submitter(client, db_session, factory, auth_headers):

@@ -12,6 +12,7 @@ from app.models.discussion import TrackDiscussion, TrackDiscussionAudio
 from app.models.issue import IssuePhase, IssueStatus
 from app.models.issue_image import IssueImage
 from app.models.master_delivery import MasterDelivery
+from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_playback_preference import TrackPlaybackPreference
@@ -54,6 +55,62 @@ def test_create_track_creates_source_version_and_event(client, db_session, facto
     assert [event.event_type for event in events] == ["track_submitted"]
 
 
+def test_create_proxy_track_as_producer_records_external_submitter(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+
+    response = client.post(
+        "/api/tracks",
+        headers=auth_headers(producer),
+        data={
+            "title": "Proxy Song",
+            "artist": "Offline Composer",
+            "album_id": str(album.id),
+            "proxy_submission": "true",
+            "external_submitter_name": "Offline Composer",
+        },
+        files={"file": ("demo.wav", b"RIFFdata", "audio/wav")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["submitter_id"] == producer.id
+    assert body["proxy_uploader_id"] == producer.id
+    assert body["external_submitter_name"] == "Offline Composer"
+    assert body["is_proxy_submission"] is True
+    assert body["submitter"]["id"] == producer.id
+    assert body["proxy_uploader"]["id"] == producer.id
+
+    track = db_session.get(Track, body["id"])
+    assert track.submitter_id == producer.id
+    assert track.proxy_uploader_id == producer.id
+    assert track.external_submitter_name == "Offline Composer"
+    assert track.source_versions[0].uploaded_by_id == producer.id
+
+
+def test_proxy_track_forbidden_for_non_producer(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    member = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[member])
+
+    response = client.post(
+        "/api/tracks",
+        headers=auth_headers(member),
+        data={
+            "title": "Proxy Song",
+            "artist": "Offline Composer",
+            "album_id": str(album.id),
+            "proxy_submission": "true",
+            "external_submitter_name": "Offline Composer",
+        },
+        files={"file": ("demo.wav", b"RIFFdata", "audio/wav")},
+    )
+
+    assert response.status_code == 403
+
+
 def test_list_tracks_respects_submitter_and_reviewer_visibility(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -89,6 +146,32 @@ def test_list_tracks_respects_submitter_and_reviewer_visibility(client, db_sessi
     assert [item["id"] for item in reviewer_response.json()] == [reviewer_track.id]
     assert outsider_response.status_code == 200
     assert outsider_response.json() == []
+
+
+def test_proxy_submitter_identity_is_hidden_from_peer_reviewer(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[reviewer])
+    track = factory.track(
+        album=album,
+        submitter=producer,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    track.external_submitter_name = "Offline Composer"
+    track.proxy_uploader_id = producer.id
+    db_session.commit()
+
+    response = client.get(f"/api/tracks/{track.id}", headers=auth_headers(reviewer))
+
+    assert response.status_code == 200
+    body = response.json()["track"]
+    assert body["artist"] is None
+    assert body["submitter"] is None
+    assert body["proxy_uploader"] is None
+    assert body["external_submitter_name"] is None
+    assert body["is_proxy_submission"] is False
 
 
 def test_list_tracks_hides_rejected_by_default_but_allows_explicit_rejected_filter(client, db_session, factory, auth_headers):
@@ -593,6 +676,28 @@ def test_final_review_requires_two_approvals_to_complete(client, db_session, fac
     assert delivery.submitter_approved_at is not None
 
 
+def test_proxy_track_producer_final_approval_counts_for_submitter(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    track = factory.track(album=album, submitter=producer, status=TrackStatus.FINAL_REVIEW)
+    track.external_submitter_name = "Offline Composer"
+    track.proxy_uploader_id = producer.id
+    delivery = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/final-review/approve",
+        headers=auth_headers(producer),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == TrackStatus.COMPLETED.value
+    db_session.refresh(delivery)
+    assert delivery.producer_approved_at is not None
+    assert delivery.submitter_approved_at is not None
+
+
 def test_submitter_can_request_reopen_to_mastering_after_completion(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -631,6 +736,228 @@ def test_producer_can_direct_reopen_completed_track_to_mastering(client, factory
     assert body["status"] == "mastering"
     assert body["workflow_cycle"] == track.workflow_cycle + 1
     assert body["mastering_notes"] == "Please keep the dynamics."
+
+
+def test_submitter_can_stage_source_followup_when_album_allows_it(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Need to replace a render with clipped intro."},
+        files={"file": ("followup.wav", b"RIFFfollowup", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == TrackStatus.SOURCE_FOLLOWUP_PENDING.value
+    assert body["pending_source_followup_request"]["reason"] == "Need to replace a render with clipped intro."
+    assert "cancel_source_followup" in body["allowed_actions"]
+
+    db_session.refresh(track)
+    assert track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value
+    req = db_session.scalar(select(SourceFollowupRequest).where(SourceFollowupRequest.track_id == track.id))
+    assert req is not None
+    assert req.previous_status == "peer_review"
+    assert req.status == "pending"
+    assert Path(req.staged_file_path).exists()
+    versions = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
+    ).all()
+    assert len(versions) == 1
+
+
+def test_source_followup_approval_applies_new_source_and_invalidates_old_master(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status=TrackStatus.COMPLETED,
+        workflow_cycle=3,
+    )
+    factory.master_delivery(track=track, uploaded_by=mastering, workflow_cycle=3)
+    original_cycle = track.workflow_cycle
+
+    request_response = client.post(
+        f"/api/tracks/{track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Need a cleaner source before remastering."},
+        files={"file": ("clean.wav", b"RIFFclean", "audio/wav")},
+    )
+    assert request_response.status_code == 200
+    request_id = request_response.json()["pending_source_followup_request"]["id"]
+    req = db_session.get(SourceFollowupRequest, request_id)
+    assert req is not None
+    staged_file_path = req.staged_file_path
+
+    decision_response = client.post(
+        f"/api/tracks/source-followups/{request_id}/decide",
+        headers=auth_headers(producer),
+        json={"decision": "approve", "target_stage_id": "mastering"},
+    )
+
+    assert decision_response.status_code == 200
+    body = decision_response.json()
+    assert body["status"] == "mastering"
+    assert body["version"] == 2
+    assert body["workflow_cycle"] == original_cycle + 1
+    assert body["current_master_delivery"] is None
+    assert body["pending_source_followup_request"] is None
+
+    db_session.refresh(track)
+    db_session.refresh(req)
+    assert track.file_path == staged_file_path
+    assert req.status == "applied"
+    assert req.target_stage_id == "mastering"
+    versions = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
+    ).all()
+    latest = max(versions, key=lambda item: item.version_number)
+    assert len(versions) == 2
+    assert latest.file_path == staged_file_path
+    assert latest.workflow_cycle == original_cycle + 1
+    assert latest.revision_notes == "Need a cleaner source before remastering."
+    assert req.applied_source_version_id == latest.id
+
+
+def test_source_followup_rejection_restores_previous_status_and_deletes_draft(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+
+    request_response = client.post(
+        f"/api/tracks/{track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Wrong export bounced."},
+        files={"file": ("wrong.wav", b"RIFFwrong", "audio/wav")},
+    )
+    assert request_response.status_code == 200
+    request_id = request_response.json()["pending_source_followup_request"]["id"]
+    req = db_session.get(SourceFollowupRequest, request_id)
+    assert req is not None
+    staged_file_path = req.staged_file_path
+    assert Path(staged_file_path).exists()
+
+    decision_response = client.post(
+        f"/api/tracks/source-followups/{request_id}/decide",
+        headers=auth_headers(producer),
+        json={"decision": "reject"},
+    )
+
+    assert decision_response.status_code == 200
+    assert decision_response.json()["status"] == "peer_review"
+    assert decision_response.json()["pending_source_followup_request"] is None
+    assert not Path(staged_file_path).exists()
+
+    db_session.refresh(req)
+    assert req.status == "rejected"
+    versions = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
+    ).all()
+    assert len(versions) == 1
+
+
+def test_source_followup_requires_album_switch_and_non_revision_stage(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    disabled_album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    disabled_track = factory.track(album=disabled_album, submitter=submitter, status="peer_review")
+
+    disabled_response = client.post(
+        f"/api/tracks/{disabled_track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Try outside enabled album."},
+        files={"file": ("followup.wav", b"RIFFfollowup", "audio/wav")},
+    )
+    assert disabled_response.status_code == 403
+
+    enabled_album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    revision_track = factory.track(album=enabled_album, submitter=submitter, status="peer_revision")
+
+    revision_response = client.post(
+        f"/api/tracks/{revision_track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Revision should use the normal upload flow."},
+        files={"file": ("revision.wav", b"RIFFrevision", "audio/wav")},
+    )
+    assert revision_response.status_code == 409
+
+
+def test_mastering_engineer_can_only_approve_mastering_related_source_followup_target(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter],
+        quick_followup_enabled=True,
+    )
+    track = factory.track(album=album, submitter=submitter, status=TrackStatus.COMPLETED)
+    request_response = client.post(
+        f"/api/tracks/{track.id}/source-followups",
+        headers=auth_headers(submitter),
+        data={"reason": "Mastering engineer should choose a mastering return target."},
+        files={"file": ("followup.wav", b"RIFFfollowup", "audio/wav")},
+    )
+    assert request_response.status_code == 200
+    request_id = request_response.json()["pending_source_followup_request"]["id"]
+
+    peer_target_response = client.post(
+        f"/api/tracks/source-followups/{request_id}/decide",
+        headers=auth_headers(mastering),
+        json={"decision": "approve", "target_stage_id": "peer_review"},
+    )
+
+    assert peer_target_response.status_code == 403
+    req = db_session.get(SourceFollowupRequest, request_id)
+    assert req is not None
+    assert req.status == "pending"
 
 
 def test_assign_reviewer_allows_album_producer_and_mastering_engineer(client, db_session, factory, auth_headers):
@@ -766,6 +1093,35 @@ def test_upload_source_version_from_peer_revision(client, db_session, factory, a
     body = response.json()
     assert body["status"] == "peer_review"
     assert body["version"] == 2
+
+
+def test_proxy_track_producer_can_upload_submitter_revision(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[reviewer])
+    track = factory.track(
+        album=album,
+        submitter=producer,
+        status="peer_revision",
+        peer_reviewer=reviewer,
+    )
+    track.external_submitter_name = "Offline Composer"
+    track.proxy_uploader_id = producer.id
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(producer),
+        files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "peer_review"
+    assert body["version"] == 2
+    assert body["external_submitter_name"] == "Offline Composer"
+    assert body["is_proxy_submission"] is True
 
 
 def test_upload_source_version_resolves_selected_issues_transactionally(client, db_session, factory, auth_headers):
@@ -1041,6 +1397,63 @@ def test_confirm_track_upload_rejects_unexpected_r2_key(client, factory, auth_he
 
     assert response.status_code == 400
     assert "expected target" in response.json()["detail"]
+
+
+def test_r2_proxy_track_upload_records_external_submitter(client, db_session, factory, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "R2_ENABLED", True)
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.r2",
+        SimpleNamespace(
+            make_object_key=lambda prefix, user_id, filename: f"{prefix}/{user_id}/{filename}",
+            generate_upload_url=lambda object_key, content_type: f"https://upload.example/{object_key}",
+            object_exists=lambda key: True,
+            download_to_temp=lambda key: Path(factory._audio_file(stem="r2-proxy", ext=".wav")),
+        ),
+    )
+
+    request_response = client.post(
+        "/api/tracks/request-upload",
+        headers=auth_headers(producer),
+        json={
+            "filename": "proxy.wav",
+            "content_type": "audio/wav",
+            "file_size": 16,
+            "album_id": album.id,
+            "title": "R2 Proxy Track",
+            "artist": "Offline Composer",
+            "proxy_submission": True,
+            "external_submitter_name": "Offline Composer",
+        },
+    )
+    assert request_response.status_code == 200
+
+    confirm_response = client.post(
+        "/api/tracks/confirm-upload",
+        headers=auth_headers(producer),
+        json={
+            "upload_id": request_response.json()["upload_id"],
+            "object_key": request_response.json()["object_key"],
+            "album_id": album.id,
+            "title": "R2 Proxy Track",
+            "artist": "Offline Composer",
+            "proxy_submission": True,
+            "external_submitter_name": "Offline Composer",
+        },
+    )
+
+    assert confirm_response.status_code == 200
+    body = confirm_response.json()
+    assert body["proxy_uploader_id"] == producer.id
+    assert body["external_submitter_name"] == "Offline Composer"
+    assert body["is_proxy_submission"] is True
+    track = db_session.get(Track, body["id"])
+    assert track.storage_backend == "r2"
+    assert track.proxy_uploader_id == producer.id
+    assert track.external_submitter_name == "Offline Composer"
 
 
 def test_confirm_source_version_upload_rejects_unexpected_r2_key(client, factory, auth_headers, monkeypatch):

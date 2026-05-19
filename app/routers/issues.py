@@ -39,6 +39,7 @@ from app.workflow import (
     build_comment_read,
     build_issue_detail_for_user,
     build_issue_read,
+    allowed_user_mention_ids,
     current_master_delivery,
     current_source_version,
     ensure_track_visibility,
@@ -307,7 +308,7 @@ def _validate_status_transition(
     if is_status_handler and old == IssueStatus.OPEN and new_status in (IssueStatus.RESOLVED, IssueStatus.PENDING_DISCUSSION):
         return
     is_creator = user.id == issue.author_id
-    if is_creator and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status == IssueStatus.OPEN:
+    if (is_creator or is_status_handler) and old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status == IssueStatus.OPEN:
         return
     if is_status_handler and old == IssueStatus.PENDING_DISCUSSION and new_status == IssueStatus.INTERNAL_RESOLVED:
         return
@@ -317,7 +318,7 @@ def _validate_status_transition(
     if old in (IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED) and new_status == IssueStatus.OPEN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the issue creator can publish this reviewer-only issue.",
+            detail="Only the issue creator or assigned reviewers can publish this reviewer-only issue.",
         )
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot perform this status transition.")
@@ -327,6 +328,34 @@ def _status_note_visibility(old_status: IssueStatus, new_status: IssueStatus) ->
     if _is_submitter_hidden_issue_status(old_status) or _is_submitter_hidden_issue_status(new_status):
         return "internal"
     return "public"
+
+
+def _mention_context_for_visibility(visibility: str) -> str:
+    return "issue_internal" if visibility == "internal" else "issue_public"
+
+
+def _notify_user_mentions(
+    db: Session,
+    user_ids: list[int],
+    *,
+    title: str,
+    body: str,
+    track: Track,
+    issue: Issue,
+    background_tasks: BackgroundTasks,
+) -> None:
+    if not user_ids:
+        return
+    notify(
+        db,
+        user_ids,
+        "user_mentioned",
+        title,
+        body,
+        related_track_id=track.id,
+        related_issue_id=issue.id,
+        background_tasks=background_tasks,
+    )
 
 
 @router.post(
@@ -618,6 +647,23 @@ async def create_issue(
                related_track_id=track.id, related_issue_id=issue.id,
                background_tasks=background_tasks, album_id=track.album_id,
                webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
+    mention_context = "issue_internal" if _is_submitter_hidden_issue_status(issue.status) else "issue_public"
+    _notify_user_mentions(
+        db,
+        allowed_user_mention_ids(
+            issue_description,
+            db,
+            track,
+            album,
+            current_user,
+            context=mention_context,
+        ),
+        title="有人提到了你",
+        body=f"「{track.title}」的问题「{issue.title}」中提到了你",
+        track=track,
+        issue=issue,
+        background_tasks=background_tasks,
+    )
     db.commit()
     db.refresh(issue)
     broadcast_track_updated(background_tasks, track.id)
@@ -683,7 +729,7 @@ def get_issue(
     track = db.get(Track, issue.track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
-    ensure_track_visibility(track, current_user, db)
+    album = ensure_track_visibility(track, current_user, db)
     _ensure_issue_visible_to_user(issue, track, current_user)
     return build_issue_detail_for_user(issue, track, current_user, db)
 
@@ -746,8 +792,7 @@ async def update_issue(
     track = db.get(Track, issue.track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
-    album = _album_for_track(track, db)
-    ensure_track_visibility(track, current_user, db)
+    album = ensure_track_visibility(track, current_user, db)
     _ensure_issue_visible_to_user(issue, track, current_user)
     _ensure_issue_update_permission(issue, track, album, current_user, db)
 
@@ -808,6 +853,7 @@ async def update_issue(
 
     new_status = issue.status
     effective_note = (status_note or "").strip()
+    status_note_comment: Comment | None = None
     if (effective_note or images or audios) and old_status != new_status:
         comment = Comment(
             issue_id=issue.id,
@@ -820,6 +866,7 @@ async def update_issue(
         )
         db.add(comment)
         db.flush()
+        status_note_comment = comment
 
         if images:
             from app.config import MAX_IMAGE_UPLOAD_SIZE
@@ -879,6 +926,25 @@ async def update_issue(
             webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name},
         )
 
+    if status_note_comment is not None:
+        note_visibility = status_note_comment.visibility
+        _notify_user_mentions(
+            db,
+            allowed_user_mention_ids(
+                status_note_comment.content,
+                db,
+                track,
+                album,
+                current_user,
+                context=_mention_context_for_visibility(note_visibility),
+            ),
+            title="有人提到了你",
+            body=f"「{track.title}」的问题「{issue.title}」状态备注中提到了你",
+            track=track,
+            issue=issue,
+            background_tasks=background_tasks,
+        )
+
     log_track_event(
         db,
         track,
@@ -927,7 +993,7 @@ async def add_comment(
     track = db.get(Track, issue.track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
-    ensure_track_visibility(track, current_user, db)
+    album = ensure_track_visibility(track, current_user, db)
     _ensure_issue_visible_to_user(issue, track, current_user)
 
     if not effective_content and not images and not audios and not r2_audio_keys:
@@ -1036,6 +1102,22 @@ async def add_comment(
                related_track_id=track.id, related_issue_id=issue.id,
                background_tasks=background_tasks, album_id=track.album_id,
                webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
+    _notify_user_mentions(
+        db,
+        allowed_user_mention_ids(
+            comment.content,
+            db,
+            track,
+            album,
+            current_user,
+            context=_mention_context_for_visibility(comment_visibility),
+        ),
+        title="有人提到了你",
+        body=f"「{track.title}」的问题「{issue.title}」评论中提到了你",
+        track=track,
+        issue=issue,
+        background_tasks=background_tasks,
+    )
 
     db.commit()
     db.refresh(comment)
@@ -1115,6 +1197,7 @@ def batch_update_issues(
         select(Issue).where(Issue.id.in_(payload.issue_ids), Issue.track_id == track_id)
     ).all())
 
+    status_note_comments: list[tuple[Issue, Comment]] = []
     for issue in issues:
         _ensure_issue_visible_to_user(issue, track, current_user)
         _ensure_issue_update_permission(issue, track, album, current_user, db)
@@ -1122,7 +1205,7 @@ def batch_update_issues(
         old_status = issue.status
         issue.status = payload.status
         if payload.status_note and old_status != payload.status:
-            db.add(Comment(
+            comment = Comment(
                 issue_id=issue.id,
                 author_id=current_user.id,
                 content=payload.status_note,
@@ -1130,7 +1213,28 @@ def batch_update_issues(
                 is_status_note=True,
                 old_status=old_status.value,
                 new_status=payload.status.value,
-            ))
+            )
+            db.add(comment)
+            db.flush()
+            status_note_comments.append((issue, comment))
+
+    for issue, comment in status_note_comments:
+        _notify_user_mentions(
+            db,
+            allowed_user_mention_ids(
+                comment.content,
+                db,
+                track,
+                album,
+                current_user,
+                context=_mention_context_for_visibility(comment.visibility),
+            ),
+            title="有人提到了你",
+            body=f"「{track.title}」的问题「{issue.title}」状态备注中提到了你",
+            track=track,
+            issue=issue,
+            background_tasks=background_tasks,
+        )
 
     db.commit()
     broadcast_track_updated(background_tasks, track.id)

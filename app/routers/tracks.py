@@ -19,6 +19,7 @@ from app.models.comment import Comment
 from app.models.issue import Issue, IssueStatus
 from app.models.master_delivery import MasterDelivery
 from app.models.reopen_request import ReopenRequest
+from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus, WorkflowVariant
 from app.models.track_playback_preference import TrackPlaybackPreference
@@ -32,6 +33,7 @@ from app.schemas.schemas import (
     TrackPlaybackPreferenceRead,
     TrackPlaybackPreferenceUpdate,
     ConfirmTrackUploadParams,
+    ConfirmSourceFollowupUploadParams,
     ConfirmUploadParams,
     DirectReopenRequest,
     PresignedUploadResponse,
@@ -41,6 +43,7 @@ from app.schemas.schemas import (
     RequestTrackUploadParams,
     RequestUploadParams,
     SetPublicRequest,
+    SourceFollowupDecisionRequest,
     StageAssignmentRead,
     TrackDetailResponse,
     TrackListItem,
@@ -150,6 +153,40 @@ def _source_version_create(
         uploaded_by_id=user.id,
         revision_notes=revision_notes,
     )
+
+
+def _validate_proxy_submission(
+    *,
+    album: Album,
+    current_user: User,
+    proxy_submission: bool,
+    external_submitter_name: str | None,
+) -> tuple[str | None, int | None]:
+    external_name = (external_submitter_name or "").strip()
+    if not proxy_submission:
+        if external_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Enable proxy submission before setting an external submitter.",
+            )
+        return None, None
+
+    if album.producer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the album producer can upload on behalf of an external submitter.",
+        )
+    if not external_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="External submitter name is required for proxy submission.",
+        )
+    if len(external_name) > 100:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="External submitter name must be at most 100 characters.",
+        )
+    return external_name, current_user.id
 
 
 def _dedupe_ints(values: list[int]) -> list[int]:
@@ -459,6 +496,232 @@ def _ensure_delivery_upload_permission(track: Track, album: Album, current_user:
         raise HTTPException(status_code=403, detail="Only the album mastering engineer can upload this delivery.")
 
 
+def _pending_source_followup_request(db: Session, track_id: int) -> SourceFollowupRequest | None:
+    return db.scalar(
+        select(SourceFollowupRequest)
+        .where(
+            SourceFollowupRequest.track_id == track_id,
+            SourceFollowupRequest.status == "pending",
+        )
+        .order_by(SourceFollowupRequest.created_at.desc())
+    )
+
+
+def _ensure_source_followup_request_allowed(
+    db: Session,
+    *,
+    track: Track,
+    album: Album,
+    current_user: User,
+) -> None:
+    if not album.quick_followup_enabled:
+        raise HTTPException(status_code=403, detail="Quick follow-up is not enabled for this album.")
+    if track.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot request a source follow-up.")
+    if track.submitter_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the track submitter can request a source follow-up.")
+    if track.status == TrackStatus.REJECTED.value:
+        raise HTTPException(status_code=409, detail="Rejected tracks must use the resubmit flow.")
+    if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
+        raise HTTPException(status_code=409, detail="A source follow-up request is already pending.")
+
+    step = engine_get_current_step(engine_parse_workflow_config(album), track)
+    if step is not None and step.type == "revision":
+        raise HTTPException(status_code=409, detail="Revision stages already allow source uploads.")
+
+    pending_reopen = db.scalar(
+        select(ReopenRequest.id).where(
+            ReopenRequest.track_id == track.id,
+            ReopenRequest.status == "pending",
+        )
+    )
+    if pending_reopen is not None:
+        raise HTTPException(status_code=409, detail="A reopen request is already pending.")
+    if _pending_source_followup_request(db, track.id) is not None:
+        raise HTTPException(status_code=409, detail="A source follow-up request is already pending.")
+
+
+def _delete_source_followup_draft(req: SourceFollowupRequest) -> None:
+    try:
+        if req.staged_storage_backend == "r2":
+            from app.services.r2 import delete_object
+
+            delete_object(req.staged_file_path)
+        else:
+            Path(req.staged_file_path).unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to delete source follow-up draft %s", req.staged_file_path, exc_info=True)
+
+
+def _create_source_followup_request(
+    db: Session,
+    *,
+    album: Album,
+    track: Track,
+    current_user: User,
+    background_tasks: BackgroundTasks,
+    reason: str,
+    file_path: str,
+    storage_backend: str,
+    duration: float | None,
+) -> TrackRead:
+    clean_reason = reason.strip()
+    if not clean_reason:
+        raise HTTPException(status_code=422, detail="A source follow-up reason is required.")
+
+    _ensure_source_followup_request_allowed(
+        db,
+        track=track,
+        album=album,
+        current_user=current_user,
+    )
+
+    previous_status = track.status
+    req = SourceFollowupRequest(
+        track_id=track.id,
+        requested_by_id=current_user.id,
+        previous_status=previous_status,
+        reason=clean_reason,
+        staged_file_path=file_path,
+        staged_storage_backend=storage_backend,
+        staged_duration=duration,
+    )
+    track.status = TrackStatus.SOURCE_FOLLOWUP_PENDING.value
+    db.add(req)
+    db.flush()
+
+    log_track_event(
+        db,
+        track,
+        current_user,
+        "source_followup_requested",
+        from_status=previous_status,
+        to_status=track.status,
+        payload={"request_id": req.id},
+    )
+    notify_targets = {album.producer_id}
+    if album.mastering_engineer_id:
+        notify_targets.add(album.mastering_engineer_id)
+    notify_targets.discard(None)
+    notify_targets.discard(current_user.id)
+    if notify_targets:
+        notify(
+            db,
+            list(notify_targets),
+            "source_followup_request",
+            "源音频补交申请",
+            f"{current_user.display_name} 请求为「{track.title}」补交新的源音频。",
+            related_track_id=track.id,
+            background_tasks=background_tasks,
+            album_id=track.album_id,
+            webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name},
+        )
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track.id)
+    return build_track_read(track, current_user, album, db=db)
+
+
+def _target_is_mastering_related(step: object) -> bool:
+    step_id = getattr(step, "id", "")
+    ui_variant = getattr(step, "ui_variant", None)
+    return (
+        getattr(step, "type", None) == "delivery"
+        or ui_variant == "mastering"
+        or "master" in step_id
+        or "mastering" in step_id
+    )
+
+
+def _validate_source_followup_target(album: Album, target_stage_id: str):
+    from app.workflow_engine import get_step_by_id, get_steps, should_new_cycle
+
+    config = engine_parse_workflow_config(album)
+    steps = get_steps(config)
+    target_step = get_step_by_id(steps, target_stage_id)
+    if target_step is None:
+        raise HTTPException(status_code=400, detail="Target stage is not part of this album workflow.")
+    if target_step.type == "revision":
+        raise HTTPException(status_code=400, detail="Source follow-up cannot target a revision stage.")
+    if not should_new_cycle(steps, target_step):
+        raise HTTPException(status_code=400, detail="Source follow-up must return before or at the first delivery stage.")
+    return target_step
+
+
+def _ensure_source_followup_decider(
+    *,
+    album: Album,
+    current_user: User,
+    target_step: object | None = None,
+) -> None:
+    if current_user.id == album.producer_id:
+        return
+    if (
+        target_step is not None
+        and album.mastering_engineer_id == current_user.id
+        and _target_is_mastering_related(target_step)
+    ):
+        return
+    if target_step is None and album.mastering_engineer_id == current_user.id:
+        return
+    raise HTTPException(status_code=403, detail="Only the producer or relevant mastering engineer can decide this request.")
+
+
+def _apply_source_followup_request(
+    db: Session,
+    *,
+    album: Album,
+    track: Track,
+    req: SourceFollowupRequest,
+    actor: User,
+    target_stage_id: str,
+    background_tasks: BackgroundTasks,
+) -> None:
+    from app.workflow_engine import execute_reopen
+
+    target_step = _validate_source_followup_target(album, target_stage_id)
+    _ensure_source_followup_decider(album=album, current_user=actor, target_step=target_step)
+
+    execute_reopen(db, album, track, actor, target_stage_id, background_tasks)
+    track.version += 1
+    track.file_path = req.staged_file_path
+    track.storage_backend = req.staged_storage_backend
+    track.duration = req.staged_duration
+
+    requester = db.get(User, req.requested_by_id) or actor
+    source_version = _source_version_create(
+        track,
+        requester,
+        req.staged_file_path,
+        req.staged_duration,
+        revision_notes=req.reason,
+        storage_backend=req.staged_storage_backend,
+    )
+    db.add(source_version)
+    db.flush()
+
+    req.status = "applied"
+    req.target_stage_id = target_stage_id
+    req.decided_by_id = actor.id
+    req.decided_at = datetime.now(timezone.utc)
+    req.applied_source_version_id = source_version.id
+
+    log_track_event(
+        db,
+        track,
+        actor,
+        "source_followup_applied",
+        from_status=TrackStatus.SOURCE_FOLLOWUP_PENDING.value,
+        to_status=track.status,
+        payload={
+            "request_id": req.id,
+            "target_stage": target_stage_id,
+            "version": track.version,
+            "workflow_cycle": track.workflow_cycle,
+        },
+    )
+
+
 def _ensure_delivery_confirm_permission(track: Track, album: Album, current_user: User) -> None:
     config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
@@ -550,6 +813,8 @@ def create_track(
     original_title: str | None = Form(default=None),
     original_artist: str | None = Form(default=None),
     author_notes: str | None = Form(default=None),
+    proxy_submission: bool = Form(default=False),
+    external_submitter_name: str | None = Form(default=None),
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db),
@@ -559,6 +824,12 @@ def create_track(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
+    external_name, proxy_uploader_id = _validate_proxy_submission(
+        album=album,
+        current_user=current_user,
+        proxy_submission=proxy_submission,
+        external_submitter_name=external_submitter_name,
+    )
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(title)}_v1")
     max_num = db.scalar(
@@ -571,9 +842,11 @@ def create_track(
         artist=artist,
         album_id=album_id,
         submitter_id=current_user.id,
+        proxy_uploader_id=proxy_uploader_id,
         bpm=bpm or None,
         original_title=original_title or None,
         original_artist=original_artist or None,
+        external_submitter_name=external_name,
         author_notes=author_notes or None,
         track_number=max_num + 1,
         file_path=file_path,
@@ -680,6 +953,12 @@ def request_track_upload(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
+    _validate_proxy_submission(
+        album=album,
+        current_user=current_user,
+        proxy_submission=params.proxy_submission,
+        external_submitter_name=params.external_submitter_name,
+    )
 
     from app.services.r2 import make_object_key
 
@@ -708,6 +987,12 @@ def confirm_track_upload(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
+    external_name, proxy_uploader_id = _validate_proxy_submission(
+        album=album,
+        current_user=current_user,
+        proxy_submission=params.proxy_submission,
+        external_submitter_name=params.external_submitter_name,
+    )
 
     _validate_r2_object_key(params.object_key, expected_prefix=f"tracks/new/source/{current_user.id}")
     _verify_r2_object(params.object_key)
@@ -726,9 +1011,11 @@ def confirm_track_upload(
         artist=params.artist,
         album_id=params.album_id,
         submitter_id=current_user.id,
+        proxy_uploader_id=proxy_uploader_id,
         bpm=params.bpm or None,
         original_title=params.original_title or None,
         original_artist=params.original_artist or None,
+        external_submitter_name=external_name,
         author_notes=params.author_notes or None,
         track_number=max_num + 1,
         file_path=params.object_key,
@@ -852,6 +1139,67 @@ def confirm_source_version_upload(
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
+
+
+@router.post("/{track_id}/source-followups/request-upload", response_model=PresignedUploadResponse)
+def request_source_followup_upload(
+    track_id: int,
+    params: RequestUploadParams,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PresignedUploadResponse:
+    _ensure_r2_enabled()
+    _validate_audio_extension(params.filename)
+    _validate_audio_size(params.file_size)
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    _ensure_source_followup_request_allowed(db, track=track, album=album, current_user=current_user)
+
+    from app.services.r2 import make_object_key
+
+    object_key = make_object_key(f"tracks/{track_id}/source-followups", current_user.id, params.filename)
+    return _presign_upload(object_key, params.content_type)
+
+
+@router.post("/{track_id}/source-followups/confirm-upload", response_model=TrackRead)
+def confirm_source_followup_upload(
+    track_id: int,
+    params: ConfirmSourceFollowupUploadParams,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    _ensure_r2_enabled()
+
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    _ensure_source_followup_request_allowed(db, track=track, album=album, current_user=current_user)
+    _validate_r2_object_key(
+        params.object_key,
+        expected_prefix=f"tracks/{track_id}/source-followups/{current_user.id}",
+    )
+    _verify_r2_object(params.object_key)
+
+    duration, _bitrate, _sample_rate = _extract_r2_metadata(params.object_key)
+    if params.duration is not None and duration is None:
+        duration = params.duration
+
+    return _create_source_followup_request(
+        db,
+        album=album,
+        track=track,
+        current_user=current_user,
+        background_tasks=background_tasks,
+        reason=params.reason,
+        file_path=params.object_key,
+        storage_backend="r2",
+        duration=duration,
+    )
 
 
 @router.post("/{track_id}/master-deliveries/request-upload", response_model=PresignedUploadResponse)
@@ -1669,6 +2017,152 @@ def decide_reopen_request(
     db.commit()
     db.refresh(req)
     return ReopenRequestRead.model_validate(req)
+
+
+@router.post("/{track_id}/source-followups", response_model=TrackRead)
+def create_source_followup_request(
+    track_id: int,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    reason: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    _ensure_source_followup_request_allowed(db, track=track, album=album, current_user=current_user)
+
+    file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_followup_{uuid.uuid4().hex[:8]}")
+    return _create_source_followup_request(
+        db,
+        album=album,
+        track=track,
+        current_user=current_user,
+        background_tasks=background_tasks,
+        reason=reason,
+        file_path=file_path,
+        storage_backend="local",
+        duration=duration,
+    )
+
+
+@router.post("/source-followups/{request_id}/decide", response_model=TrackRead)
+def decide_source_followup_request(
+    request_id: int,
+    payload: SourceFollowupDecisionRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    req = db.get(SourceFollowupRequest, request_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail="Source follow-up request not found.")
+    track = db.get(Track, req.track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if req.status != "pending":
+        raise HTTPException(status_code=409, detail="This source follow-up request is not pending.")
+
+    if payload.decision == "approve":
+        if not payload.target_stage_id:
+            raise HTTPException(status_code=422, detail="A target stage is required to approve source follow-up.")
+        _apply_source_followup_request(
+            db,
+            album=album,
+            track=track,
+            req=req,
+            actor=current_user,
+            target_stage_id=payload.target_stage_id,
+            background_tasks=background_tasks,
+        )
+        notify(
+            db,
+            [req.requested_by_id],
+            "source_followup_approved",
+            "源音频补交已通过",
+            f"「{track.title}」的源音频补交已通过，流程已返回待处理阶段。",
+            related_track_id=track.id,
+            background_tasks=background_tasks,
+            album_id=track.album_id,
+            webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name},
+        )
+    else:
+        _ensure_source_followup_decider(album=album, current_user=current_user)
+        previous_status = track.status
+        if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
+            track.status = req.previous_status
+        req.status = "rejected"
+        req.decided_by_id = current_user.id
+        req.decided_at = datetime.now(timezone.utc)
+        _delete_source_followup_draft(req)
+        log_track_event(
+            db,
+            track,
+            current_user,
+            "source_followup_rejected",
+            from_status=previous_status,
+            to_status=track.status,
+            payload={"request_id": req.id},
+        )
+        notify(
+            db,
+            [req.requested_by_id],
+            "source_followup_rejected",
+            "源音频补交未通过",
+            f"「{track.title}」的源音频补交申请未通过。",
+            related_track_id=track.id,
+            background_tasks=background_tasks,
+            album_id=track.album_id,
+            webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name},
+        )
+
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track.id)
+    return build_track_read(track, current_user, album, db=db)
+
+
+@router.post("/source-followups/{request_id}/cancel", response_model=TrackRead)
+def cancel_source_followup_request(
+    request_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    req = db.get(SourceFollowupRequest, request_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail="Source follow-up request not found.")
+    track = db.get(Track, req.track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if req.status != "pending":
+        raise HTTPException(status_code=409, detail="This source follow-up request is not pending.")
+    if req.requested_by_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the requester can cancel this source follow-up.")
+
+    previous_status = track.status
+    if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
+        track.status = req.previous_status
+    req.status = "cancelled"
+    req.decided_at = datetime.now(timezone.utc)
+    _delete_source_followup_draft(req)
+    log_track_event(
+        db,
+        track,
+        current_user,
+        "source_followup_cancelled",
+        from_status=previous_status,
+        to_status=track.status,
+        payload={"request_id": req.id},
+    )
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track.id)
+    return build_track_read(track, current_user, album, db=db)
 
 
 @router.post("/{track_id}/source-versions", response_model=TrackRead)

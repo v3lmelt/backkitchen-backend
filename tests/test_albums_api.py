@@ -434,6 +434,7 @@ def test_create_album_sets_default_workflow_config(client, factory, auth_headers
             "assignment_mode",
             "reviewer_pool",
             "required_reviewer_count",
+            "revision_decision_policy",
             "assignee_user_id",
             "require_confirmation",
             "actor_roles",

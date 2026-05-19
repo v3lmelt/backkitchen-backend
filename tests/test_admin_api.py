@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
+from app.models.admin_audit_log import AdminAuditLog
 from app.models.circle import Circle, CircleMember
 from app.models.reopen_request import ReopenRequest
 from app.models.stage_assignment import StageAssignment
@@ -394,3 +395,98 @@ def test_admin_reassign_cancels_completed_and_pending_assignments_before_new_ass
         (reviewer_b.id, "cancelled", "reassigned"),
         (reviewer_a.id, "pending", None),
     ]
+
+
+def latest_audit_reason(db_session, action: str) -> str | None:
+    audit = db_session.scalar(
+        select(AdminAuditLog)
+        .where(AdminAuditLog.action == action)
+        .order_by(AdminAuditLog.id.desc())
+        .limit(1)
+    )
+    assert audit is not None
+    return audit.reason
+
+
+def test_admin_track_actions_accept_missing_or_blank_reasons(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    admin_user = factory.user(username="admin-track-ops", admin_role="operator", is_admin=True)
+    producer = factory.user(username="track-ops-producer", role="producer")
+    mastering = factory.user(username="track-ops-master", role="mastering_engineer")
+    submitter = factory.user(username="track-ops-submitter")
+    reviewer = factory.user(username="track-ops-reviewer")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer],
+        checklist_enabled=False,
+    )
+
+    force_track = factory.track(album=album, submitter=submitter, status="intake")
+    force_response = client.post(
+        f"/api/admin/tracks/{force_track.id}/force-status",
+        headers=auth_headers(admin_user),
+        json={"new_status": "peer_review"},
+    )
+    assert force_response.status_code == 200
+    assert latest_audit_reason(db_session, "track_force_status") is None
+
+    reassign_track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=reviewer)
+    reassign_response = client.post(
+        f"/api/admin/tracks/{reassign_track.id}/reassign",
+        headers=auth_headers(admin_user),
+        json={"user_ids": [reviewer.id], "reason": "   "},
+    )
+    assert reassign_response.status_code == 200
+    assert latest_audit_reason(db_session, "track_reassigned") is None
+
+    reopen_track = factory.track(album=album, submitter=submitter, status=TrackStatus.COMPLETED.value)
+    reopen_response = client.post(
+        f"/api/admin/tracks/{reopen_track.id}/reopen",
+        headers=auth_headers(admin_user),
+        json={"target_stage_id": "peer_review", "reason": ""},
+    )
+    assert reopen_response.status_code == 200
+    assert latest_audit_reason(db_session, "track_reopened") is None
+
+    archive_track = factory.track(album=album, submitter=submitter, status="intake")
+    archive_response = client.post(
+        f"/api/admin/tracks/{archive_track.id}/archive",
+        headers=auth_headers(admin_user),
+        json={},
+    )
+    assert archive_response.status_code == 200
+    assert latest_audit_reason(db_session, "track_archived") is None
+
+    restore_response = client.post(
+        f"/api/admin/tracks/{archive_track.id}/restore",
+        headers=auth_headers(admin_user),
+        json={"reason": "\t"},
+    )
+    assert restore_response.status_code == 200
+    assert latest_audit_reason(db_session, "track_restored") is None
+
+    delete_track = factory.track(album=album, submitter=submitter, status="intake")
+    delete_response = client.delete(
+        f"/api/admin/tracks/{delete_track.id}?reason=+",
+        headers=auth_headers(admin_user),
+    )
+    assert delete_response.status_code == 204
+    assert latest_audit_reason(db_session, "track_deleted") is None
+
+
+def test_admin_user_governance_still_requires_reason(client, factory, auth_headers):
+    admin_user = factory.user(username="admin-user-ops", admin_role="operator", is_admin=True)
+    target = factory.user(username="reason-required")
+
+    response = client.post(
+        f"/api/admin/users/{target.id}/suspend",
+        headers=auth_headers(admin_user),
+        json={},
+    )
+
+    assert response.status_code == 422

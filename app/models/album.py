@@ -34,6 +34,12 @@ class Album(Base):
         default=False,
         server_default="0",
     )
+    quick_followup_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+    )
     deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     phase_deadlines: Mapped[str | None] = mapped_column(Text, nullable=True)
     webhook_config: Mapped[str | None] = mapped_column(Text, nullable=True)
