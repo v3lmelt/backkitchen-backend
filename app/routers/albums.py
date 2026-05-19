@@ -602,17 +602,23 @@ def update_album_metadata(
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
     album = ensure_album_producer(album_id, current_user, db)
-    if payload.title is not None:
+    updated_fields = payload.model_fields_set
+    if "title" in updated_fields and payload.title is not None:
         album.title = payload.title
-    album.description = payload.description
-    album.release_date = payload.release_date
-    album.catalog_number = payload.catalog_number
-    album.circle_name = payload.circle_name
-    if payload.checklist_enabled is not None:
+    if "description" in updated_fields:
+        album.description = payload.description
+    if "release_date" in updated_fields:
+        album.release_date = payload.release_date
+    if "catalog_number" in updated_fields:
+        album.catalog_number = payload.catalog_number
+    if "circle_name" in updated_fields:
+        album.circle_name = payload.circle_name
+    if "checklist_enabled" in updated_fields and payload.checklist_enabled is not None:
         album.checklist_enabled = payload.checklist_enabled
-    if payload.quick_followup_enabled is not None:
+    if "quick_followup_enabled" in updated_fields and payload.quick_followup_enabled is not None:
         album.quick_followup_enabled = payload.quick_followup_enabled
-    album.genres = json.dumps(payload.genres, ensure_ascii=False) if payload.genres else None
+    if "genres" in updated_fields:
+        album.genres = json.dumps(payload.genres, ensure_ascii=False) if payload.genres else None
     db.commit()
     db.refresh(album)
     return _read_album_with_summary(album, db, current_user)

@@ -1,6 +1,6 @@
 import copy
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from app.models.circle import CircleMember
 from app.routers import albums as albums_router
@@ -57,10 +57,16 @@ def test_create_album_inherits_circle_default_checklist_flag(client, factory, au
     assert response.json()["checklist_enabled"] is False
 
 
-def test_update_album_metadata_can_toggle_checklist_enabled(client, factory, auth_headers):
+def test_update_album_metadata_can_toggle_checklist_enabled(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     album = factory.album(producer=producer, mastering_engineer=mastering, checklist_enabled=True)
+    album.description = "Detailed production notes"
+    album.release_date = date(2026, 6, 1)
+    album.catalog_number = "BK-001"
+    album.circle_name = "Back Kitchen"
+    album.genres = json.dumps(["ambient", "vocal"], ensure_ascii=False)
+    db_session.commit()
 
     response = client.patch(
         f"/api/albums/{album.id}/metadata",
@@ -69,7 +75,48 @@ def test_update_album_metadata_can_toggle_checklist_enabled(client, factory, aut
     )
 
     assert response.status_code == 200
-    assert response.json()["checklist_enabled"] is False
+    body = response.json()
+    assert body["checklist_enabled"] is False
+    assert body["description"] == "Detailed production notes"
+    assert body["release_date"] == "2026-06-01"
+    assert body["catalog_number"] == "BK-001"
+    assert body["circle_name"] == "Back Kitchen"
+    assert body["genres"] == ["ambient", "vocal"]
+
+
+def test_update_album_metadata_can_toggle_quick_followup_without_clearing_fields(
+    client, db_session, factory, auth_headers
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        checklist_enabled=False,
+        quick_followup_enabled=False,
+    )
+    album.description = "Keep this description"
+    album.release_date = date(2026, 7, 2)
+    album.catalog_number = "BK-002"
+    album.circle_name = "Archive Circle"
+    album.genres = json.dumps(["rock"], ensure_ascii=False)
+    db_session.commit()
+
+    response = client.patch(
+        f"/api/albums/{album.id}/metadata",
+        headers=auth_headers(producer),
+        json={"quick_followup_enabled": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["quick_followup_enabled"] is True
+    assert body["checklist_enabled"] is False
+    assert body["description"] == "Keep this description"
+    assert body["release_date"] == "2026-07-02"
+    assert body["catalog_number"] == "BK-002"
+    assert body["circle_name"] == "Archive Circle"
+    assert body["genres"] == ["rock"]
 
 
 def test_create_album_applies_team_deadlines_and_template_atomically(
