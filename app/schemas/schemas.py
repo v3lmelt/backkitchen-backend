@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.issue import IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.track import RejectionMode, TrackStatus
@@ -83,14 +83,26 @@ class AdminActivityLogEntry(BaseModel):
     album_title: str | None = None
 
 
-class AdminForceStatus(BaseModel):
+class AdminOptionalReasonMixin(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
+
+
+class AdminForceStatus(AdminOptionalReasonMixin):
     new_status: str = Field(..., min_length=1, max_length=50)
-    reason: str = Field(..., min_length=1, max_length=500)
 
 
-class AdminReassign(BaseModel):
+class AdminReassign(AdminOptionalReasonMixin):
     user_ids: list[int] = Field(..., min_length=1)
-    reason: str = Field(..., min_length=1, max_length=500)
 
 
 class AdminReasonPayload(BaseModel):
@@ -102,9 +114,12 @@ class AdminTransferOwnershipRequest(BaseModel):
     reason: str = Field(..., min_length=1, max_length=500)
 
 
-class AdminTrackReopen(BaseModel):
+class AdminTrackReopen(AdminOptionalReasonMixin):
     target_stage_id: str = Field(..., min_length=1, max_length=50)
-    reason: str = Field(..., min_length=1, max_length=500)
+
+
+class AdminOptionalReasonPayload(AdminOptionalReasonMixin):
+    pass
 
 
 class AdminReopenDecision(BaseModel):

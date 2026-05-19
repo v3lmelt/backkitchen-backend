@@ -35,6 +35,7 @@ from app.schemas.schemas import (
     AdminAuditLogRead,
     AdminDashboardStats,
     AdminForceStatus,
+    AdminOptionalReasonPayload,
     AdminReasonPayload,
     AdminReassign,
     AdminReopenDecision,
@@ -97,6 +98,13 @@ def _deserialize_json_object(value: str | None) -> dict[str, Any] | None:
     if isinstance(parsed, dict):
         return parsed
     return {"value": parsed}
+
+
+def _normalize_optional_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    stripped = reason.strip()
+    return stripped or None
 
 
 def _audit_to_read(entry: AdminAuditLog) -> AdminAuditLogRead:
@@ -1185,7 +1193,7 @@ def admin_decide_reopen_request(
 @router.post("/tracks/{track_id}/archive", response_model=TrackRead)
 def admin_archive_track(
     track_id: int,
-    payload: AdminReasonPayload,
+    payload: AdminOptionalReasonPayload,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin(ADMIN_ROLE_OPERATOR)),
@@ -1236,7 +1244,7 @@ def admin_archive_track(
 @router.post("/tracks/{track_id}/restore", response_model=TrackRead)
 def admin_restore_track(
     track_id: int,
-    payload: AdminReasonPayload,
+    payload: AdminOptionalReasonPayload,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin(ADMIN_ROLE_OPERATOR)),
@@ -1287,7 +1295,7 @@ def admin_restore_track(
 @router.delete("/tracks/{track_id}", status_code=status.HTTP_204_NO_CONTENT)
 def admin_delete_track(
     track_id: int,
-    reason: str = Query(default="Deleted by admin", min_length=1, max_length=500),
+    reason: str | None = Query(default=None, max_length=500),
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin(ADMIN_ROLE_OPERATOR)),
 ) -> None:
@@ -1307,6 +1315,7 @@ def admin_delete_track(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
 
+    normalized_reason = _normalize_optional_reason(reason)
     before = _track_snapshot(track)
     local_paths, r2_keys = collect_track_files(track)
     record_admin_audit(
@@ -1316,7 +1325,7 @@ def admin_delete_track(
         entity_type="track",
         entity_id=track.id,
         summary=f"Deleted track {track.title}",
-        reason=reason,
+        reason=normalized_reason,
         before=before,
         after=None,
         album_id=album.id,
