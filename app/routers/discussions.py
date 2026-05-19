@@ -33,7 +33,7 @@ from app.schemas.schemas import (
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.upload import stream_upload
-from app.workflow import ensure_track_visibility, is_mastering_participant
+from app.workflow import allowed_user_mention_ids, ensure_track_visibility, is_mastering_participant
 from app.workflow import mask_user_read_if_needed, peer_identity_anonymize_user_ids_for_viewer
 from app.workflow import discussion_audio_file_url
 
@@ -149,6 +149,26 @@ def _build_audio_response(audio: TrackDiscussionAudio, resolve: str | None):
 
 
 MAX_DISCUSSION_PAGE_SIZE = 50
+
+
+def _notify_user_mentions(
+    db: Session,
+    user_ids: list[int],
+    *,
+    track: Track,
+    background_tasks: BackgroundTasks,
+) -> None:
+    if not user_ids:
+        return
+    notify(
+        db,
+        user_ids,
+        "user_mentioned",
+        "有人提到了你",
+        f"「{track.title}」的讨论中提到了你",
+        related_track_id=track.id,
+        background_tasks=background_tasks,
+    )
 
 
 @router.get(
@@ -415,6 +435,19 @@ async def create_discussion(
         related_track_id=track.id,
         background_tasks=background_tasks,
         album_id=track.album_id,
+    )
+    _notify_user_mentions(
+        db,
+        allowed_user_mention_ids(
+            discussion.content,
+            db,
+            track,
+            album,
+            current_user,
+            context="mastering" if phase == "mastering" else "general",
+        ),
+        track=track,
+        background_tasks=background_tasks,
     )
     logger.info(
         "discussion_created track_id=%s discussion_id=%s user_id=%s phase=%s image_count=%s audio_count=%s r2_audio_count=%s",

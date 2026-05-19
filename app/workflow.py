@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -41,12 +42,15 @@ from app.schemas.schemas import (
     IssueMarkerRead,
     IssueRead,
     MasterDeliveryRead,
+    MentionCandidatesRead,
     TrackDetailResponse,
     TrackRead,
     TrackSourceVersionRead,
     UserRead,
     WorkflowEventRead,
 )
+
+USER_MENTION_PATTERN = re.compile(r"(?<![\w])@user:(\d{1,9})(?![\w])")
 
 
 def next_issue_local_number(db: Session, track_id: int) -> int:
@@ -74,9 +78,183 @@ def discussion_audio_file_url(audio_id: int) -> str:
     return f"/api/discussion-audios/{audio_id}/file"
 
 
+def extract_user_mention_ids(text: str | None) -> list[int]:
+    """Return unique @user:ID mentions in first-seen order."""
+    if not text:
+        return []
+    seen: set[int] = set()
+    result: list[int] = []
+    for match in USER_MENTION_PATTERN.finditer(text):
+        user_id = int(match.group(1))
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        result.append(user_id)
+    return result
+
+
 def get_album_member_ids(db: Session, album_id: int) -> set[int]:
     rows = db.scalars(select(AlbumMember).where(AlbumMember.album_id == album_id)).all()
     return {row.user_id for row in rows}
+
+
+def _mention_candidate_ids(db: Session, track: Track, album: Album) -> list[int]:
+    ordered: list[int] = []
+    seen: set[int] = set()
+
+    def add(user_id: int | None) -> None:
+        if user_id is None or user_id in seen:
+            return
+        seen.add(user_id)
+        ordered.append(user_id)
+
+    add(track.submitter_id)
+    add(album.producer_id)
+    add(album.mastering_engineer_id)
+    add(track.peer_reviewer_id)
+
+    for user_id in db.scalars(
+        select(AlbumMember.user_id).where(AlbumMember.album_id == album.id)
+    ).all():
+        add(user_id)
+
+    for user_id in db.scalars(
+        select(StageAssignment.user_id).where(
+            StageAssignment.track_id == track.id,
+            or_(
+                StageAssignment.status.in_(["pending", "completed"]),
+                (
+                    StageAssignment.status == "cancelled"
+                ) & (
+                    StageAssignment.cancellation_reason == ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED
+                ),
+            ),
+        )
+    ).all():
+        add(user_id)
+
+    return ordered
+
+
+def _active_users_by_id(db: Session, user_ids: list[int]) -> dict[int, User]:
+    if not user_ids:
+        return {}
+    users = db.scalars(select(User).where(User.id.in_(user_ids))).all()
+    return {
+        user.id: user
+        for user in users
+        if user.deleted_at is None and user.suspended_at is None
+    }
+
+
+def _can_user_see_general_track_area(
+    user_id: int,
+    track: Track,
+    album: Album,
+    album_member_ids: set[int],
+    assignment_ids: set[int],
+) -> bool:
+    if user_id in {track.submitter_id, track.peer_reviewer_id, album.producer_id, album.mastering_engineer_id}:
+        return True
+    if user_id in assignment_ids:
+        return True
+    return user_id in album_member_ids and (track.status == TrackStatus.COMPLETED or track.is_public)
+
+
+def _candidate_user_reads(
+    db: Session,
+    ordered_ids: list[int],
+    *,
+    include_ids: set[int],
+    anonymize_user_ids: set[int],
+) -> list[UserRead]:
+    users_by_id = _active_users_by_id(db, ordered_ids)
+    result: list[UserRead] = []
+    for user_id in ordered_ids:
+        if user_id not in include_ids:
+            continue
+        user = users_by_id.get(user_id)
+        if user is None:
+            continue
+        result.append(_mask_user_read_if_needed(_user_read(user), anonymize_user_ids))
+    return [item for item in result if item is not None]
+
+
+def build_mention_candidates(
+    db: Session,
+    track: Track,
+    album: Album,
+    viewer: User,
+    anonymize_user_ids: set[int] | None = None,
+) -> MentionCandidatesRead:
+    """Build per-context @user candidates visible to the current viewer."""
+    anonymize = anonymize_user_ids or peer_identity_anonymize_user_ids_for_viewer(db, track, album, viewer)
+    ordered_ids = _mention_candidate_ids(db, track, album)
+    album_member_ids = get_album_member_ids(db, album.id)
+    assignment_ids = set(
+        db.scalars(
+            select(StageAssignment.user_id).where(
+                StageAssignment.track_id == track.id,
+                or_(
+                    StageAssignment.status.in_(["pending", "completed"]),
+                    (
+                        StageAssignment.status == "cancelled"
+                    ) & (
+                        StageAssignment.cancellation_reason == ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED
+                    ),
+                ),
+            )
+        ).all()
+    )
+    general_ids = {
+        user_id
+        for user_id in ordered_ids
+        if _can_user_see_general_track_area(user_id, track, album, album_member_ids, assignment_ids)
+    }
+
+    viewer_can_see_mastering = is_mastering_participant(viewer, track, album)
+    mastering_ids = (
+        ({track.submitter_id, album.producer_id, album.mastering_engineer_id} & set(ordered_ids))
+        if viewer_can_see_mastering
+        else set()
+    )
+    mastering_ids.discard(None)
+
+    viewer_can_see_internal_issue = viewer.id != track.submitter_id
+    issue_internal_ids = set(general_ids)
+    issue_internal_ids.discard(track.submitter_id)
+    if not viewer_can_see_internal_issue:
+        issue_internal_ids.clear()
+
+    return MentionCandidatesRead(
+        general=_candidate_user_reads(db, ordered_ids, include_ids=general_ids, anonymize_user_ids=anonymize),
+        mastering=_candidate_user_reads(db, ordered_ids, include_ids=mastering_ids, anonymize_user_ids=anonymize),
+        issue_public=_candidate_user_reads(db, ordered_ids, include_ids=general_ids, anonymize_user_ids=anonymize),
+        issue_internal=_candidate_user_reads(db, ordered_ids, include_ids=issue_internal_ids, anonymize_user_ids=anonymize),
+    )
+
+
+def allowed_user_mention_ids(
+    text: str | None,
+    db: Session,
+    track: Track,
+    album: Album,
+    viewer: User,
+    *,
+    context: str,
+) -> list[int]:
+    mentioned_ids = extract_user_mention_ids(text)
+    if not mentioned_ids:
+        return []
+    candidates = build_mention_candidates(db, track, album, viewer)
+    candidate_map = {
+        "general": candidates.general,
+        "mastering": candidates.mastering,
+        "issue_public": candidates.issue_public,
+        "issue_internal": candidates.issue_internal,
+    }
+    allowed_ids = {user.id for user in candidate_map.get(context, [])}
+    return [user_id for user_id in mentioned_ids if user_id in allowed_ids and user_id != viewer.id]
 
 
 def get_all_album_member_ids(db: Session, album_id: int | None = None) -> dict[int, set[int]]:
@@ -850,6 +1028,13 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         master_deliveries=[MasterDeliveryRead.model_validate(d) for d in track.master_deliveries],
         discussions=discussions,
         workflow_config=wf_config_schema,
+        mention_candidates=build_mention_candidates(
+            db,
+            track,
+            album,
+            user,
+            anonymize_user_ids=anonymize_user_ids,
+        ),
     )
 
 
