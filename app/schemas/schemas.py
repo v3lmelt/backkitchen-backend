@@ -689,6 +689,7 @@ class TrackDetailResponse(BaseModel):
     master_deliveries: list[MasterDeliveryRead] = []
     discussions: list["DiscussionRead"] = []
     workflow_config: "WorkflowConfigSchema | None" = None
+    mention_candidates: "MentionCandidatesRead" = Field(default_factory=lambda: MentionCandidatesRead())
 
 
 class NotificationRead(BaseModel):
@@ -749,6 +750,13 @@ class DiscussionRead(BaseModel):
     audios: list[DiscussionAudioRead] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class MentionCandidatesRead(BaseModel):
+    general: list[UserRead] = Field(default_factory=list)
+    mastering: list[UserRead] = Field(default_factory=list)
+    issue_public: list[UserRead] = Field(default_factory=list)
+    issue_internal: list[UserRead] = Field(default_factory=list)
 
 
 class DiscussionUpdate(BaseModel):
