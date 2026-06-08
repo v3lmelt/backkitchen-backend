@@ -307,6 +307,7 @@ def _finalize_source_version_upload(
     track.storage_backend = storage_backend
     track.duration = duration
     track.status = next_status
+    track.requested_revision_type = None  # Clear after upload
     prepare_review_assignments_for_stage_entry(
         db,
         album,
@@ -482,6 +483,18 @@ def _ensure_revision_upload_permission(track: Track, album: Album, current_user:
     assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
     if assignee_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the assigned user can upload a new source version.")
+
+    # NEW: Validate mastering revision upload matches requested type
+    if step.return_to:
+        from app.workflow_engine import get_step_by_id, get_steps
+        return_step = get_step_by_id(get_steps(config), step.return_to)
+        if return_step and _target_is_mastering_related(return_step):
+            # This is a mastering revision
+            if track.requested_revision_type == "stem_files":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This revision requires stem files via external link. File upload is not allowed.",
+                )
 
 
 def _ensure_delivery_upload_permission(track: Track, album: Album, current_user: User) -> None:
@@ -1627,7 +1640,10 @@ def workflow_transition(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    engine_execute_transition(db, album, track, current_user, payload.decision, background_tasks)
+    engine_execute_transition(
+        db, album, track, current_user, payload.decision, background_tasks,
+        revision_type=payload.revision_type
+    )
     db.commit()
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)

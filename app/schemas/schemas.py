@@ -487,6 +487,7 @@ class TrackRead(TrackBase):
     is_proxy_submission: bool = False
     author_notes: str | None = None
     mastering_notes: str | None = None
+    requested_revision_type: str | None = None
     is_public: bool = False
     created_at: datetime
     updated_at: datetime
@@ -839,6 +840,14 @@ class IssueBatchUpdate(BaseModel):
 
 class WorkflowTransitionRequest(BaseModel):
     decision: str = Field(..., min_length=1, max_length=50)
+    revision_type: str | None = Field(default=None)
+
+    @field_validator("revision_type")
+    @classmethod
+    def validate_revision_type(cls, value: str | None) -> str | None:
+        if value is not None and value not in ("source_audio", "stem_files"):
+            raise ValueError("revision_type must be 'source_audio' or 'stem_files'")
+        return value
 
 
 class WorkflowStepDefSchema(BaseModel):

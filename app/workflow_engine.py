@@ -928,6 +928,7 @@ def execute_transition(
     user: User,
     decision: str,
     background_tasks: BackgroundTasks,
+    revision_type: str | None = None,
 ) -> None:
     """Execute a workflow transition on a track with a custom workflow.
 
@@ -1189,6 +1190,29 @@ def execute_transition(
         else:
             # Forward: auto-assign reviewers if entering a review step
             assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks, user)
+
+        # Handle requested_revision_type for mastering revisions
+        if target_step.type == "revision":
+            # Check if this is a mastering revision
+            is_mastering_revision = False
+            if target_step.return_to:
+                return_step = get_step_by_id(steps, target_step.return_to)
+                is_mastering_revision = return_step and _target_is_mastering_related(return_step)
+
+            if is_mastering_revision:
+                # Mastering revisions REQUIRE a revision type
+                if revision_type not in ("source_audio", "stem_files"):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Mastering revision requests must specify revision_type ('source_audio' or 'stem_files').",
+                    )
+                track.requested_revision_type = revision_type
+            else:
+                # Non-mastering revisions: no restriction, default to None
+                track.requested_revision_type = None
+        else:
+            # Clear the field when not in a revision step
+            track.requested_revision_type = None
 
     # Mark the current user's assignment when it wasn't already handled above.
     if step.type == "review" and pending_assignment and pending_assignment.status == "pending":

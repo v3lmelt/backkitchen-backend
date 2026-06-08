@@ -733,6 +733,7 @@ def build_track_read(
         is_public=track.is_public,
         author_notes=track.author_notes,
         mastering_notes=track.mastering_notes,
+        requested_revision_type=track.requested_revision_type,
     )
 
 
