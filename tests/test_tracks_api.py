@@ -15,6 +15,7 @@ from app.models.master_delivery import MasterDelivery
 from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
+from app.models.track_composer import TrackExternalComposer
 from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.workflow_event import WorkflowEvent
@@ -78,6 +79,9 @@ def test_create_proxy_track_as_producer_records_external_submitter(client, db_se
     assert body["submitter_id"] == producer.id
     assert body["proxy_uploader_id"] == producer.id
     assert body["external_submitter_name"] == "Offline Composer"
+    assert body["external_composer_names"] == ["Offline Composer"]
+    assert [item["name"] for item in body["external_composers"]] == ["Offline Composer"]
+    assert body["composer_ids"] == []
     assert body["is_proxy_submission"] is True
     assert body["submitter"]["id"] == producer.id
     assert body["proxy_uploader"]["id"] == producer.id
@@ -86,6 +90,10 @@ def test_create_proxy_track_as_producer_records_external_submitter(client, db_se
     assert track.submitter_id == producer.id
     assert track.proxy_uploader_id == producer.id
     assert track.external_submitter_name == "Offline Composer"
+    external_names = db_session.scalars(
+        select(TrackExternalComposer.name).where(TrackExternalComposer.track_id == track.id)
+    ).all()
+    assert external_names == ["Offline Composer"]
     assert track.source_versions[0].uploaded_by_id == producer.id
 
 
@@ -379,6 +387,83 @@ def test_upload_master_delivery_increments_delivery_number(client, db_session, f
     ).all()
     assert sorted(delivery.delivery_number for delivery in deliveries) == [1, 2]
 
+
+
+def test_upload_master_delivery_rejects_text_only_message(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+    factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/master-deliveries",
+        headers=auth_headers(mastering),
+        data={"delivery_message": "https://cloud.example/stems\n提取码: bk24"},
+    )
+
+    assert response.status_code == 422
+    assert "requires an audio file" in response.text
+    deliveries = db_session.scalars(
+        select(MasterDelivery).where(MasterDelivery.track_id == track.id)
+    ).all()
+    assert sorted(delivery.delivery_number for delivery in deliveries) == [1]
+
+def test_upload_master_delivery_rejects_empty_submission(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/master-deliveries",
+        headers=auth_headers(mastering),
+        data={"delivery_message": " \n\t "},
+    )
+
+    assert response.status_code == 422
+    assert "requires an audio file" in response.text
+
+
+def test_upload_master_delivery_requires_assigned_user(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/master-deliveries",
+        headers=auth_headers(submitter),
+        data={"delivery_message": "https://cloud.example/not-allowed"},
+    )
+
+    assert response.status_code == 403
+    assert "assigned user" in response.text
+
+
+def test_master_audio_rejects_text_only_delivery(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="final_review")
+    factory.master_delivery(
+        track=track,
+        uploaded_by=mastering,
+        delivery_kind="text",
+        delivery_message="https://cloud.example/stems",
+    )
+
+    response = client.get(
+        f"/api/tracks/{track.id}/master-audio",
+        headers=auth_headers(producer),
+    )
+
+    assert response.status_code == 404
+    assert "does not include an audio file" in response.text
 
 def test_final_review_reject_to_mastering_keeps_cycle_and_clears_approvals(
     client,
@@ -680,8 +765,13 @@ def test_proxy_track_producer_final_approval_counts_for_submitter(client, db_ses
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     album = factory.album(producer=producer, mastering_engineer=mastering)
-    track = factory.track(album=album, submitter=producer, status=TrackStatus.FINAL_REVIEW)
-    track.external_submitter_name = "Offline Composer"
+    track = factory.track(
+        album=album,
+        submitter=producer,
+        status=TrackStatus.FINAL_REVIEW,
+        external_composers=["Offline Composer"],
+        include_submitter_composer=False,
+    )
     track.proxy_uploader_id = producer.id
     delivery = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
     db_session.commit()
@@ -1105,8 +1195,9 @@ def test_proxy_track_producer_can_upload_submitter_revision(client, db_session, 
         submitter=producer,
         status="peer_revision",
         peer_reviewer=reviewer,
+        external_composers=["Offline Composer"],
+        include_submitter_composer=False,
     )
-    track.external_submitter_name = "Offline Composer"
     track.proxy_uploader_id = producer.id
     db_session.commit()
 
@@ -1121,6 +1212,8 @@ def test_proxy_track_producer_can_upload_submitter_revision(client, db_session, 
     assert body["status"] == "peer_review"
     assert body["version"] == 2
     assert body["external_submitter_name"] == "Offline Composer"
+    assert body["external_composer_names"] == ["Offline Composer"]
+    assert body["composer_ids"] == []
     assert body["is_proxy_submission"] is True
 
 
@@ -1226,6 +1319,96 @@ def test_upload_source_version_from_mastering_revision(client, db_session, facto
     body = response.json()
     assert body["status"] == "mastering"
     assert body["version"] == 2
+
+def test_submit_external_source_link_from_mastering_revision_preserves_audio(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="mastering_revision",
+    )
+    original_file_path = track.file_path
+    original_storage_backend = track.storage_backend
+    original_duration = track.duration
+    issue = factory.issue(
+        track=track,
+        author=mastering,
+        phase=IssuePhase.MASTERING,
+        status=IssueStatus.OPEN,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions/external-link",
+        headers=auth_headers(submitter),
+        json={
+            "revision_notes": "  https://cloud.example/stems\n提取码: bk24  ",
+            "resolved_issue_ids": [issue.id],
+            "resolution_note": "Stems uploaded to the linked folder.",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "mastering"
+    assert body["version"] == 2
+    assert body["file_path"] == original_file_path
+    assert body["duration"] == original_duration
+    current_source = body["current_source_version"]
+    assert current_source["source_kind"] == "external_link"
+    assert current_source["file_path"] is None
+    assert current_source["revision_notes"] == "https://cloud.example/stems\n提取码: bk24"
+
+    db_session.refresh(track)
+    db_session.refresh(issue)
+    assert track.file_path == original_file_path
+    assert track.storage_backend == original_storage_backend
+    assert track.duration == original_duration
+    assert issue.status == IssueStatus.RESOLVED
+    versions = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
+    ).all()
+    assert len(versions) == 2
+    external_version = max(versions, key=lambda version: version.version_number)
+    assert external_version.source_kind == "external_link"
+    assert external_version.file_path is None
+    assert external_version.revision_notes == "https://cloud.example/stems\n提取码: bk24"
+
+
+def test_submit_external_source_link_rejects_non_mastering_revision(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="peer_revision")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions/external-link",
+        headers=auth_headers(submitter),
+        json={"revision_notes": "https://cloud.example/stems"},
+    )
+
+    assert response.status_code == 409
+    assert "mastering revision" in response.text
+
+
+def test_submit_external_source_link_requires_assigned_composer(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering_revision")
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions/external-link",
+        headers=auth_headers(producer),
+        json={"revision_notes": "https://cloud.example/stems"},
+    )
+
+    assert response.status_code == 403
+    assert "assigned user" in response.text
 
 
 def test_upload_source_version_wrong_status_fails(client, factory, auth_headers):
@@ -1449,11 +1632,18 @@ def test_r2_proxy_track_upload_records_external_submitter(client, db_session, fa
     body = confirm_response.json()
     assert body["proxy_uploader_id"] == producer.id
     assert body["external_submitter_name"] == "Offline Composer"
+    assert body["external_composer_names"] == ["Offline Composer"]
+    assert [item["name"] for item in body["external_composers"]] == ["Offline Composer"]
+    assert body["composer_ids"] == []
     assert body["is_proxy_submission"] is True
     track = db_session.get(Track, body["id"])
     assert track.storage_backend == "r2"
     assert track.proxy_uploader_id == producer.id
     assert track.external_submitter_name == "Offline Composer"
+    external_names = db_session.scalars(
+        select(TrackExternalComposer.name).where(TrackExternalComposer.track_id == track.id)
+    ).all()
+    assert external_names == ["Offline Composer"]
 
 
 def test_confirm_source_version_upload_rejects_unexpected_r2_key(client, factory, auth_headers, monkeypatch):

@@ -43,9 +43,13 @@ from app.workflow import (
     current_master_delivery,
     current_source_version,
     ensure_track_visibility,
+    is_track_composer,
+    is_track_composer_actor,
     log_track_event,
     next_issue_local_number,
     peer_identity_anonymize_user_ids_for_viewer,
+    track_composer_actor_ids_for_notify,
+    track_composer_actor_ordered_ids,
 )
 from app.workflow_engine import (
     get_steps,
@@ -245,23 +249,26 @@ def _status_handler_ids(issue: Issue, track: Track, album: Album, db: Session) -
 
 
 def _ensure_issue_visible_to_user(issue: Issue, track: Track, user: User) -> None:
-    # Pending-discussion issues are hidden from submitters until discussion ends.
-    if user.id == track.submitter_id and _is_submitter_hidden_issue_status(issue.status):
+    album = track.album
+    if album is not None and user.id == album.producer_id:
+        return
+    # Pending-discussion issues are hidden from composers until discussion ends.
+    if is_track_composer(track, user.id) and _is_submitter_hidden_issue_status(issue.status):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
 
 
 def _ensure_comment_visible_to_user(comment: Comment, track: Track, user: User, db: Session) -> None:
     album = db.get(Album, track.album_id)
-    if album and user.id == track.submitter_id and user.id == album.producer_id:
+    if album and user.id == album.producer_id:
         return
-    if comment.visibility == "internal" and user.id == track.submitter_id:
+    if comment.visibility == "internal" and is_track_composer(track, user.id, db):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
 
 
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User, db: Session) -> None:
     reviewer_ids = _phase_reviewer_ids(issue, track, album, db)
     status_handler_ids = _status_handler_ids(issue, track, album, db)
-    allowed = {track.submitter_id, issue.author_id} | reviewer_ids | status_handler_ids
+    allowed = set(track_composer_actor_ordered_ids(track, album, db)) | {issue.author_id} | reviewer_ids | status_handler_ids
     allowed.discard(None)
     if user.id not in allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to update this issue.")
@@ -289,7 +296,7 @@ def _validate_status_transition(
     if old == new_status:
         return
 
-    is_submitter = user.id == track.submitter_id
+    is_submitter = is_track_composer_actor(track, album, user.id, db)
     handler_ids = _status_handler_ids(issue, track, album, db)
     is_status_handler = user.id in handler_ids or (
         issue.phase != IssuePhase.FINAL_REVIEW.value and user.id == issue.author_id
@@ -641,8 +648,9 @@ async def create_issue(
         "issue_created",
         payload={"phase": effective_phase, "title": issue_title, "issue_id": issue.id},
     )
-    if current_user.id != track.submitter_id and not _is_submitter_hidden_issue_status(issue.status):
-        notify(db, [track.submitter_id], "new_issue", f"新问题：{issue.title}",
+    notify_ids = track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id)
+    if notify_ids and not _is_submitter_hidden_issue_status(issue.status):
+        notify(db, notify_ids, "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
                related_track_id=track.id, related_issue_id=issue.id,
                background_tasks=background_tasks, album_id=track.album_id,
@@ -694,7 +702,7 @@ def list_issues(
         .order_by(Issue.created_at)
         .options(selectinload(Issue.markers), selectinload(Issue.audios), selectinload(Issue.images))
     ).all())
-    if current_user.id == track.submitter_id:
+    if is_track_composer(track, current_user.id, db):
         issues = [issue for issue in issues if not _is_submitter_hidden_issue_status(issue.status)]
     # Pre-fetch all issue authors
     author_ids = {i.author_id for i in issues}
@@ -911,11 +919,10 @@ async def update_issue(
     if (
         _is_submitter_hidden_issue_status(old_status)
         and not _is_submitter_hidden_issue_status(new_status)
-        and current_user.id != track.submitter_id
     ):
         notify(
             db,
-            [track.submitter_id],
+            track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id),
             "new_issue",
             f"新问题：{issue.title}",
             f"「{track.title}」上有新的审核问题",
@@ -1094,7 +1101,7 @@ async def add_comment(
 
     participant_ids = [issue.author_id] + [c.author_id for c in issue.comments if c.id != comment.id]
     if comment_visibility == "public":
-        participant_ids.append(track.submitter_id)
+        participant_ids.extend(track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id))
     notify_ids = [uid for uid in dict.fromkeys(participant_ids) if uid != current_user.id]
     if notify_ids:
         notify(db, notify_ids, "new_comment", "新评论",

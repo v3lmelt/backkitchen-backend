@@ -24,6 +24,7 @@ from app.models.issue import Issue, IssueStatus
 from app.models.reopen_request import ReopenRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
+from app.models.track_composer import TrackComposer
 from app.models.user import User
 from app.models.webhook_delivery import WebhookDelivery
 from app.models.workflow_event import WorkflowEvent
@@ -50,7 +51,7 @@ from app.schemas.schemas import (
     WorkflowEventRead,
 )
 from app.services.cleanup import cleanup_files, collect_track_files
-from app.workflow import build_track_read, log_track_event
+from app.workflow import build_track_read, log_track_event, track_composer_ids_for_notify
 from app.workflow_engine import (
     ASSIGNMENT_CANCEL_REASON_REASSIGNED,
     _cancel_active_review_assignments,
@@ -205,11 +206,14 @@ def _assert_user_can_be_deactivated(db: Session, user: User) -> None:
         )
 
     authored_track = db.scalar(
-        select(Track.id).where(
-            Track.submitter_id == user.id,
+        select(Track.id)
+        .outerjoin(TrackComposer, TrackComposer.track_id == Track.id)
+        .where(
+            or_(Track.submitter_id == user.id, TrackComposer.user_id == user.id),
             Track.archived_at.is_(None),
             _active_track_filter(),
-        ).limit(1)
+        )
+        .limit(1)
     )
     if authored_track is not None:
         raise HTTPException(
@@ -257,6 +261,35 @@ def _ensure_circle_owner_membership(db: Session, circle_id: int, user_id: int) -
         return
     membership.role = "owner"
 
+
+
+def _transfer_track_composer_link(
+    db: Session,
+    *,
+    track_id: int,
+    source_user_id: int,
+    target_user_id: int,
+) -> None:
+    source_link = db.scalar(
+        select(TrackComposer).where(
+            TrackComposer.track_id == track_id,
+            TrackComposer.user_id == source_user_id,
+        )
+    )
+    target_link = db.scalar(
+        select(TrackComposer.id).where(
+            TrackComposer.track_id == track_id,
+            TrackComposer.user_id == target_user_id,
+        )
+    )
+    if source_link is None:
+        if target_link is None:
+            db.add(TrackComposer(track_id=track_id, user_id=target_user_id))
+        return
+    if target_link is not None:
+        db.delete(source_link)
+        return
+    source_link.user_id = target_user_id
 
 def _transfer_user_ownership(
     db: Session,
@@ -307,15 +340,26 @@ def _transfer_user_ownership(
 
     active_tracks = list(
         db.scalars(
-            select(Track).where(
-                Track.submitter_id == source_user.id,
+            select(Track)
+            .outerjoin(TrackComposer, TrackComposer.track_id == Track.id)
+            .where(
+                or_(Track.submitter_id == source_user.id, TrackComposer.user_id == source_user.id),
                 Track.archived_at.is_(None),
                 _active_track_filter(),
             )
+            .distinct()
         ).all()
     )
     for track in active_tracks:
-        track.submitter_id = target_user.id
+        if track.submitter_id == source_user.id:
+            track.submitter_id = target_user.id
+        _transfer_track_composer_link(
+            db,
+            track_id=track.id,
+            source_user_id=source_user.id,
+            target_user_id=target_user.id,
+        )
+        _ensure_album_membership(db, track.album_id, target_user.id)
         counts["active_tracks"] += 1
 
     review_tracks = list(
@@ -1214,7 +1258,7 @@ def admin_archive_track(
     log_track_event(db, track, admin, "track_archived", payload={"previous_status": track.status})
     notify(
         db,
-        [track.submitter_id],
+        track_composer_ids_for_notify(track, db, skip_user_id=admin.id),
         "track_archived",
         "Track archived",
         f"{track.title} has been archived by an administrator.",
@@ -1265,7 +1309,7 @@ def admin_restore_track(
     log_track_event(db, track, admin, "track_restored")
     notify(
         db,
-        [track.submitter_id],
+        track_composer_ids_for_notify(track, db, skip_user_id=admin.id),
         "track_restored",
         "Track restored",
         f"{track.title} has been restored by an administrator.",

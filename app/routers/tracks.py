@@ -22,6 +22,7 @@ from app.models.reopen_request import ReopenRequest
 from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus, WorkflowVariant
+from app.models.track_composer import TrackComposer, TrackExternalComposer
 from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
@@ -32,6 +33,7 @@ from app.schemas.schemas import (
     ReassignReviewerRequest,
     TrackPlaybackPreferenceRead,
     TrackPlaybackPreferenceUpdate,
+    ConfirmMasterDeliveryUploadParams,
     ConfirmTrackUploadParams,
     ConfirmSourceFollowupUploadParams,
     ConfirmUploadParams,
@@ -43,11 +45,13 @@ from app.schemas.schemas import (
     RequestTrackUploadParams,
     RequestUploadParams,
     SetPublicRequest,
+    SourceExternalLinkSubmission,
     SourceFollowupDecisionRequest,
     StageAssignmentRead,
     TrackDetailResponse,
     TrackListItem,
     TrackMetadataUpdate,
+    TrackComposerUpdate,
     TrackRead,
     WorkflowTransitionRequest,
 )
@@ -77,11 +81,14 @@ from app.workflow import (
     ensure_album_visibility,
     ensure_track_visibility,
     get_all_album_member_ids,
+    is_track_composer_actor,
     get_album_member_ids,
     log_track_event,
     mask_user_read_if_needed,
     peer_identity_anonymize_user_ids_for_viewer,
     should_anonymize_track,
+    track_composer_actor_ids_for_notify,
+    track_composer_ids,
 )
 
 router = APIRouter(prefix="/api/tracks", tags=["tracks"])
@@ -140,8 +147,14 @@ def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float 
 
 
 def _source_version_create(
-    track: Track, user: User, file_path: str, duration: float | None,
-    *, revision_notes: str | None = None, storage_backend: str = "local",
+    track: Track,
+    user: User,
+    file_path: str | None,
+    duration: float | None,
+    *,
+    revision_notes: str | None = None,
+    storage_backend: str = "local",
+    source_kind: str = "file",
 ) -> TrackSourceVersion:
     return TrackSourceVersion(
         track_id=track.id,
@@ -149,44 +162,38 @@ def _source_version_create(
         version_number=track.version,
         file_path=file_path,
         storage_backend=storage_backend,
+        source_kind=source_kind,
         duration=duration,
         uploaded_by_id=user.id,
         revision_notes=revision_notes,
     )
 
 
-def _validate_proxy_submission(
+def _normalize_external_composer_names(
+    external_composer_names: list[str] | None = None,
     *,
-    album: Album,
-    current_user: User,
-    proxy_submission: bool,
-    external_submitter_name: str | None,
-) -> tuple[str | None, int | None]:
-    external_name = (external_submitter_name or "").strip()
-    if not proxy_submission:
-        if external_name:
+    external_submitter_name: str | None = None,
+) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    raw_names = [*(external_composer_names or [])]
+    if external_submitter_name:
+        raw_names.append(external_submitter_name)
+    for raw_name in raw_names:
+        name = (raw_name or "").strip()
+        if not name:
+            continue
+        if len(name) > 100:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Enable proxy submission before setting an external submitter.",
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="External composer names must be at most 100 characters.",
             )
-        return None, None
-
-    if album.producer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the album producer can upload on behalf of an external submitter.",
-        )
-    if not external_name:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="External submitter name is required for proxy submission.",
-        )
-    if len(external_name) > 100:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="External submitter name must be at most 100 characters.",
-        )
-    return external_name, current_user.id
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
 
 
 def _dedupe_ints(values: list[int]) -> list[int]:
@@ -268,12 +275,14 @@ def _finalize_source_version_upload(
     track: Track,
     current_user: User,
     background_tasks: BackgroundTasks,
-    file_path: str,
+    file_path: str | None,
     storage_backend: str,
     duration: float | None,
     revision_notes: str | None,
     resolved_issue_ids: list[int],
     resolution_note: str | None,
+    source_kind: str = "file",
+    replace_current_audio: bool = True,
 ) -> None:
     issue_cycle = track.workflow_cycle
 
@@ -303,9 +312,12 @@ def _finalize_source_version_upload(
 
     previous_status = track.status
     track.version += 1
-    track.file_path = file_path
-    track.storage_backend = storage_backend
-    track.duration = duration
+    if replace_current_audio:
+        if file_path is None:
+            raise HTTPException(status_code=500, detail="File source upload produced no audio file.")
+        track.file_path = file_path
+        track.storage_backend = storage_backend
+        track.duration = duration
     track.status = next_status
     track.requested_revision_type = None  # Clear after upload
     prepare_review_assignments_for_stage_entry(
@@ -323,10 +335,13 @@ def _finalize_source_version_upload(
             duration,
             revision_notes=revision_notes or None,
             storage_backend=storage_backend,
+            source_kind=source_kind,
         )
     )
 
     event_payload: dict[str, object] = {"version": track.version, "workflow_cycle": track.workflow_cycle}
+    if source_kind != "file":
+        event_payload["source_kind"] = source_kind
     if resolved_ids:
         event_payload["resolved_issue_ids"] = resolved_ids
     if resolution_note:
@@ -351,7 +366,7 @@ def _handle_delivery_status(
     delivery_number: int,
     background_tasks: BackgroundTasks,
 ) -> None:
-    """Advance track status after a master delivery upload.
+    """Advance track status after a master delivery submission.
 
     When the current step has ``require_confirmation=True`` the track stays
     put until the mastering engineer explicitly confirms the delivery.
@@ -367,8 +382,8 @@ def _handle_delivery_status(
         )
         # Notify mastering engineer that delivery needs confirmation
         notify(db, [album.mastering_engineer_id], "delivery_awaiting_confirmation",
-               "母带文件待确认",
-               f"「{track.title}」的母带文件已上传，请确认后继续流程",
+               "母带交付待确认",
+               f"「{track.title}」的母带交付已提交，请确认后继续流程",
                related_track_id=track.id,
                background_tasks=background_tasks, album_id=track.album_id,
                webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
@@ -379,8 +394,9 @@ def _handle_delivery_status(
         from_status=previous_status, to_status=track.status,
         payload={"delivery_number": delivery_number},
     )
-    notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "母带文件已上传",
-           f"「{track.title}」母带文件已上传，等待审核", related_track_id=track.id,
+    notify_targets = [album.producer_id, *track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id)]
+    notify(db, notify_targets, "track_status_changed", "母带交付已提交",
+           f"「{track.title}」母带交付已提交，等待审核", related_track_id=track.id,
            background_tasks=background_tasks, album_id=track.album_id,
            webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
@@ -415,6 +431,135 @@ def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
         deduped.append(uid)
     return deduped
 
+def _album_team_user_ids(db: Session, album: Album) -> set[int]:
+    user_ids = get_album_member_ids(db, album.id)
+    if album.producer_id is not None:
+        user_ids.add(album.producer_id)
+    if album.mastering_engineer_id is not None:
+        user_ids.add(album.mastering_engineer_id)
+    return user_ids
+
+
+def _validated_composer_ids(
+    db: Session,
+    *,
+    album: Album,
+    composer_ids: list[int] | None,
+) -> list[int]:
+    ordered = _dedupe_user_ids(composer_ids or [])
+    if not ordered:
+        return []
+    team_ids = _album_team_user_ids(db, album)
+    invalid_team_ids = [user_id for user_id in ordered if user_id not in team_ids]
+    if invalid_team_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Users {sorted(invalid_team_ids)} are not active participants on this album.",
+        )
+    active_ids = set(
+        db.scalars(
+            select(User.id).where(
+                User.id.in_(ordered),
+                User.deleted_at.is_(None),
+                User.suspended_at.is_(None),
+            )
+        ).all()
+    )
+    invalid_active_ids = [user_id for user_id in ordered if user_id not in active_ids]
+    if invalid_active_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Users {sorted(invalid_active_ids)} are not active participants on this album.",
+        )
+    return ordered
+
+
+def _validated_track_composer_payload(
+    db: Session,
+    *,
+    album: Album,
+    current_user: User,
+    composer_ids: list[int] | None,
+    external_composer_names: list[str] | None,
+    proxy_submission: bool = False,
+    external_submitter_name: str | None = None,
+    include_current_user_by_default: bool,
+) -> tuple[list[int], list[str], int | None]:
+    legacy_external_name = (external_submitter_name or "").strip()
+    if legacy_external_name and not proxy_submission:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Enable proxy submission before setting an external submitter.",
+        )
+    if proxy_submission and album.producer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the album producer can upload on behalf of an external composer.",
+        )
+
+    external_names = _normalize_external_composer_names(
+        external_composer_names,
+        external_submitter_name=legacy_external_name if proxy_submission else None,
+    )
+    if proxy_submission and not external_names:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="External composer name is required for proxy submission.",
+        )
+
+    requested_composer_ids = list(composer_ids or [])
+    if include_current_user_by_default and not proxy_submission:
+        requested_composer_ids = [current_user.id, *requested_composer_ids]
+    platform_composer_ids = _validated_composer_ids(
+        db,
+        album=album,
+        composer_ids=requested_composer_ids,
+    )
+
+    if not platform_composer_ids and external_names and album.producer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the album producer can manage a track with only external composers.",
+        )
+    if not platform_composer_ids and not external_names:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one platform composer or external composer is required.",
+        )
+
+    proxy_uploader_id = current_user.id if proxy_submission or (external_names and not platform_composer_ids) else None
+    return platform_composer_ids, external_names, proxy_uploader_id
+
+
+def _replace_track_composer_links(db: Session, track: Track, composer_ids: list[int]) -> None:
+    existing = {
+        link.user_id: link
+        for link in db.scalars(
+            select(TrackComposer).where(TrackComposer.track_id == track.id)
+        ).all()
+    }
+    desired = set(composer_ids)
+    for user_id, link in existing.items():
+        if user_id not in desired:
+            db.delete(link)
+    for user_id in composer_ids:
+        if user_id not in existing:
+            db.add(TrackComposer(track_id=track.id, user_id=user_id))
+
+
+def _replace_track_external_composer_links(db: Session, track: Track, names: list[str]) -> None:
+    existing = list(
+        db.scalars(
+            select(TrackExternalComposer)
+            .where(TrackExternalComposer.track_id == track.id)
+            .order_by(TrackExternalComposer.sort_order, TrackExternalComposer.id)
+        ).all()
+    )
+    for link in existing:
+        db.delete(link)
+    for index, name in enumerate(names):
+        db.add(TrackExternalComposer(track_id=track.id, name=name, sort_order=index))
+
 
 def _track_read_with_identity_mask(
     track: Track,
@@ -443,8 +588,9 @@ def _validate_manual_reviewer_selection(
     db: Session,
     reviewer_limit: int,
 ) -> None:
-    if track.submitter_id in user_ids:
-        raise HTTPException(status_code=400, detail="Cannot assign the track author as reviewer.")
+    composer_ids = track_composer_ids(track, db)
+    if composer_ids & set(user_ids):
+        raise HTTPException(status_code=400, detail="Cannot assign a track composer as reviewer.")
 
     valid_reviewer_ids = get_album_member_ids(db, album.id)
     if album.producer_id is not None:
@@ -465,22 +611,30 @@ def _validate_manual_reviewer_selection(
         )
 
 
-def _ensure_revision_upload_permission(track: Track, album: Album, current_user: User) -> None:
+def _ensure_revision_upload_permission(db: Session, track: Track, album: Album, current_user: User) -> None:
     # Resubmit path: a finally-rejected-but-resubmittable track may always be
     # re-uploaded by its original submitter, regardless of the current step.
     if (
         track.status == TrackStatus.REJECTED
         and track.rejection_mode == RejectionMode.RESUBMITTABLE
     ):
-        if track.submitter_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Only the submitter can resubmit this track.")
+        if not is_track_composer_actor(track, album, current_user.id, db):
+            raise HTTPException(status_code=403, detail="Only a track composer can resubmit this track.")
         return
 
     config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
     if step is None or step.type != "revision":
         raise HTTPException(status_code=409, detail="This track is not waiting for a new source version.")
-    assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
+    if step.assignee_user_id is not None:
+        if step.assignee_user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the assigned user can upload a new source version.")
+        return
+    if step.assignee_role == "submitter":
+        if not is_track_composer_actor(track, album, current_user.id, db):
+            raise HTTPException(status_code=403, detail="Only the assigned user can upload a new source version.")
+        return
+    assignee_id = engine_resolve_assignee(album, track, step.assignee_role)
     if assignee_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the assigned user can upload a new source version.")
 
@@ -497,11 +651,42 @@ def _ensure_revision_upload_permission(track: Track, album: Album, current_user:
                 )
 
 
+def _ensure_external_source_link_permission(db: Session, track: Track, album: Album, current_user: User) -> None:
+    _ensure_revision_upload_permission(db, track, album, current_user)
+
+    from app.workflow_engine import get_step_by_id, get_steps
+
+    config = engine_parse_workflow_config(album)
+    step = engine_get_current_step(config, track)
+    if step is None or step.type != "revision" or not step.return_to:
+        raise HTTPException(
+            status_code=409,
+            detail="External source links are only allowed during mastering revision steps.",
+        )
+    return_step = get_step_by_id(get_steps(config), step.return_to)
+    if return_step is None or not _target_is_mastering_related(return_step):
+        raise HTTPException(
+            status_code=409,
+            detail="External source links are only allowed during mastering revision steps.",
+        )
+
+    # NEW: Validate that external link is allowed for this revision
+    if track.requested_revision_type == "source_audio":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This revision requires a source audio file upload. External links are not allowed.",
+        )
+
+
 def _ensure_delivery_upload_permission(track: Track, album: Album, current_user: User) -> None:
     config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
     if step is None or step.type != "delivery":
         raise HTTPException(status_code=409, detail="Track is not in a delivery stage.")
+    if step.assignee_user_id is None and step.assignee_role == "submitter":
+        if not is_track_composer_actor(track, album, current_user.id, db=None):
+            raise HTTPException(status_code=403, detail="Only the assigned user can upload a master delivery.")
+        return
     assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
     if assignee_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the assigned user can upload a master delivery.")
@@ -531,8 +716,8 @@ def _ensure_source_followup_request_allowed(
         raise HTTPException(status_code=403, detail="Quick follow-up is not enabled for this album.")
     if track.archived_at is not None:
         raise HTTPException(status_code=409, detail="Archived tracks cannot request a source follow-up.")
-    if track.submitter_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the track submitter can request a source follow-up.")
+    if not is_track_composer_actor(track, album, current_user.id, db):
+        raise HTTPException(status_code=403, detail="Only a track composer can request a source follow-up.")
     if track.status == TrackStatus.REJECTED.value:
         raise HTTPException(status_code=409, detail="Rejected tracks must use the resubmit flow.")
     if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
@@ -742,6 +927,10 @@ def _ensure_delivery_confirm_permission(track: Track, album: Album, current_user
         raise HTTPException(status_code=409, detail="Track is not in a delivery stage.")
     if not step.require_confirmation:
         raise HTTPException(status_code=409, detail="This delivery step does not require confirmation.")
+    if step.assignee_user_id is None and step.assignee_role == "submitter":
+        if not is_track_composer_actor(track, album, current_user.id, db=None):
+            raise HTTPException(status_code=403, detail="Only the assigned user can confirm delivery.")
+        return
     assignee_id = step.assignee_user_id or engine_resolve_assignee(album, track, step.assignee_role)
     if assignee_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the assigned user can confirm delivery.")
@@ -828,6 +1017,8 @@ def create_track(
     author_notes: str | None = Form(default=None),
     proxy_submission: bool = Form(default=False),
     external_submitter_name: str | None = Form(default=None),
+    composer_ids: list[int] | None = Form(default=None),
+    external_composer_names: list[str] | None = Form(default=None),
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db),
@@ -837,11 +1028,15 @@ def create_track(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-    external_name, proxy_uploader_id = _validate_proxy_submission(
+    platform_composer_ids, external_names, proxy_uploader_id = _validated_track_composer_payload(
+        db,
         album=album,
         current_user=current_user,
+        composer_ids=composer_ids,
+        external_composer_names=external_composer_names,
         proxy_submission=proxy_submission,
         external_submitter_name=external_submitter_name,
+        include_current_user_by_default=True,
     )
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(title)}_v1")
@@ -859,7 +1054,7 @@ def create_track(
         bpm=bpm or None,
         original_title=original_title or None,
         original_artist=original_artist or None,
-        external_submitter_name=external_name,
+        external_submitter_name=external_names[0] if external_names else None,
         author_notes=author_notes or None,
         track_number=max_num + 1,
         file_path=file_path,
@@ -870,6 +1065,8 @@ def create_track(
     )
     db.add(track)
     db.flush()
+    _replace_track_composer_links(db, track, platform_composer_ids)
+    _replace_track_external_composer_links(db, track, external_names)
     db.add(_source_version_create(track, current_user, file_path, duration))
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
 
@@ -966,11 +1163,15 @@ def request_track_upload(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-    _validate_proxy_submission(
+    _validated_track_composer_payload(
+        db,
         album=album,
         current_user=current_user,
+        composer_ids=params.composer_ids,
+        external_composer_names=params.external_composer_names,
         proxy_submission=params.proxy_submission,
         external_submitter_name=params.external_submitter_name,
+        include_current_user_by_default=True,
     )
 
     from app.services.r2 import make_object_key
@@ -1000,11 +1201,15 @@ def confirm_track_upload(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-    external_name, proxy_uploader_id = _validate_proxy_submission(
+    platform_composer_ids, external_names, proxy_uploader_id = _validated_track_composer_payload(
+        db,
         album=album,
         current_user=current_user,
+        composer_ids=params.composer_ids,
+        external_composer_names=params.external_composer_names,
         proxy_submission=params.proxy_submission,
         external_submitter_name=params.external_submitter_name,
+        include_current_user_by_default=True,
     )
 
     _validate_r2_object_key(params.object_key, expected_prefix=f"tracks/new/source/{current_user.id}")
@@ -1028,7 +1233,7 @@ def confirm_track_upload(
         bpm=params.bpm or None,
         original_title=params.original_title or None,
         original_artist=params.original_artist or None,
-        external_submitter_name=external_name,
+        external_submitter_name=external_names[0] if external_names else None,
         author_notes=params.author_notes or None,
         track_number=max_num + 1,
         file_path=params.object_key,
@@ -1040,6 +1245,8 @@ def confirm_track_upload(
     )
     db.add(track)
     db.flush()
+    _replace_track_composer_links(db, track, platform_composer_ids)
+    _replace_track_external_composer_links(db, track, external_names)
     sv = TrackSourceVersion(
         track_id=track.id,
         workflow_cycle=track.workflow_cycle,
@@ -1051,6 +1258,8 @@ def confirm_track_upload(
     )
     db.add(sv)
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
+
+
     logger.info(
         "track_confirm_upload track_id=%s album_id=%s user_id=%s storage_backend=r2",
         track.id,
@@ -1071,6 +1280,36 @@ def confirm_track_upload(
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
 
+@router.patch("/{track_id}/composers", response_model=TrackRead)
+def update_track_composers(
+    track_id: int,
+    payload: TrackComposerUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if current_user.id != album.producer_id and not is_track_composer_actor(track, album, current_user.id, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the producer or a composer-side actor can update track composers.")
+
+    platform_composer_ids, external_names, proxy_uploader_id = _validated_track_composer_payload(
+        db,
+        album=album,
+        current_user=current_user,
+        composer_ids=payload.composer_ids,
+        external_composer_names=payload.external_composer_names,
+        include_current_user_by_default=False,
+    )
+    _replace_track_composer_links(db, track, platform_composer_ids)
+    _replace_track_external_composer_links(db, track, external_names)
+    track.external_submitter_name = external_names[0] if external_names else None
+    track.proxy_uploader_id = proxy_uploader_id
+    db.commit()
+    db.refresh(track)
+    return build_track_read(track, current_user, album, db=db)
+
 
 @router.post("/{track_id}/source-versions/request-upload", response_model=PresignedUploadResponse)
 def request_source_version_upload(
@@ -1087,7 +1326,7 @@ def request_source_version_upload(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    _ensure_revision_upload_permission(track, album, current_user)
+    _ensure_revision_upload_permission(db, track, album, current_user)
 
     from app.services.r2 import make_object_key
 
@@ -1117,7 +1356,7 @@ def confirm_source_version_upload(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    _ensure_revision_upload_permission(track, album, current_user)
+    _ensure_revision_upload_permission(db, track, album, current_user)
     _validate_r2_object_key(
         params.object_key,
         expected_prefix=f"tracks/{track_id}/source/{track.version + 1}",
@@ -1245,7 +1484,7 @@ def request_master_delivery_upload(
 @router.post("/{track_id}/master-deliveries/confirm-upload", response_model=TrackRead)
 def confirm_master_delivery_upload(
     track_id: int,
-    params: ConfirmUploadParams,
+    params: ConfirmMasterDeliveryUploadParams,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -1267,12 +1506,15 @@ def confirm_master_delivery_upload(
         expected_prefix=f"tracks/{track_id}/master/{delivery_number}",
     )
     _verify_r2_object(params.object_key)
+    delivery_message = params.delivery_message.strip() if params.delivery_message else None
     delivery = MasterDelivery(
         track_id=track.id,
         workflow_cycle=track.workflow_cycle,
         delivery_number=delivery_number,
         file_path=params.object_key,
         storage_backend="r2",
+        delivery_kind="file",
+        delivery_message=delivery_message,
         uploaded_by_id=current_user.id,
     )
     db.add(delivery)
@@ -1290,7 +1532,7 @@ def confirm_delivery(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
-    """Mastering engineer confirms an uploaded delivery after previewing it."""
+    """Mastering engineer confirms a submitted delivery after reviewing it."""
     from app.workflow_engine import execute_delivery_confirm
 
     track = db.get(Track, track_id)
@@ -1316,8 +1558,9 @@ def confirm_delivery(
         from_status=previous_status, to_status=track.status,
         payload={"delivery_id": delivery.id, "delivery_number": delivery.delivery_number},
     )
-    notify(db, [album.producer_id, track.submitter_id], "track_status_changed", "母带文件已确认",
-           f"「{track.title}」母带文件已确认，等待审核", related_track_id=track.id,
+    notify_targets = [album.producer_id, *track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id)]
+    notify(db, notify_targets, "track_status_changed", "母带交付已确认",
+           f"「{track.title}」母带交付已确认，等待审核", related_track_id=track.id,
            background_tasks=background_tasks, album_id=track.album_id,
            webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
     db.commit()
@@ -1406,7 +1649,7 @@ def list_tracks(
         if alb is None:
             continue
         is_privileged = current_user.is_admin or current_user.id in (alb.producer_id, alb.mastering_engineer_id)
-        is_submitter = track.submitter_id == current_user.id
+        is_submitter = is_track_composer_actor(track, alb, current_user.id, db)
         is_reviewer = track.peer_reviewer_id == current_user.id
         is_assigned_reviewer = track.id in assigned_track_ids
         if track.album_id not in visible_album_ids:
@@ -1541,7 +1784,7 @@ def update_track_metadata(
 ) -> TrackRead:
     """Update track metadata (title, artist, bpm, original_title, original_artist).
 
-    Only the track submitter or the album producer may call this endpoint.
+    Only a track composer or the album producer may call this endpoint.
     """
     track = db.get(Track, track_id)
     if track is None:
@@ -1549,10 +1792,10 @@ def update_track_metadata(
     album = db.get(Album, track.album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if current_user.id not in {track.submitter_id, album.producer_id}:
+    if current_user.id != album.producer_id and not is_track_composer_actor(track, album, current_user.id, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the track submitter or album producer can edit track metadata.",
+            detail="Only a track composer or album producer can edit track metadata.",
         )
 
     changes: dict[str, dict[str, str | None]] = {}
@@ -1584,17 +1827,17 @@ def update_author_notes(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
-    """Update the author's submission notes. Only the track submitter may call this."""
+    """Update the author's submission notes. Only track composers may call this."""
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = db.get(Album, track.album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if track.submitter_id != current_user.id:
+    if not is_track_composer_actor(track, album, current_user.id, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the track author can update author notes.",
+            detail="Only a track composer can update author notes.",
         )
     track.author_notes = payload.author_notes
     db.commit()
@@ -1609,17 +1852,17 @@ def update_mastering_notes(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
-    """Update the mastering notes. Only the track submitter may call this."""
+    """Update the mastering notes. Only track composers may call this."""
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = db.get(Album, track.album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if track.submitter_id != current_user.id:
+    if not is_track_composer_actor(track, album, current_user.id, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the track author can update mastering notes.",
+            detail="Only a track composer can update mastering notes.",
         )
     track.mastering_notes = payload.mastering_notes
     db.commit()
@@ -1893,8 +2136,8 @@ def create_reopen_request(
     album = ensure_track_visibility(track, current_user, db)
     if track.status != "completed":
         raise HTTPException(status_code=409, detail="Only completed tracks can be reopened.")
-    if track.submitter_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the track author can request a reopen.")
+    if not is_track_composer_actor(track, album, current_user.id, db):
+        raise HTTPException(status_code=403, detail="Only a track composer can request a reopen.")
 
     # Check for pending requests
     existing = db.scalar(
@@ -2157,8 +2400,8 @@ def cancel_source_followup_request(
     album = ensure_track_visibility(track, current_user, db)
     if req.status != "pending":
         raise HTTPException(status_code=409, detail="This source follow-up request is not pending.")
-    if req.requested_by_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the requester can cancel this source follow-up.")
+    if not is_track_composer_actor(track, album, current_user.id, db):
+        raise HTTPException(status_code=403, detail="Only a track composer can cancel this source follow-up.")
 
     previous_status = track.status
     if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
@@ -2196,7 +2439,7 @@ def upload_source_version(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    _ensure_revision_upload_permission(track, album, current_user)
+    _ensure_revision_upload_permission(db, track, album, current_user)
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_v{track.version + 1}")
     _finalize_source_version_upload(
@@ -2224,12 +2467,57 @@ def upload_source_version(
     broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
+@router.post("/{track_id}/source-versions/external-link", response_model=TrackRead)
+def submit_source_external_link(
+    track_id: int,
+    payload: SourceExternalLinkSubmission,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    _ensure_external_source_link_permission(db, track, album, current_user)
+
+    preserved_storage_backend = track.storage_backend
+    _finalize_source_version_upload(
+        db,
+        album=album,
+        track=track,
+        current_user=current_user,
+        background_tasks=background_tasks,
+        file_path=None,
+        storage_backend=preserved_storage_backend,
+        duration=None,
+        revision_notes=payload.revision_notes,
+        resolved_issue_ids=payload.resolved_issue_ids,
+        resolution_note=payload.resolution_note,
+        source_kind="external_link",
+        replace_current_audio=False,
+    )
+    logger.info(
+        "source_external_link_submit track_id=%s user_id=%s version=%s resolved_issue_count=%s",
+        track.id,
+        current_user.id,
+        track.version,
+        len(payload.resolved_issue_ids),
+    )
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track_id)
+    return build_track_read(track, current_user, album, db=db)
+
+
+
 
 @router.post("/{track_id}/master-deliveries", response_model=TrackRead)
 def upload_master_delivery(
     track_id: int,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(default=None),
+    delivery_message: str | None = Form(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
@@ -2238,6 +2526,9 @@ def upload_master_delivery(
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
     _ensure_delivery_upload_permission(track, album, current_user)
+    normalized_delivery_message = delivery_message.strip() if delivery_message else None
+    if file is None:
+        raise HTTPException(status_code=422, detail="Master delivery requires an audio file.")
 
     delivery_number = 1
     current_delivery = current_master_delivery(track)
@@ -2249,6 +2540,8 @@ def upload_master_delivery(
         workflow_cycle=track.workflow_cycle,
         delivery_number=delivery_number,
         file_path=file_path,
+        delivery_kind="file",
+        delivery_message=normalized_delivery_message,
         uploaded_by_id=current_user.id,
     )
     db.add(delivery)
@@ -2269,15 +2562,17 @@ def approve_final_review(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if track.status != TrackStatus.FINAL_REVIEW or current_user.id not in {album.producer_id, track.submitter_id}:
-        raise HTTPException(status_code=403, detail="Only the producer or submitter can approve final review.")
+    if track.status != TrackStatus.FINAL_REVIEW or (
+        current_user.id != album.producer_id and not is_track_composer_actor(track, album, current_user.id, db)
+    ):
+        raise HTTPException(status_code=403, detail="Only the producer or a track composer can approve final review.")
     delivery = current_master_delivery(track)
     if delivery is None:
         raise HTTPException(status_code=409, detail="No master delivery available.")
 
     now = datetime.now(timezone.utc)
     is_producer = current_user.id == album.producer_id
-    is_submitter = current_user.id == track.submitter_id
+    is_submitter = is_track_composer_actor(track, album, current_user.id, db)
 
     if is_producer and is_submitter:
         delivery.producer_approved_at = delivery.producer_approved_at or now
@@ -2303,7 +2598,11 @@ def approve_final_review(
         payload={"delivery_id": delivery.id},
     )
     if track.status == TrackStatus.COMPLETED:
-        notify(db, [track.submitter_id, album.mastering_engineer_id], "track_status_changed",
+        notify_targets = [
+            *track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id),
+            album.mastering_engineer_id,
+        ]
+        notify(db, notify_targets, "track_status_changed",
                "曲目已完成！", f"「{track.title}」已完成所有审核流程！", related_track_id=track.id,
                background_tasks=background_tasks, album_id=track.album_id,
                webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name, "to_step": "已完成"})
@@ -2325,15 +2624,15 @@ def request_return_in_final_review(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    """Submitter asks the producer to return the track during final review."""
+    """Composer asks the producer to return the track during final review."""
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
 
-    # Must be the submitter (and not the producer — the producer can return directly)
-    if current_user.id != track.submitter_id or current_user.id == album.producer_id:
-        raise HTTPException(status_code=403, detail="Only the submitter (non-producer) can request a return.")
+    # Must be a composer (and not the producer — the producer can return directly)
+    if not is_track_composer_actor(track, album, current_user.id, db) or current_user.id == album.producer_id:
+        raise HTTPException(status_code=403, detail="Only a non-producer track composer can request a return.")
 
     # Verify track is in a final_review step
     from app.workflow_engine import get_current_step
@@ -2375,7 +2674,7 @@ def archive_track(
         raise HTTPException(status_code=409, detail="Track is already archived.")
     track.archived_at = datetime.now(timezone.utc)
     log_track_event(db, track, current_user, "track_archived", payload={"previous_status": track.status})
-    notify(db, [track.submitter_id], "track_archived", "曲目已归档",
+    notify(db, track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id), "track_archived", "曲目已归档",
            f"「{track.title}」已被制作人归档", related_track_id=track.id,
            background_tasks=background_tasks, album_id=track.album_id,
            webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
@@ -2401,7 +2700,7 @@ def restore_track(
         raise HTTPException(status_code=409, detail="Track is not archived.")
     track.archived_at = None
     log_track_event(db, track, current_user, "track_restored")
-    notify(db, [track.submitter_id], "track_restored", "曲目已恢复",
+    notify(db, track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id), "track_restored", "曲目已恢复",
            f"「{track.title}」已被制作人恢复", related_track_id=track.id,
            background_tasks=background_tasks, album_id=track.album_id,
            webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
@@ -2478,6 +2777,9 @@ def get_source_version_audio(
     version = db.get(TrackSourceVersion, version_id)
     if version is None or version.track_id != track_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found.")
+    if not version.file_path:
+        raise HTTPException(status_code=404, detail="This source version does not include an audio file.")
+
 
     # immutable=True: version_id in URL guarantees content never changes
     return _serve_audio(version.file_path, version.storage_backend, f"{track.title}-v{version.version_number}", resolve, immutable=True)
@@ -2499,6 +2801,8 @@ def serve_master_audio(
     delivery = current_master_delivery(track)
     if delivery is None:
         raise HTTPException(status_code=404, detail="No master delivery is available for this track.")
+    if not delivery.file_path:
+        raise HTTPException(status_code=404, detail="This master delivery does not include an audio file.")
     # immutable=False: same URL serves new master deliveries across workflow cycles
     return _serve_audio(delivery.file_path, delivery.storage_backend, f"{track.title}-master", resolve, immutable=False)
 
@@ -2521,6 +2825,8 @@ def get_master_delivery_audio(
     delivery = db.get(MasterDelivery, delivery_id)
     if delivery is None or delivery.track_id != track_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found.")
+    if not delivery.file_path:
+        raise HTTPException(status_code=404, detail="This master delivery does not include an audio file.")
 
     filename = f"{track.title}-master-v{delivery.delivery_number}"
     if delivery.workflow_cycle != track.workflow_cycle:
