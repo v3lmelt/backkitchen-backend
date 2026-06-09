@@ -24,7 +24,7 @@ from app.models.checklist import ChecklistItem
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.master_delivery import MasterDelivery
 from app.models.track import RejectionMode, Track
-from app.models.track_composer import TrackComposer
+from app.models.track_composer import TrackComposer, TrackExternalComposer
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.invitation import Invitation
@@ -214,6 +214,8 @@ class Factory:
         create_source_version: bool = True,
         file_path: str | None = None,
         composers: list[User] | None = None,
+        external_composers: list[str] | None = None,
+        include_submitter_composer: bool = True,
     ) -> Track:
         audio_path = file_path or self._audio_file()
         track = Track(
@@ -234,11 +236,18 @@ class Factory:
         self.session.commit()
         self.session.refresh(track)
         seen_composer_ids: set[int] = set()
-        for composer in [submitter, *(composers or [])]:
+        platform_composers = ([submitter] if include_submitter_composer else []) + list(composers or [])
+        for composer in platform_composers:
             if composer.id in seen_composer_ids:
                 continue
             seen_composer_ids.add(composer.id)
             self.session.add(TrackComposer(track_id=track.id, user_id=composer.id))
+        for index, name in enumerate(external_composers or []):
+            self.session.add(TrackExternalComposer(track_id=track.id, name=name, sort_order=index))
+        if external_composers:
+            track.external_submitter_name = external_composers[0]
+            if not seen_composer_ids:
+                track.proxy_uploader_id = album.producer_id
         self.session.commit()
 
         if create_source_version and audio_path:

@@ -9,7 +9,7 @@ from app.models.master_delivery import MasterDelivery
 from app.models.notification import Notification
 from app.models.stage_assignment import StageAssignment
 from app.models.track import TrackStatus
-from app.models.track_composer import TrackComposer
+from app.models.track_composer import TrackComposer, TrackExternalComposer
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 from app.workflow_engine import assign_reviewers, get_current_step, parse_workflow_config
 
@@ -230,8 +230,8 @@ def test_all_composers_are_excluded_from_reviewer_assignment(client, db_session,
     ).all()
 
 
-def test_track_composer_patch_preserves_primary_submitter(client, db_session, factory, auth_headers):
-    producer, _mastering, submitter, secondary, _reviewer, _album, track = _collab_track(factory)
+def test_track_composer_patch_validates_members_and_replaces_platform_list(client, db_session, factory, auth_headers):
+    producer, _mastering, _submitter, secondary, _reviewer, _album, track = _collab_track(factory)
     replacement = factory.user(username="replacement")
     db_session.add(TrackComposer(track_id=track.id, user_id=replacement.id))
     db_session.commit()
@@ -254,4 +254,124 @@ def test_track_composer_patch_preserves_primary_submitter(client, db_session, fa
         json={"composer_ids": [secondary.id, replacement.id]},
     )
     assert response.status_code == 200
-    assert set(response.json()["composer_ids"]) == {submitter.id, secondary.id, replacement.id}
+    assert set(response.json()["composer_ids"]) == {secondary.id, replacement.id}
+
+
+def test_create_track_accepts_multiple_external_composers_with_platform_composer(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer", username="producer-external-create")
+    mastering = factory.user(role="mastering_engineer", username="mastering-external-create")
+    submitter = factory.user(username="submitter-external-create")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+
+    response = client.post(
+        "/api/tracks",
+        headers=auth_headers(submitter),
+        data={
+            "title": "Mixed Song",
+            "artist": "Mixed Unit",
+            "album_id": str(album.id),
+            "external_composer_names": ["Guest A", "Guest B"],
+        },
+        files={"file": ("mixed.wav", BytesIO(b"RIFFmixed"), "audio/wav")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["composer_ids"] == [submitter.id]
+    assert body["external_composer_names"] == ["Guest A", "Guest B"]
+    assert [item["name"] for item in body["external_composers"]] == ["Guest A", "Guest B"]
+    assert body["is_proxy_submission"] is False
+
+    stored_names = db_session.scalars(
+        select(TrackExternalComposer.name)
+        .where(TrackExternalComposer.track_id == body["id"])
+        .order_by(TrackExternalComposer.sort_order)
+    ).all()
+    assert stored_names == ["Guest A", "Guest B"]
+
+
+def test_external_only_track_uses_producer_as_composer_actor(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer", username="external-only-producer")
+    mastering = factory.user(role="mastering_engineer", username="external-only-mastering")
+    reviewer = factory.user(username="external-only-reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[reviewer], quick_followup_enabled=True)
+    track = factory.track(
+        album=album,
+        submitter=producer,
+        status="peer_revision",
+        peer_reviewer=reviewer,
+        external_composers=["Offline A", "Offline B"],
+        include_submitter_composer=False,
+    )
+    track.proxy_uploader_id = producer.id
+    db_session.commit()
+
+    detail = client.get(f"/api/tracks/{track.id}", headers=auth_headers(producer))
+    assert detail.status_code == 200
+    detail_track = detail.json()["track"]
+    assert detail_track["composer_ids"] == []
+    assert detail_track["external_composer_names"] == ["Offline A", "Offline B"]
+    assert "upload_revision" in detail_track["allowed_actions"]
+
+    revision = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(producer),
+        files={"file": ("revision.wav", BytesIO(b"RIFFexternal"), "audio/wav")},
+    )
+    assert revision.status_code == 200
+    assert revision.json()["version"] == 2
+
+
+def test_platform_composer_can_handle_mixed_external_track_actions(client, factory, auth_headers):
+    _producer, _mastering, _submitter, secondary, _reviewer, _album, track = _collab_track(
+        factory,
+        status="peer_revision",
+    )
+    factory.session.add(TrackExternalComposer(track_id=track.id, name="Offline Guest", sort_order=0))
+    track.external_submitter_name = "Offline Guest"
+    factory.session.commit()
+
+    revision = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(secondary),
+        files={"file": ("revision.wav", BytesIO(b"RIFFmixedrev"), "audio/wav")},
+    )
+
+    assert revision.status_code == 200
+    body = revision.json()
+    assert set(body["composer_ids"]) == {track.submitter_id, secondary.id}
+    assert body["external_composer_names"] == ["Offline Guest"]
+
+
+def test_patch_track_composers_updates_external_names_and_rejects_external_only_non_producer(client, db_session, factory, auth_headers):
+    producer, _mastering, submitter, secondary, _reviewer, _album, track = _collab_track(factory)
+
+    mixed = client.patch(
+        f"/api/tracks/{track.id}/composers",
+        headers=auth_headers(submitter),
+        json={
+            "composer_ids": [submitter.id, secondary.id],
+            "external_composer_names": ["Guest A", "Guest B"],
+        },
+    )
+    assert mixed.status_code == 200
+    assert set(mixed.json()["composer_ids"]) == {submitter.id, secondary.id}
+    assert mixed.json()["external_composer_names"] == ["Guest A", "Guest B"]
+
+    external_only_by_submitter = client.patch(
+        f"/api/tracks/{track.id}/composers",
+        headers=auth_headers(submitter),
+        json={"composer_ids": [], "external_composer_names": ["Guest Only"]},
+    )
+    assert external_only_by_submitter.status_code == 403
+
+    external_only_by_producer = client.patch(
+        f"/api/tracks/{track.id}/composers",
+        headers=auth_headers(producer),
+        json={"composer_ids": [], "external_composer_names": ["Guest Only"]},
+    )
+    assert external_only_by_producer.status_code == 200
+    body = external_only_by_producer.json()
+    assert body["composer_ids"] == []
+    assert body["external_composer_names"] == ["Guest Only"]
+    assert body["proxy_uploader_id"] == producer.id

@@ -12,7 +12,7 @@ PRE_ADMIN_GOVERNANCE_REVISION = "f3a2b1c4d5e6"
 PRE_AUDIT_LOG_REVISION = "f4b5c6d7e8f9"
 PRE_TRACK_DELETE_INTEGRITY_REVISION = "n1o2p3q4r5s6"
 PRE_ASSIGNMENT_DEDUPE_REVISION = "p2q3r4s5t6u7"
-HEAD_REVISION = "v8w9x0y1z2a3"
+HEAD_REVISION = "w9x0y1z2a3b4"
 
 
 def _sqlite_url(db_path: Path) -> str:
@@ -282,12 +282,15 @@ def _create_pre_track_composers_schema(db_path: Path) -> None:
             CREATE TABLE tracks (
                 id INTEGER NOT NULL PRIMARY KEY,
                 submitter_id INTEGER,
+                proxy_uploader_id INTEGER,
+                external_submitter_name VARCHAR(100),
                 FOREIGN KEY(submitter_id) REFERENCES users(id)
             );
-            INSERT INTO tracks (id, submitter_id) VALUES
-                (1, 1),
-                (2, NULL),
-                (3, 2);
+            INSERT INTO tracks (id, submitter_id, proxy_uploader_id, external_submitter_name) VALUES
+                (1, 1, NULL, NULL),
+                (2, NULL, NULL, NULL),
+                (3, 2, NULL, NULL),
+                (4, 1, 1, 'Offline Composer');
 
             CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
             INSERT INTO alembic_version (version_num) VALUES ('t6u7v8w9x0y1');
@@ -536,6 +539,14 @@ def test_track_composer_migration_backfills_primary_submitters(tmp_path: Path) -
             ORDER BY track_id, user_id
             """
         ).fetchall() == [(1, 1), (3, 2)]
+        assert conn.execute(
+            """
+            SELECT track_id, name, sort_order
+            FROM track_external_composers
+            ORDER BY track_id, sort_order
+            """
+        ).fetchall() == [(4, "Offline Composer", 0)]
+        assert conn.execute("PRAGMA index_list('track_external_composers')").fetchall()
         assert conn.execute("PRAGMA index_list('track_composers')").fetchall()
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:

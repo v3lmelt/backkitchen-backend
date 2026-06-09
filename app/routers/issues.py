@@ -44,11 +44,12 @@ from app.workflow import (
     current_source_version,
     ensure_track_visibility,
     is_track_composer,
+    is_track_composer_actor,
     log_track_event,
     next_issue_local_number,
     peer_identity_anonymize_user_ids_for_viewer,
-    track_composer_ids,
-    track_composer_ids_for_notify,
+    track_composer_actor_ids_for_notify,
+    track_composer_actor_ordered_ids,
 )
 from app.workflow_engine import (
     get_steps,
@@ -267,7 +268,7 @@ def _ensure_comment_visible_to_user(comment: Comment, track: Track, user: User, 
 def _ensure_issue_update_permission(issue: Issue, track: Track, album: Album, user: User, db: Session) -> None:
     reviewer_ids = _phase_reviewer_ids(issue, track, album, db)
     status_handler_ids = _status_handler_ids(issue, track, album, db)
-    allowed = track_composer_ids(track, db) | {issue.author_id} | reviewer_ids | status_handler_ids
+    allowed = set(track_composer_actor_ordered_ids(track, album, db)) | {issue.author_id} | reviewer_ids | status_handler_ids
     allowed.discard(None)
     if user.id not in allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to update this issue.")
@@ -295,7 +296,7 @@ def _validate_status_transition(
     if old == new_status:
         return
 
-    is_submitter = is_track_composer(track, user.id, db)
+    is_submitter = is_track_composer_actor(track, album, user.id, db)
     handler_ids = _status_handler_ids(issue, track, album, db)
     is_status_handler = user.id in handler_ids or (
         issue.phase != IssuePhase.FINAL_REVIEW.value and user.id == issue.author_id
@@ -647,7 +648,7 @@ async def create_issue(
         "issue_created",
         payload={"phase": effective_phase, "title": issue_title, "issue_id": issue.id},
     )
-    notify_ids = track_composer_ids_for_notify(track, db, skip_user_id=current_user.id)
+    notify_ids = track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id)
     if notify_ids and not _is_submitter_hidden_issue_status(issue.status):
         notify(db, notify_ids, "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
@@ -921,7 +922,7 @@ async def update_issue(
     ):
         notify(
             db,
-            track_composer_ids_for_notify(track, db, skip_user_id=current_user.id),
+            track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id),
             "new_issue",
             f"新问题：{issue.title}",
             f"「{track.title}」上有新的审核问题",
@@ -1100,7 +1101,7 @@ async def add_comment(
 
     participant_ids = [issue.author_id] + [c.author_id for c in issue.comments if c.id != comment.id]
     if comment_visibility == "public":
-        participant_ids.extend(track_composer_ids_for_notify(track, db, skip_user_id=current_user.id))
+        participant_ids.extend(track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id))
     notify_ids = [uid for uid in dict.fromkeys(participant_ids) if uid != current_user.id]
     if notify_ids:
         notify(db, notify_ids, "new_comment", "新评论",

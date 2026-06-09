@@ -15,6 +15,7 @@ from app.models.master_delivery import MasterDelivery
 from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
+from app.models.track_composer import TrackExternalComposer
 from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.workflow_event import WorkflowEvent
@@ -78,6 +79,9 @@ def test_create_proxy_track_as_producer_records_external_submitter(client, db_se
     assert body["submitter_id"] == producer.id
     assert body["proxy_uploader_id"] == producer.id
     assert body["external_submitter_name"] == "Offline Composer"
+    assert body["external_composer_names"] == ["Offline Composer"]
+    assert [item["name"] for item in body["external_composers"]] == ["Offline Composer"]
+    assert body["composer_ids"] == []
     assert body["is_proxy_submission"] is True
     assert body["submitter"]["id"] == producer.id
     assert body["proxy_uploader"]["id"] == producer.id
@@ -86,6 +90,10 @@ def test_create_proxy_track_as_producer_records_external_submitter(client, db_se
     assert track.submitter_id == producer.id
     assert track.proxy_uploader_id == producer.id
     assert track.external_submitter_name == "Offline Composer"
+    external_names = db_session.scalars(
+        select(TrackExternalComposer.name).where(TrackExternalComposer.track_id == track.id)
+    ).all()
+    assert external_names == ["Offline Composer"]
     assert track.source_versions[0].uploaded_by_id == producer.id
 
 
@@ -757,8 +765,13 @@ def test_proxy_track_producer_final_approval_counts_for_submitter(client, db_ses
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
     album = factory.album(producer=producer, mastering_engineer=mastering)
-    track = factory.track(album=album, submitter=producer, status=TrackStatus.FINAL_REVIEW)
-    track.external_submitter_name = "Offline Composer"
+    track = factory.track(
+        album=album,
+        submitter=producer,
+        status=TrackStatus.FINAL_REVIEW,
+        external_composers=["Offline Composer"],
+        include_submitter_composer=False,
+    )
     track.proxy_uploader_id = producer.id
     delivery = factory.master_delivery(track=track, uploaded_by=mastering, delivery_number=1)
     db_session.commit()
@@ -1182,8 +1195,9 @@ def test_proxy_track_producer_can_upload_submitter_revision(client, db_session, 
         submitter=producer,
         status="peer_revision",
         peer_reviewer=reviewer,
+        external_composers=["Offline Composer"],
+        include_submitter_composer=False,
     )
-    track.external_submitter_name = "Offline Composer"
     track.proxy_uploader_id = producer.id
     db_session.commit()
 
@@ -1198,6 +1212,8 @@ def test_proxy_track_producer_can_upload_submitter_revision(client, db_session, 
     assert body["status"] == "peer_review"
     assert body["version"] == 2
     assert body["external_submitter_name"] == "Offline Composer"
+    assert body["external_composer_names"] == ["Offline Composer"]
+    assert body["composer_ids"] == []
     assert body["is_proxy_submission"] is True
 
 
@@ -1616,11 +1632,18 @@ def test_r2_proxy_track_upload_records_external_submitter(client, db_session, fa
     body = confirm_response.json()
     assert body["proxy_uploader_id"] == producer.id
     assert body["external_submitter_name"] == "Offline Composer"
+    assert body["external_composer_names"] == ["Offline Composer"]
+    assert [item["name"] for item in body["external_composers"]] == ["Offline Composer"]
+    assert body["composer_ids"] == []
     assert body["is_proxy_submission"] is True
     track = db_session.get(Track, body["id"])
     assert track.storage_backend == "r2"
     assert track.proxy_uploader_id == producer.id
     assert track.external_submitter_name == "Offline Composer"
+    external_names = db_session.scalars(
+        select(TrackExternalComposer.name).where(TrackExternalComposer.track_id == track.id)
+    ).all()
+    assert external_names == ["Offline Composer"]
 
 
 def test_confirm_source_version_upload_rejects_unexpected_r2_key(client, factory, auth_headers, monkeypatch):

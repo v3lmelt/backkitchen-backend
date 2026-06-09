@@ -41,7 +41,7 @@ from app.workflow import (
     is_track_composer,
     mask_user_read_if_needed,
     peer_identity_anonymize_user_ids_for_viewer,
-    track_composer_ids,
+    track_composer_actor_ordered_ids,
 )
 
 router = APIRouter(tags=["discussions"])
@@ -414,10 +414,10 @@ async def create_discussion(
     elif audios and phase != "mastering":
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Audio uploads are only allowed in mastering discussions.")
 
-    composer_ids = track_composer_ids(track, db)
+    composer_actor_ids = track_composer_actor_ordered_ids(track, album, db)
     # Notify participants — mastering discussions notify composers, mastering engineer, and producer
     if phase == "mastering":
-        participant_ids: set[int | None] = set(composer_ids) | {album.producer_id}
+        participant_ids: set[int | None] = set(composer_actor_ids) | {album.producer_id}
         if album.mastering_engineer_id:
             participant_ids.add(album.mastering_engineer_id)
         notify_body = f"「{track.title}」有新的母带讨论"
@@ -430,7 +430,7 @@ async def create_discussion(
                 )
             ).all()
         )
-        participant_ids = set(composer_ids) | {track.peer_reviewer_id, album.producer_id, *reviewer_ids}
+        participant_ids = set(composer_actor_ids) | {track.peer_reviewer_id, album.producer_id, *reviewer_ids}
         if album.mastering_engineer_id:
             participant_ids.add(album.mastering_engineer_id)
         notify_body = f"「{track.title}」有新的讨论"

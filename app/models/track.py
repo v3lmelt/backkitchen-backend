@@ -97,6 +97,12 @@ class Track(Base):
         back_populates="track",
         cascade="all, delete-orphan",
     )
+    external_composer_links: Mapped[list["TrackExternalComposer"]] = relationship(  # noqa: F821
+        "TrackExternalComposer",
+        back_populates="track",
+        cascade="all, delete-orphan",
+        order_by="TrackExternalComposer.sort_order",
+    )
     album: Mapped["Album"] = relationship("Album", back_populates="tracks")  # noqa: F821
     submitter: Mapped["User | None"] = relationship(  # noqa: F821
         "User", foreign_keys=[submitter_id]

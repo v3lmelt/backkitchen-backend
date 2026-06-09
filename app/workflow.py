@@ -26,7 +26,7 @@ from app.models.reopen_request import ReopenRequest
 from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus
-from app.models.track_composer import TrackComposer
+from app.models.track_composer import TrackComposer, TrackExternalComposer
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
@@ -47,6 +47,7 @@ from app.schemas.schemas import (
     MasterDeliveryRead,
     MentionCandidatesRead,
     TrackDetailResponse,
+    TrackExternalComposerRead,
     TrackRead,
     TrackSourceVersionRead,
     UserRead,
@@ -110,7 +111,6 @@ def track_composer_ordered_ids(track: Track, db: Session | None = None) -> list[
         seen.add(user_id)
         ordered.append(user_id)
 
-    add(track.submitter_id)
     links = None
     if db is not None and track.id is not None:
         links = db.scalars(
@@ -132,6 +132,75 @@ def track_composer_ids(track: Track, db: Session | None = None) -> set[int]:
 
 def is_track_composer(track: Track, user_id: int | None, db: Session | None = None) -> bool:
     return user_id is not None and user_id in track_composer_ids(track, db)
+
+
+def track_external_composer_links(
+    track: Track,
+    db: Session | None = None,
+) -> list[TrackExternalComposer]:
+    if db is not None and track.id is not None:
+        return list(
+            db.scalars(
+                select(TrackExternalComposer)
+                .where(TrackExternalComposer.track_id == track.id)
+                .order_by(TrackExternalComposer.sort_order, TrackExternalComposer.id)
+            ).all()
+        )
+    return list(getattr(track, "external_composer_links", None) or [])
+
+
+def track_external_composer_names(
+    track: Track,
+    db: Session | None = None,
+) -> list[str]:
+    names = [link.name for link in track_external_composer_links(track, db) if link.name]
+    if names:
+        return names
+    legacy_name = (track.external_submitter_name or "").strip()
+    return [legacy_name] if legacy_name else []
+
+
+def track_external_composer_reads(
+    track: Track,
+    db: Session,
+) -> list[TrackExternalComposerRead]:
+    return [
+        TrackExternalComposerRead.model_validate(link)
+        for link in track_external_composer_links(track, db)
+    ]
+
+
+def track_composer_actor_ordered_ids(
+    track: Track,
+    album: Album,
+    db: Session | None = None,
+) -> list[int]:
+    platform_ids = track_composer_ordered_ids(track, db)
+    if platform_ids:
+        return platform_ids
+    if track_external_composer_names(track, db) and album.producer_id is not None:
+        return [album.producer_id]
+    return [track.submitter_id] if track.submitter_id is not None else []
+
+
+def is_track_composer_actor(
+    track: Track,
+    album: Album,
+    user_id: int | None,
+    db: Session | None = None,
+) -> bool:
+    return user_id is not None and user_id in track_composer_actor_ordered_ids(track, album, db)
+
+
+def track_composer_actor_ids_for_notify(
+    track: Track,
+    album: Album,
+    db: Session | None = None,
+    *,
+    skip_user_id: int | None = None,
+) -> list[int]:
+    ids = track_composer_actor_ordered_ids(track, album, db)
+    return [user_id for user_id in ids if user_id != skip_user_id]
 
 
 def track_composer_ids_for_notify(
@@ -588,7 +657,7 @@ def track_allowed_actions(
     pending_followup = _pending_source_followup_request(db, track.id)
     if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
         if pending_followup:
-            if is_track_composer(track, user.id, db):
+            if is_track_composer_actor(track, album, user.id, db):
                 actions.append("cancel_source_followup")
             if user.id in {album.producer_id, album.mastering_engineer_id}:
                 actions.append("decide_source_followup")
@@ -657,7 +726,7 @@ def _can_request_source_followup(
         return False
     if track.archived_at is not None:
         return False
-    if not is_track_composer(track, user.id, db):
+    if not is_track_composer_actor(track, album, user.id, db):
         return False
     if track.status in {TrackStatus.REJECTED.value, TrackStatus.SOURCE_FOLLOWUP_PENDING.value}:
         return False
@@ -754,6 +823,8 @@ def build_track_read(
         workflow_transitions = [
             {"decision": t.decision, "label": t.label} for t in transitions
         ]
+    external_names = [] if anonymize else track_external_composer_names(track, db)
+    external_submitter_name = external_names[0] if external_names else track.external_submitter_name
 
     return TrackRead(
         id=track.id,
@@ -774,12 +845,13 @@ def build_track_read(
         workflow_cycle=track.workflow_cycle,
         submitter_id=track.submitter_id,
         composer_ids=track_composer_ordered_ids(track, db),
+        external_composer_names=external_names,
         proxy_uploader_id=track.proxy_uploader_id,
         peer_reviewer_id=track.peer_reviewer_id,
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
-        external_submitter_name=None if anonymize else track.external_submitter_name,
-        is_proxy_submission=False if anonymize else bool(track.external_submitter_name and track.proxy_uploader_id),
+        external_submitter_name=None if anonymize else external_submitter_name,
+        is_proxy_submission=False if anonymize else bool(external_names and track.proxy_uploader_id),
         created_at=track.created_at,
         updated_at=track.updated_at,
         issue_count=len(visible_issues),
@@ -790,6 +862,7 @@ def build_track_read(
             else _mask_user_read_if_needed(_user_read(track.submitter), anonymize_user_ids)
         ),
         composers=[] if anonymize or db is None else track_composer_user_reads(db, track, anonymize_user_ids),
+        external_composers=[] if anonymize or db is None else track_external_composer_reads(track, db),
         proxy_uploader=(
             None
             if anonymize
@@ -1037,6 +1110,8 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             selectinload(Track.source_versions),
             selectinload(Track.master_deliveries),
             selectinload(Track.checklist_items),
+            selectinload(Track.composer_links),
+            selectinload(Track.external_composer_links),
             selectinload(Track.submitter),
             selectinload(Track.proxy_uploader),
             selectinload(Track.peer_reviewer),

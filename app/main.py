@@ -38,6 +38,7 @@ from app.models import (  # noqa: F401
     RejectionMode,
     Track,
     TrackComposer,
+    TrackExternalComposer,
     TrackPlaybackPreference,
     TrackSourceVersion,
     TrackStatus,
@@ -295,6 +296,25 @@ def _backfill_workflow_data() -> None:
                 track.submitter_id = (matching_user or fallback).id if (matching_user or fallback) else None
 
 
+        # --- Proxy tracks missing an external composer record ---
+        external_composer_exists = exists(
+            select(TrackExternalComposer.id).where(
+                TrackExternalComposer.track_id == Track.id,
+            )
+        )
+        proxy_tracks_missing_external = list(db.scalars(
+            select(Track)
+            .where(
+                Track.external_submitter_name != None,  # noqa: E711
+                ~external_composer_exists,
+            )
+            .limit(_BACKFILL_BATCH_SIZE)
+        ).all())
+        for track in proxy_tracks_missing_external:
+            external_name = (track.external_submitter_name or "").strip()
+            if external_name:
+                db.add(TrackExternalComposer(track_id=track.id, name=external_name, sort_order=0))
+
         # --- Tracks missing composer membership for their primary submitter ---
         has_primary_composer = exists(
             select(TrackComposer.id).where(
@@ -304,7 +324,11 @@ def _backfill_workflow_data() -> None:
         )
         tracks_missing_composer = list(db.scalars(
             select(Track)
-            .where(Track.submitter_id != None, ~has_primary_composer)  # noqa: E711
+            .where(
+                Track.submitter_id != None,  # noqa: E711
+                Track.external_submitter_name == None,  # noqa: E711
+                ~has_primary_composer,
+            )
             .limit(_BACKFILL_BATCH_SIZE)
         ).all())
         for track in tracks_missing_composer:

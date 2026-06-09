@@ -447,6 +447,7 @@ class TrackBase(BaseModel):
     original_artist: str | None = Field(default=None, max_length=200)
     author_notes: str | None = Field(default=None, max_length=5000)
     composer_ids: list[int] = Field(default_factory=list)
+    external_composer_names: list[str] = Field(default_factory=list)
 
 
 class TrackMetadataUpdate(BaseModel):
@@ -462,7 +463,16 @@ class AuthorNotesUpdate(BaseModel):
 
 class TrackComposerUpdate(BaseModel):
     composer_ids: list[int] = Field(default_factory=list)
+    external_composer_names: list[str] = Field(default_factory=list)
 
+
+class TrackExternalComposerRead(BaseModel):
+    id: int
+    name: str
+    sort_order: int = 0
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MasteringNotesUpdate(BaseModel):
@@ -504,6 +514,7 @@ class TrackRead(TrackBase):
     open_issue_count: int = 0
     submitter: UserRead | None = None
     composers: list[UserRead] = Field(default_factory=list)
+    external_composers: list[TrackExternalComposerRead] = Field(default_factory=list)
     proxy_uploader: UserRead | None = None
     peer_reviewer: UserRead | None = None
     current_source_version: TrackSourceVersionRead | None = None
@@ -1215,6 +1226,7 @@ class RequestTrackUploadParams(RequestUploadParams):
     proxy_submission: bool = False
     external_submitter_name: str | None = Field(default=None, max_length=100)
     composer_ids: list[int] = Field(default_factory=list)
+    external_composer_names: list[str] = Field(default_factory=list)
 
 
 class PresignedUploadResponse(BaseModel):
@@ -1268,6 +1280,7 @@ class ConfirmTrackUploadParams(ConfirmUploadParams):
     proxy_submission: bool = False
     external_submitter_name: str | None = Field(default=None, max_length=100)
     composer_ids: list[int] = Field(default_factory=list)
+    external_composer_names: list[str] = Field(default_factory=list)
 
 
 class RequestCommentAudioUploadParams(BaseModel):
