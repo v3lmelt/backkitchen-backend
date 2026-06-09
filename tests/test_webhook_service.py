@@ -504,3 +504,41 @@ def test_try_dispatch_composer_email_skips_actor_unverified_and_hidden_issue(db_
     )
 
     assert background_tasks.tasks == []
+
+
+def test_try_dispatch_composer_email_targets_all_verified_composers_except_actor(db_session, factory):
+    producer = factory.user(role="producer", username="producer")
+    mastering = factory.user(username="mastering")
+    submitter = factory.user(username="submitter", email="primary@example.com", email_verified=True)
+    secondary = factory.user(username="secondary", email="secondary@example.com", email_verified=True)
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, secondary, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        composers=[secondary],
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    issue = factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER)
+    album.webhook_config = json.dumps({
+        "email_enabled": True,
+        "email_events": ["new_issue"],
+    })
+    db_session.commit()
+
+    background_tasks = BackgroundTasks()
+    notifications._try_dispatch_composer_email(
+        db_session,
+        background_tasks,
+        album.id,
+        "new_issue",
+        "New issue",
+        "Please fix this track.",
+        track.id,
+        issue.id,
+        webhook_context={"actor_id": secondary.id},
+    )
+
+    assert len(background_tasks.tasks) == 1
+    assert background_tasks.tasks[0].args[0] == "primary@example.com"

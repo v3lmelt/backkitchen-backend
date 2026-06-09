@@ -37,6 +37,7 @@ from app.models import (  # noqa: F401
     Notification,
     RejectionMode,
     Track,
+    TrackComposer,
     TrackPlaybackPreference,
     TrackSourceVersion,
     TrackStatus,
@@ -293,6 +294,21 @@ def _backfill_workflow_data() -> None:
                 fallback = next((u for u in all_users_list if u.id != album.producer_id), all_users_list[0] if all_users_list else None)
                 track.submitter_id = (matching_user or fallback).id if (matching_user or fallback) else None
 
+
+        # --- Tracks missing composer membership for their primary submitter ---
+        has_primary_composer = exists(
+            select(TrackComposer.id).where(
+                TrackComposer.track_id == Track.id,
+                TrackComposer.user_id == Track.submitter_id,
+            )
+        )
+        tracks_missing_composer = list(db.scalars(
+            select(Track)
+            .where(Track.submitter_id != None, ~has_primary_composer)  # noqa: E711
+            .limit(_BACKFILL_BATCH_SIZE)
+        ).all())
+        for track in tracks_missing_composer:
+            db.add(TrackComposer(track_id=track.id, user_id=track.submitter_id))
         # --- Tracks missing peer_reviewer_id ---
         tracks_no_reviewer = list(db.scalars(
             select(Track).where(Track.peer_reviewer_id == None, Track.submitter_id != None).limit(_BACKFILL_BATCH_SIZE)  # noqa: E711
@@ -449,6 +465,7 @@ def _seed_demo_data() -> None:
         )
         db.add(track)
         db.flush()
+        db.add(TrackComposer(track_id=track.id, user_id=submitter.id, created_at=now))
         log_track_event(db, track, submitter, "track_submitted", to_status="intake")
 
         db.commit()

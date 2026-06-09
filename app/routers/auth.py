@@ -369,6 +369,7 @@ def delete_account(
     from app.models.album import Album
     from app.models.circle import Circle
     from app.models.track import RejectionMode, Track, TrackStatus
+    from app.models.track_composer import TrackComposer
 
     if not verify_password(payload.password, current_user.password or ""):
         raise HTTPException(
@@ -408,11 +409,14 @@ def delete_account(
     )
 
     authored_track = db.scalars(
-        select(Track.id).where(
-            Track.submitter_id == current_user.id,
+        select(Track.id)
+        .outerjoin(TrackComposer, TrackComposer.track_id == Track.id)
+        .where(
+            or_(Track.submitter_id == current_user.id, TrackComposer.user_id == current_user.id),
             Track.archived_at.is_(None),
             active_track_filter,
-        ).limit(1)
+        )
+        .limit(1)
     ).first()
     if authored_track is not None:
         raise HTTPException(

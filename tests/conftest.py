@@ -24,6 +24,7 @@ from app.models.checklist import ChecklistItem
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueSeverity, IssueStatus, MarkerType
 from app.models.master_delivery import MasterDelivery
 from app.models.track import RejectionMode, Track
+from app.models.track_composer import TrackComposer
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.invitation import Invitation
@@ -212,6 +213,7 @@ class Factory:
         workflow_cycle: int = 1,
         create_source_version: bool = True,
         file_path: str | None = None,
+        composers: list[User] | None = None,
     ) -> Track:
         audio_path = file_path or self._audio_file()
         track = Track(
@@ -231,6 +233,13 @@ class Factory:
         self.session.add(track)
         self.session.commit()
         self.session.refresh(track)
+        seen_composer_ids: set[int] = set()
+        for composer in [submitter, *(composers or [])]:
+            if composer.id in seen_composer_ids:
+                continue
+            seen_composer_ids.add(composer.id)
+            self.session.add(TrackComposer(track_id=track.id, user_id=composer.id))
+        self.session.commit()
 
         if create_source_version and audio_path:
             self.source_version(track=track, uploaded_by=submitter, version_number=version, workflow_cycle=workflow_cycle, file_path=audio_path)
@@ -269,12 +278,18 @@ class Factory:
         delivery_number: int = 1,
         workflow_cycle: int | None = None,
         file_path: str | None = None,
+        delivery_kind: str = "file",
+        delivery_message: str | None = None,
     ) -> MasterDelivery:
+        if file_path is None and delivery_kind == "file":
+            file_path = self._audio_file(stem=self._next("master"), ext=".mp3")
         delivery = MasterDelivery(
             track_id=track.id,
             workflow_cycle=workflow_cycle or track.workflow_cycle,
             delivery_number=delivery_number,
-            file_path=file_path or self._audio_file(stem=self._next("master"), ext=".mp3"),
+            file_path=file_path,
+            delivery_kind=delivery_kind,
+            delivery_message=delivery_message,
             uploaded_by_id=uploaded_by.id,
         )
         self.session.add(delivery)

@@ -26,6 +26,7 @@ from app.models.reopen_request import ReopenRequest
 from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus
+from app.models.track_composer import TrackComposer
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
@@ -99,6 +100,72 @@ def get_album_member_ids(db: Session, album_id: int) -> set[int]:
     rows = db.scalars(select(AlbumMember).where(AlbumMember.album_id == album_id)).all()
     return {row.user_id for row in rows}
 
+def track_composer_ordered_ids(track: Track, db: Session | None = None) -> list[int]:
+    ordered: list[int] = []
+    seen: set[int] = set()
+
+    def add(user_id: int | None) -> None:
+        if user_id is None or user_id in seen:
+            return
+        seen.add(user_id)
+        ordered.append(user_id)
+
+    add(track.submitter_id)
+    links = None
+    if db is not None and track.id is not None:
+        links = db.scalars(
+            select(TrackComposer)
+            .where(TrackComposer.track_id == track.id)
+            .order_by(TrackComposer.created_at, TrackComposer.id)
+        ).all()
+    else:
+        links = getattr(track, "composer_links", None)
+    if links:
+        for link in links:
+            add(link.user_id)
+    return ordered
+
+
+def track_composer_ids(track: Track, db: Session | None = None) -> set[int]:
+    return set(track_composer_ordered_ids(track, db))
+
+
+def is_track_composer(track: Track, user_id: int | None, db: Session | None = None) -> bool:
+    return user_id is not None and user_id in track_composer_ids(track, db)
+
+
+def track_composer_ids_for_notify(
+    track: Track,
+    db: Session | None = None,
+    *,
+    skip_user_id: int | None = None,
+) -> list[int]:
+    ids = track_composer_ordered_ids(track, db)
+    return [user_id for user_id in ids if user_id != skip_user_id]
+
+
+def track_composer_user_reads(
+    db: Session,
+    track: Track,
+    anonymize_user_ids: set[int] | None = None,
+) -> list[UserRead]:
+    ordered_ids = track_composer_ordered_ids(track, db)
+    if not ordered_ids:
+        return []
+    users_by_id = {
+        user.id: user
+        for user in db.scalars(select(User).where(User.id.in_(ordered_ids))).all()
+    }
+    result: list[UserRead] = []
+    for user_id in ordered_ids:
+        user = users_by_id.get(user_id)
+        if user is None:
+            continue
+        user_read = _mask_user_read_if_needed(_user_read(user), anonymize_user_ids)
+        if user_read is not None:
+            result.append(user_read)
+    return result
+
 
 def _mention_candidate_ids(db: Session, track: Track, album: Album) -> list[int]:
     ordered: list[int] = []
@@ -110,7 +177,8 @@ def _mention_candidate_ids(db: Session, track: Track, album: Album) -> list[int]
         seen.add(user_id)
         ordered.append(user_id)
 
-    add(track.submitter_id)
+    for user_id in track_composer_ordered_ids(track, db):
+        add(user_id)
     add(album.producer_id)
     add(album.mastering_engineer_id)
     add(track.peer_reviewer_id)
@@ -155,8 +223,9 @@ def _can_user_see_general_track_area(
     album: Album,
     album_member_ids: set[int],
     assignment_ids: set[int],
+    composer_ids: set[int],
 ) -> bool:
-    if user_id in {track.submitter_id, track.peer_reviewer_id, album.producer_id, album.mastering_engineer_id}:
+    if user_id in composer_ids or user_id in {track.peer_reviewer_id, album.producer_id, album.mastering_engineer_id}:
         return True
     if user_id in assignment_ids:
         return True
@@ -208,23 +277,23 @@ def build_mention_candidates(
             )
         ).all()
     )
+    composer_ids = track_composer_ids(track, db)
     general_ids = {
         user_id
         for user_id in ordered_ids
-        if _can_user_see_general_track_area(user_id, track, album, album_member_ids, assignment_ids)
+        if _can_user_see_general_track_area(user_id, track, album, album_member_ids, assignment_ids, composer_ids)
     }
 
     viewer_can_see_mastering = is_mastering_participant(viewer, track, album)
     mastering_ids = (
-        ({track.submitter_id, album.producer_id, album.mastering_engineer_id} & set(ordered_ids))
+        (composer_ids | {album.producer_id, album.mastering_engineer_id}) & set(ordered_ids)
         if viewer_can_see_mastering
         else set()
     )
     mastering_ids.discard(None)
 
-    viewer_can_see_internal_issue = viewer.id != track.submitter_id
-    issue_internal_ids = set(general_ids)
-    issue_internal_ids.discard(track.submitter_id)
+    viewer_can_see_internal_issue = viewer.id not in composer_ids
+    issue_internal_ids = set(general_ids) - composer_ids
     if not viewer_can_see_internal_issue:
         issue_internal_ids.clear()
 
@@ -322,12 +391,12 @@ def is_album_completed(db: Session, album_id: int) -> bool:
 def should_anonymize_track(track: Track, user: User, album: Album) -> bool:
     """Return True if the user should see an anonymized view of this track.
 
-    Full info is shown to: the album producer, the mastering engineer, and the
-    track's own submitter.  Everyone else sees artist/submitter redacted.
+    Full info is shown to: the album producer, the mastering engineer, and every
+    composer on the track. Everyone else sees artist/composer identities redacted.
     """
     if user.id in (album.producer_id, album.mastering_engineer_id):
         return False
-    if user.id == track.submitter_id:
+    if is_track_composer(track, user.id):
         return False
     return True
 
@@ -337,8 +406,8 @@ def _is_identity_privileged_viewer(user: User, album: Album) -> bool:
 
 
 def is_mastering_participant(user: User, track: Track, album: Album) -> bool:
-    """Return True if user is submitter, producer, or mastering engineer for this track."""
-    return user.id in {track.submitter_id, album.producer_id, album.mastering_engineer_id}
+    """Return True if user is composer, producer, or mastering engineer for this track."""
+    return is_track_composer(track, user.id) or user.id in {album.producer_id, album.mastering_engineer_id}
 
 
 def _hash_user_id(user_id: int) -> str:
@@ -389,7 +458,8 @@ def _is_peer_identity_anonymous_phase(track: Track, album: Album) -> bool:
 
 
 def _peer_identity_user_ids(db: Session, track: Track, album: Album) -> set[int]:
-    user_ids = {track.submitter_id, track.peer_reviewer_id}
+    user_ids = set(track_composer_ids(track, db))
+    user_ids.add(track.peer_reviewer_id)
 
     stage_ids: list[str] = []
     try:
@@ -429,7 +499,10 @@ def peer_identity_anonymize_user_ids_for_viewer(
     if not _is_peer_identity_anonymous_phase(track, album):
         return set()
     user_ids = _peer_identity_user_ids(db, track, album)
-    user_ids.discard(viewer.id)
+    if is_track_composer(track, viewer.id, db):
+        user_ids -= track_composer_ids(track, db)
+    else:
+        user_ids.discard(viewer.id)
     return user_ids
 
 
@@ -443,8 +516,8 @@ def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
     # Producer and mastering engineer always have access
     if user.id in (album.producer_id, album.mastering_engineer_id):
         return album
-    # Submitter and peer reviewer of this specific track always have access
-    if user.id == track.submitter_id or user.id == track.peer_reviewer_id:
+    # Composers and peer reviewer of this specific track always have access
+    if is_track_composer(track, user.id, db) or user.id == track.peer_reviewer_id:
         return album
     assignment_id = db.scalar(
         select(StageAssignment.id).where(
@@ -515,7 +588,7 @@ def track_allowed_actions(
     pending_followup = _pending_source_followup_request(db, track.id)
     if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
         if pending_followup:
-            if pending_followup.requested_by_id == user.id:
+            if is_track_composer(track, user.id, db):
                 actions.append("cancel_source_followup")
             if user.id in {album.producer_id, album.mastering_engineer_id}:
                 actions.append("decide_source_followup")
@@ -584,7 +657,7 @@ def _can_request_source_followup(
         return False
     if track.archived_at is not None:
         return False
-    if track.submitter_id != user.id:
+    if not is_track_composer(track, user.id, db):
         return False
     if track.status in {TrackStatus.REJECTED.value, TrackStatus.SOURCE_FOLLOWUP_PENDING.value}:
         return False
@@ -605,17 +678,20 @@ def _can_request_source_followup(
 
 
 def _issue_visible_to_user(issue: Issue, track: Track, user: User) -> bool:
+    album = track.album
+    if album is not None and user.id == album.producer_id:
+        return True
     return not (
-        user.id == track.submitter_id
+        is_track_composer(track, user.id)
         and issue.status in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}
     )
 
 
 def _comment_visible_to_user(comment: Comment, issue: Issue, track: Track, user: User) -> bool:
     album = track.album
-    if album is not None and user.id == track.submitter_id and user.id == album.producer_id:
+    if album is not None and user.id == album.producer_id:
         return _issue_visible_to_user(issue, track, user)
-    if comment.visibility == "internal" and user.id == track.submitter_id:
+    if comment.visibility == "internal" and is_track_composer(track, user.id):
         return False
     return _issue_visible_to_user(issue, track, user)
 
@@ -697,6 +773,7 @@ def build_track_read(
         version=track.version,
         workflow_cycle=track.workflow_cycle,
         submitter_id=track.submitter_id,
+        composer_ids=track_composer_ordered_ids(track, db),
         proxy_uploader_id=track.proxy_uploader_id,
         peer_reviewer_id=track.peer_reviewer_id,
         producer_id=album.producer_id,
@@ -712,6 +789,7 @@ def build_track_read(
             if anonymize
             else _mask_user_read_if_needed(_user_read(track.submitter), anonymize_user_ids)
         ),
+        composers=[] if anonymize or db is None else track_composer_user_reads(db, track, anonymize_user_ids),
         proxy_uploader=(
             None
             if anonymize
@@ -968,7 +1046,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
     # Seed the discussion panel with the most recent slice; the wall view will
     # paginate older entries on demand via /api/tracks/{id}/discussions.
     can_see_mastering = is_mastering_participant(user, track, album)
-    suppress_internal = user.id == track.submitter_id and user.id != album.producer_id
+    suppress_internal = is_track_composer(track, user.id, db) and user.id != album.producer_id
     recent_discussions_stmt = (
         select(TrackDiscussion)
         .where(TrackDiscussion.track_id == track.id)

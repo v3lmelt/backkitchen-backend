@@ -12,7 +12,7 @@ PRE_ADMIN_GOVERNANCE_REVISION = "f3a2b1c4d5e6"
 PRE_AUDIT_LOG_REVISION = "f4b5c6d7e8f9"
 PRE_TRACK_DELETE_INTEGRITY_REVISION = "n1o2p3q4r5s6"
 PRE_ASSIGNMENT_DEDUPE_REVISION = "p2q3r4s5t6u7"
-HEAD_REVISION = "s5t6u7v8w9x0"
+HEAD_REVISION = "v8w9x0y1z2a3"
 
 
 def _sqlite_url(db_path: Path) -> str:
@@ -266,6 +266,38 @@ def _create_track_delete_integrity_schema(db_path: Path) -> None:
         conn.close()
 
 
+def _create_pre_track_composers_schema(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE users (
+                id INTEGER NOT NULL PRIMARY KEY,
+                created_at DATETIME NOT NULL
+            );
+            INSERT INTO users (id, created_at) VALUES
+                (1, '2026-06-07 00:00:00'),
+                (2, '2026-06-07 00:00:00');
+
+            CREATE TABLE tracks (
+                id INTEGER NOT NULL PRIMARY KEY,
+                submitter_id INTEGER,
+                FOREIGN KEY(submitter_id) REFERENCES users(id)
+            );
+            INSERT INTO tracks (id, submitter_id) VALUES
+                (1, 1),
+                (2, NULL),
+                (3, 2);
+
+            CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
+            INSERT INTO alembic_version (version_num) VALUES ('t6u7v8w9x0y1');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _create_duplicate_active_assignment_schema(db_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
@@ -484,6 +516,30 @@ def test_track_delete_integrity_migration_cleans_stale_links(tmp_path: Path) -> 
     finally:
         conn.close()
 
+
+def test_track_composer_migration_backfills_primary_submitters(tmp_path: Path) -> None:
+    db_path = tmp_path / "track-composers.db"
+    _create_pre_track_composers_schema(db_path)
+
+    result = _run_upgrade(db_path)
+
+    assert result.returncode == 0, result.stderr
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            HEAD_REVISION,
+        )
+        assert conn.execute(
+            """
+            SELECT track_id, user_id
+            FROM track_composers
+            ORDER BY track_id, user_id
+            """
+        ).fetchall() == [(1, 1), (3, 2)]
+        assert conn.execute("PRAGMA index_list('track_composers')").fetchall()
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        conn.close()
 
 def test_active_assignment_dedupe_migration_cleans_duplicates_and_preserves_issues(
     tmp_path: Path,

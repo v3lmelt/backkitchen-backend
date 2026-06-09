@@ -33,9 +33,16 @@ from app.schemas.schemas import (
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.upload import stream_upload
-from app.workflow import allowed_user_mention_ids, ensure_track_visibility, is_mastering_participant
-from app.workflow import mask_user_read_if_needed, peer_identity_anonymize_user_ids_for_viewer
-from app.workflow import discussion_audio_file_url
+from app.workflow import (
+    allowed_user_mention_ids,
+    discussion_audio_file_url,
+    ensure_track_visibility,
+    is_mastering_participant,
+    is_track_composer,
+    mask_user_read_if_needed,
+    peer_identity_anonymize_user_ids_for_viewer,
+    track_composer_ids,
+)
 
 router = APIRouter(tags=["discussions"])
 logger = logging.getLogger(__name__)
@@ -104,7 +111,9 @@ def _ensure_discussion_visible_to_user(
     if discussion.phase == "mastering":
         if album is None or not is_mastering_participant(user, track, album):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to mastering discussions.")
-    if discussion.visibility == "internal" and user.id == track.submitter_id:
+    if discussion.visibility == "internal" and album is not None and user.id == album.producer_id:
+        return
+    if discussion.visibility == "internal" and is_track_composer(track, user.id, db):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to internal discussions.")
 
 
@@ -405,9 +414,10 @@ async def create_discussion(
     elif audios and phase != "mastering":
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Audio uploads are only allowed in mastering discussions.")
 
-    # Notify participants — mastering discussions only notify submitter, mastering engineer, and producer
+    composer_ids = track_composer_ids(track, db)
+    # Notify participants — mastering discussions notify composers, mastering engineer, and producer
     if phase == "mastering":
-        participant_ids: set[int | None] = {track.submitter_id, album.producer_id}
+        participant_ids: set[int | None] = set(composer_ids) | {album.producer_id}
         if album.mastering_engineer_id:
             participant_ids.add(album.mastering_engineer_id)
         notify_body = f"「{track.title}」有新的母带讨论"
@@ -420,7 +430,7 @@ async def create_discussion(
                 )
             ).all()
         )
-        participant_ids = {track.submitter_id, track.peer_reviewer_id, album.producer_id, *reviewer_ids}
+        participant_ids = set(composer_ids) | {track.peer_reviewer_id, album.producer_id, *reviewer_ids}
         if album.mastering_engineer_id:
             participant_ids.add(album.mastering_engineer_id)
         notify_body = f"「{track.title}」有新的讨论"
