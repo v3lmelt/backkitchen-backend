@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from app import main as main_module
 from app.models.album import Album
+from app.models.circle import Circle
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_source_version import TrackSourceVersion
 from app.services import cleanup as cleanup_service
@@ -73,6 +74,44 @@ def test_run_expired_source_cleanup_clears_expired_versions_and_rejected_track_f
         (str(version_file), "local"),
         (str(track_file), "local"),
     ]
+
+
+def test_backfill_workflow_data_preserves_disabled_checklist_flags(
+    db_session,
+    session_factory,
+    factory,
+    monkeypatch,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(username="mastering")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        checklist_enabled=False,
+    )
+    circle = Circle(
+        name="Checklist Off Circle",
+        description="desc",
+        created_by=producer.id,
+        default_checklist_enabled=False,
+    )
+    db_session.add(circle)
+    db_session.commit()
+    album_id = album.id
+    circle_id = circle.id
+
+    monkeypatch.setattr(main_module, "SessionLocal", session_factory)
+
+    main_module._backfill_workflow_data()
+
+    db_session.expire_all()
+    refreshed_album = db_session.get(Album, album_id)
+    refreshed_circle = db_session.get(Circle, circle_id)
+
+    assert refreshed_album is not None
+    assert refreshed_album.checklist_enabled is False
+    assert refreshed_circle is not None
+    assert refreshed_circle.default_checklist_enabled is False
 
 
 def test_run_archived_track_cleanup_deletes_expired_tracks_and_cleans_files(

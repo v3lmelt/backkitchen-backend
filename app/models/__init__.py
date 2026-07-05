@@ -20,6 +20,7 @@ from app.models.reopen_request import ReopenRequest
 from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
 from app.models.track import RejectionMode, Track, TrackStatus
+from app.models.track_composer import TrackComposer, TrackExternalComposer
 from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
@@ -57,6 +58,8 @@ __all__ = [
     "SourceFollowupRequest",
     "StageAssignment",
     "Track",
+    "TrackComposer",
+    "TrackExternalComposer",
     "TrackPlaybackPreference",
     "TrackDiscussion",
     "TrackDiscussionAudio",
