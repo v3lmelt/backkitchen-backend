@@ -20,6 +20,113 @@ from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.workflow_event import WorkflowEvent
 from app.security import create_access_token
+from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
+
+
+def _workflow_config_with_fixed_peer_reviewer(reviewer_id: int) -> dict:
+    config = json.loads(json.dumps(DEFAULT_WORKFLOW_CONFIG))
+    for step in config["steps"]:
+        if step["id"] == "peer_review":
+            step["assignment_mode"] = "fixed"
+            step["reviewer_pool"] = [reviewer_id]
+            step["required_reviewer_count"] = 1
+            break
+    return config
+
+
+def _transition(client, auth_headers, track_id: int, actor, decision: str, *, revision_type: str | None = None) -> dict:
+    payload = {"decision": decision}
+    if revision_type is not None:
+        payload["revision_type"] = revision_type
+    response = client.post(
+        f"/api/tracks/{track_id}/workflow/transition",
+        headers=auth_headers(actor),
+        json=payload,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _start_uploaded_track_through_mastering(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer],
+        workflow_config=_workflow_config_with_fixed_peer_reviewer(reviewer.id),
+    )
+
+    created = client.post(
+        "/api/tracks",
+        headers=auth_headers(submitter),
+        data={
+            "title": "Full Flow Song",
+            "artist": "Flow Unit",
+            "album_id": str(album.id),
+            "composer_ids": [str(submitter.id)],
+        },
+        files={"file": ("demo.wav", b"RIFFdata", "audio/wav")},
+    )
+    assert created.status_code == 201, created.text
+    created_body = created.json()
+    assert created_body["status"] == "intake"
+    track_id = created_body["id"]
+
+    intake = _transition(client, auth_headers, track_id, producer, "accept")
+    assert intake["status"] == "peer_review"
+    assert intake["peer_reviewer_id"] == reviewer.id
+
+    checklist = client.post(
+        f"/api/tracks/{track_id}/checklist",
+        headers=auth_headers(reviewer),
+        json={"items": [{"label": "Balance", "passed": True}]},
+    )
+    assert checklist.status_code == 201, checklist.text
+
+    peer_review = _transition(client, auth_headers, track_id, reviewer, "pass")
+    assert peer_review["status"] == "producer_gate"
+
+    producer_gate = _transition(client, auth_headers, track_id, producer, "approve")
+    assert producer_gate["status"] == "mastering"
+
+    return producer, mastering, submitter, track_id
+
+
+def _upload_confirm_and_approve_master(client, auth_headers, track_id: int, producer, mastering, submitter) -> dict:
+    delivery = client.post(
+        f"/api/tracks/{track_id}/master-deliveries",
+        headers=auth_headers(mastering),
+        files={"file": ("master.mp3", b"ID3master", "audio/mpeg")},
+    )
+    assert delivery.status_code == 200, delivery.text
+    delivery_body = delivery.json()
+    assert delivery_body["status"] == "mastering"
+    delivery_id = delivery_body["current_master_delivery"]["id"]
+
+    confirmed = client.post(
+        f"/api/tracks/{track_id}/master-deliveries/{delivery_id}/confirm",
+        headers=auth_headers(mastering),
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["status"] == "final_review"
+
+    producer_approval = client.post(
+        f"/api/tracks/{track_id}/final-review/approve",
+        headers=auth_headers(producer),
+    )
+    assert producer_approval.status_code == 200, producer_approval.text
+    assert producer_approval.json()["status"] == "final_review"
+
+    submitter_approval = client.post(
+        f"/api/tracks/{track_id}/final-review/approve",
+        headers=auth_headers(submitter),
+    )
+    assert submitter_approval.status_code == 200, submitter_approval.text
+    assert submitter_approval.json()["status"] == "completed"
+    return submitter_approval.json()
 
 
 def test_create_track_creates_source_version_and_event(client, db_session, factory, auth_headers):
@@ -31,7 +138,13 @@ def test_create_track_creates_source_version_and_event(client, db_session, facto
     response = client.post(
         "/api/tracks",
         headers=auth_headers(submitter),
-        data={"title": "New Song", "artist": "Nova", "album_id": str(album.id), "bpm": "172"},
+        data={
+            "title": "New Song",
+            "artist": "Nova",
+            "album_id": str(album.id),
+            "bpm": "172",
+            "composer_ids": [str(submitter.id)],
+        },
         files={"file": ("demo.wav", b"RIFFdata", "audio/wav")},
     )
 
@@ -54,6 +167,23 @@ def test_create_track_creates_source_version_and_event(client, db_session, facto
         select(WorkflowEvent).where(WorkflowEvent.track_id == track_id)
     ).all()
     assert [event.event_type for event in events] == ["track_submitted"]
+
+
+def test_create_track_requires_explicit_composer_binding(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+
+    response = client.post(
+        "/api/tracks",
+        headers=auth_headers(submitter),
+        data={"title": "New Song", "artist": "Nova", "album_id": str(album.id)},
+        files={"file": ("demo.wav", b"RIFFdata", "audio/wav")},
+    )
+
+    assert response.status_code == 422
+    assert "At least one platform composer or external composer is required" in response.text
 
 
 def test_create_proxy_track_as_producer_records_external_submitter(client, db_session, factory, auth_headers):
@@ -154,6 +284,39 @@ def test_list_tracks_respects_submitter_and_reviewer_visibility(client, db_sessi
     assert [item["id"] for item in reviewer_response.json()] == [reviewer_track.id]
     assert outsider_response.status_code == 200
     assert outsider_response.json() == []
+
+
+def test_create_track_accepts_active_non_member_composer_uid(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    uploader = factory.user(username="uploader")
+    composer = factory.user(username="manual-uid-composer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[uploader])
+
+    response = client.post(
+        "/api/tracks",
+        headers=auth_headers(uploader),
+        data={
+            "title": "Manual UID Song",
+            "artist": "Manual Alias",
+            "album_id": str(album.id),
+            "composer_ids": [str(composer.id)],
+        },
+        files={"file": ("manual.wav", b"RIFFdata", "audio/wav")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["composer_ids"] == [composer.id]
+    track_id = body["id"]
+
+    track_list = client.get("/api/tracks", headers=auth_headers(composer))
+    assert track_list.status_code == 200
+    assert track_id in {item["id"] for item in track_list.json()}
+
+    albums = client.get("/api/albums", headers=auth_headers(composer))
+    assert albums.status_code == 200
+    assert album.id not in {item["id"] for item in albums.json()}
 
 
 def test_proxy_submitter_identity_is_hidden_from_peer_reviewer(client, db_session, factory, auth_headers):
@@ -1320,6 +1483,144 @@ def test_upload_source_version_from_mastering_revision(client, db_session, facto
     assert body["status"] == "mastering"
     assert body["version"] == 2
 
+
+def test_track_full_flow_completes_after_mastering_requests_stem_files(client, db_session, factory, auth_headers):
+    producer, mastering, submitter, track_id = _start_uploaded_track_through_mastering(
+        client,
+        factory,
+        auth_headers,
+    )
+
+    revision = _transition(
+        client,
+        auth_headers,
+        track_id,
+        mastering,
+        "request_revision",
+        revision_type="stem_files",
+    )
+    assert revision["status"] == "mastering_revision"
+    assert revision["requested_revision_type"] == "stem_files"
+
+    wrong_upload = client.post(
+        f"/api/tracks/{track_id}/source-versions",
+        headers=auth_headers(submitter),
+        files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
+    )
+    assert wrong_upload.status_code == 409
+    assert "stem files" in wrong_upload.text
+
+    source_revision = client.post(
+        f"/api/tracks/{track_id}/source-versions/external-link",
+        headers=auth_headers(submitter),
+        json={"revision_notes": "https://cloud.example/full-flow-stems\ncode: bk24"},
+    )
+    assert source_revision.status_code == 200, source_revision.text
+    source_body = source_revision.json()
+    assert source_body["status"] == "mastering"
+    assert source_body["version"] == 2
+    assert source_body["requested_revision_type"] is None
+    assert source_body["current_source_version"]["source_kind"] == "external_link"
+    assert source_body["current_source_version"]["file_path"] is None
+
+    completed = _upload_confirm_and_approve_master(
+        client,
+        auth_headers,
+        track_id,
+        producer,
+        mastering,
+        submitter,
+    )
+    assert completed["status"] == "completed"
+
+    db_session.expire_all()
+    versions = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track_id)
+    ).all()
+    assert len(versions) == 2
+    assert max(versions, key=lambda version: version.version_number).source_kind == "external_link"
+
+
+def test_track_full_flow_completes_after_mastering_requests_source_audio(client, db_session, factory, auth_headers):
+    producer, mastering, submitter, track_id = _start_uploaded_track_through_mastering(
+        client,
+        factory,
+        auth_headers,
+    )
+
+    revision = _transition(
+        client,
+        auth_headers,
+        track_id,
+        mastering,
+        "request_revision",
+        revision_type="source_audio",
+    )
+    assert revision["status"] == "mastering_revision"
+    assert revision["requested_revision_type"] == "source_audio"
+
+    wrong_link = client.post(
+        f"/api/tracks/{track_id}/source-versions/external-link",
+        headers=auth_headers(submitter),
+        json={"revision_notes": "https://cloud.example/full-flow-stems"},
+    )
+    assert wrong_link.status_code == 409
+    assert "source audio" in wrong_link.text
+
+    source_revision = client.post(
+        f"/api/tracks/{track_id}/source-versions",
+        headers=auth_headers(submitter),
+        files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
+    )
+    assert source_revision.status_code == 200, source_revision.text
+    source_body = source_revision.json()
+    assert source_body["status"] == "mastering"
+    assert source_body["version"] == 2
+    assert source_body["requested_revision_type"] is None
+    assert source_body["current_source_version"]["source_kind"] == "file"
+    assert source_body["current_source_version"]["file_path"] is not None
+
+    completed = _upload_confirm_and_approve_master(
+        client,
+        auth_headers,
+        track_id,
+        producer,
+        mastering,
+        submitter,
+    )
+    assert completed["status"] == "completed"
+
+    db_session.expire_all()
+    versions = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track_id)
+    ).all()
+    assert len(versions) == 2
+    assert max(versions, key=lambda version: version.version_number).source_kind == "file"
+
+
+def test_upload_source_version_rejects_file_when_mastering_requested_stems(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="mastering_revision",
+    )
+    track.requested_revision_type = "stem_files"
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions",
+        headers=auth_headers(submitter),
+        files={"file": ("revision.wav", b"RIFFrev", "audio/wav")},
+    )
+
+    assert response.status_code == 409
+    assert "stem files" in response.text
+
+
 def test_submit_external_source_link_from_mastering_revision_preserves_audio(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -1330,6 +1631,8 @@ def test_submit_external_source_link_from_mastering_revision_preserves_audio(cli
         submitter=submitter,
         status="mastering_revision",
     )
+    track.requested_revision_type = "stem_files"
+    db_session.commit()
     original_file_path = track.file_path
     original_storage_backend = track.storage_backend
     original_duration = track.duration
@@ -1375,6 +1678,25 @@ def test_submit_external_source_link_from_mastering_revision_preserves_audio(cli
     assert external_version.source_kind == "external_link"
     assert external_version.file_path is None
     assert external_version.revision_notes == "https://cloud.example/stems\n提取码: bk24"
+
+
+def test_submit_external_source_link_rejects_when_mastering_requested_source_audio(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering_revision")
+    track.requested_revision_type = "source_audio"
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/source-versions/external-link",
+        headers=auth_headers(submitter),
+        json={"revision_notes": "https://cloud.example/stems"},
+    )
+
+    assert response.status_code == 409
+    assert "source audio" in response.text
 
 
 def test_submit_external_source_link_rejects_non_mastering_revision(client, factory, auth_headers):
@@ -1575,6 +1897,7 @@ def test_confirm_track_upload_rejects_unexpected_r2_key(client, factory, auth_he
             "album_id": album.id,
             "title": "R2 Track",
             "artist": "Nova",
+            "composer_ids": [submitter.id],
         },
     )
 

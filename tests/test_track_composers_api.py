@@ -1,4 +1,5 @@
 import copy
+from datetime import datetime, timezone
 from io import BytesIO
 
 from sqlalchemy import select
@@ -230,7 +231,7 @@ def test_all_composers_are_excluded_from_reviewer_assignment(client, db_session,
     ).all()
 
 
-def test_track_composer_patch_validates_members_and_replaces_platform_list(client, db_session, factory, auth_headers):
+def test_track_composer_patch_accepts_active_non_member_and_replaces_platform_list(client, db_session, factory, auth_headers):
     producer, _mastering, _submitter, secondary, _reviewer, _album, track = _collab_track(factory)
     replacement = factory.user(username="replacement")
     db_session.add(TrackComposer(track_id=track.id, user_id=replacement.id))
@@ -241,20 +242,41 @@ def test_track_composer_patch_validates_members_and_replaces_platform_list(clien
         headers=auth_headers(producer),
         json={"composer_ids": [secondary.id, replacement.id]},
     )
-    assert response.status_code == 422
+    assert response.status_code == 200
+    assert set(response.json()["composer_ids"]) == {secondary.id, replacement.id}
 
-    album = track.album
-    from app.models.album_member import AlbumMember
 
-    db_session.add(AlbumMember(album_id=album.id, user_id=replacement.id))
+def test_track_composer_patch_rejects_missing_deleted_or_suspended_users(client, db_session, factory, auth_headers):
+    producer, _mastering, _submitter, secondary, _reviewer, _album, track = _collab_track(factory)
+    deleted = factory.user(username="deleted-composer")
+    suspended = factory.user(username="suspended-composer")
+    deleted.deleted_at = datetime.now(timezone.utc)
+    suspended.suspended_at = datetime.now(timezone.utc)
     db_session.commit()
+
     response = client.patch(
         f"/api/tracks/{track.id}/composers",
         headers=auth_headers(producer),
-        json={"composer_ids": [secondary.id, replacement.id]},
+        json={"composer_ids": [secondary.id, deleted.id]},
     )
-    assert response.status_code == 200
-    assert set(response.json()["composer_ids"]) == {secondary.id, replacement.id}
+    assert response.status_code == 422
+    assert "not active platform users" in response.text
+
+    response = client.patch(
+        f"/api/tracks/{track.id}/composers",
+        headers=auth_headers(producer),
+        json={"composer_ids": [secondary.id, suspended.id]},
+    )
+    assert response.status_code == 422
+    assert "not active platform users" in response.text
+
+    response = client.patch(
+        f"/api/tracks/{track.id}/composers",
+        headers=auth_headers(producer),
+        json={"composer_ids": [secondary.id, 999999]},
+    )
+    assert response.status_code == 422
+    assert "not active platform users" in response.text
 
 
 def test_create_track_accepts_multiple_external_composers_with_platform_composer(client, db_session, factory, auth_headers):
@@ -270,6 +292,7 @@ def test_create_track_accepts_multiple_external_composers_with_platform_composer
             "title": "Mixed Song",
             "artist": "Mixed Unit",
             "album_id": str(album.id),
+            "composer_ids": [str(submitter.id)],
             "external_composer_names": ["Guest A", "Guest B"],
         },
         files={"file": ("mixed.wav", BytesIO(b"RIFFmixed"), "audio/wav")},

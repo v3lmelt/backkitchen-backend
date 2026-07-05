@@ -232,13 +232,13 @@ def _run_sqlite_compat_migrations() -> None:
             conn.execute(text("UPDATE issues SET status = 'resolved' WHERE lower(status) = 'resolved' OR status = 'RESOLVED'"))
         if "albums" in columns_by_table:
             conn.execute(
-                text("UPDATE albums SET checklist_enabled = 1 WHERE checklist_enabled IS NULL OR checklist_enabled = 0")
+                text("UPDATE albums SET checklist_enabled = 1 WHERE checklist_enabled IS NULL")
             )
         if "circles" in columns_by_table:
             conn.execute(
                 text(
                     "UPDATE circles SET default_checklist_enabled = 1 "
-                    "WHERE default_checklist_enabled IS NULL OR default_checklist_enabled = 0"
+                    "WHERE default_checklist_enabled IS NULL"
                 )
             )
         if "track_discussion_audios" in columns_by_table:
@@ -363,12 +363,12 @@ def _backfill_workflow_data() -> None:
                     item.workflow_cycle = track.workflow_cycle
 
         db.execute(
-            text("UPDATE albums SET checklist_enabled = 1 WHERE checklist_enabled IS NULL OR checklist_enabled = 0")
+            text("UPDATE albums SET checklist_enabled = 1 WHERE checklist_enabled IS NULL")
         )
         db.execute(
             text(
                 "UPDATE circles SET default_checklist_enabled = 1 "
-                "WHERE default_checklist_enabled IS NULL OR default_checklist_enabled = 0"
+                "WHERE default_checklist_enabled IS NULL"
             )
         )
         db.execute(text("UPDATE track_discussion_audios SET storage_backend = 'local' WHERE storage_backend IS NULL"))

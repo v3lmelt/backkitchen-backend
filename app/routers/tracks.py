@@ -14,7 +14,6 @@ from app.admin_permissions import has_admin_role
 from app.config import settings
 from app.database import get_db
 from app.models.album import Album
-from app.models.album_member import AlbumMember
 from app.models.comment import Comment
 from app.models.issue import Issue, IssueStatus
 from app.models.master_delivery import MasterDelivery
@@ -431,15 +430,6 @@ def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
         deduped.append(uid)
     return deduped
 
-def _album_team_user_ids(db: Session, album: Album) -> set[int]:
-    user_ids = get_album_member_ids(db, album.id)
-    if album.producer_id is not None:
-        user_ids.add(album.producer_id)
-    if album.mastering_engineer_id is not None:
-        user_ids.add(album.mastering_engineer_id)
-    return user_ids
-
-
 def _validated_composer_ids(
     db: Session,
     *,
@@ -449,13 +439,6 @@ def _validated_composer_ids(
     ordered = _dedupe_user_ids(composer_ids or [])
     if not ordered:
         return []
-    team_ids = _album_team_user_ids(db, album)
-    invalid_team_ids = [user_id for user_id in ordered if user_id not in team_ids]
-    if invalid_team_ids:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Users {sorted(invalid_team_ids)} are not active participants on this album.",
-        )
     active_ids = set(
         db.scalars(
             select(User.id).where(
@@ -469,7 +452,7 @@ def _validated_composer_ids(
     if invalid_active_ids:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Users {sorted(invalid_active_ids)} are not active participants on this album.",
+            detail=f"Users {sorted(invalid_active_ids)} are not active platform users.",
         )
     return ordered
 
@@ -611,7 +594,32 @@ def _validate_manual_reviewer_selection(
         )
 
 
-def _ensure_revision_upload_permission(db: Session, track: Track, album: Album, current_user: User) -> None:
+def _is_mastering_revision_step(config: object, step: object) -> bool:
+    return_to = getattr(step, "return_to", None)
+    if not return_to:
+        return False
+    from app.workflow_engine import get_step_by_id, get_steps
+
+    return_step = get_step_by_id(get_steps(config), return_to)
+    return bool(return_step and _target_is_mastering_related(return_step))
+
+
+def _ensure_file_upload_allowed_for_revision_type(config: object, step: object, track: Track) -> None:
+    if _is_mastering_revision_step(config, step) and track.requested_revision_type == "stem_files":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This revision requires stem files via external link. File upload is not allowed.",
+        )
+
+
+def _ensure_revision_upload_permission(
+    db: Session,
+    track: Track,
+    album: Album,
+    current_user: User,
+    *,
+    enforce_file_revision_type: bool = True,
+) -> None:
     # Resubmit path: a finally-rejected-but-resubmittable track may always be
     # re-uploaded by its original submitter, regardless of the current step.
     if (
@@ -626,6 +634,8 @@ def _ensure_revision_upload_permission(db: Session, track: Track, album: Album, 
     step = engine_get_current_step(config, track)
     if step is None or step.type != "revision":
         raise HTTPException(status_code=409, detail="This track is not waiting for a new source version.")
+    if enforce_file_revision_type:
+        _ensure_file_upload_allowed_for_revision_type(config, step, track)
     if step.assignee_user_id is not None:
         if step.assignee_user_id != current_user.id:
             raise HTTPException(status_code=403, detail="Only the assigned user can upload a new source version.")
@@ -638,39 +648,18 @@ def _ensure_revision_upload_permission(db: Session, track: Track, album: Album, 
     if assignee_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the assigned user can upload a new source version.")
 
-    # NEW: Validate mastering revision upload matches requested type
-    if step.return_to:
-        from app.workflow_engine import get_step_by_id, get_steps
-        return_step = get_step_by_id(get_steps(config), step.return_to)
-        if return_step and _target_is_mastering_related(return_step):
-            # This is a mastering revision
-            if track.requested_revision_type == "stem_files":
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="This revision requires stem files via external link. File upload is not allowed.",
-                )
-
 
 def _ensure_external_source_link_permission(db: Session, track: Track, album: Album, current_user: User) -> None:
-    _ensure_revision_upload_permission(db, track, album, current_user)
-
-    from app.workflow_engine import get_step_by_id, get_steps
+    _ensure_revision_upload_permission(db, track, album, current_user, enforce_file_revision_type=False)
 
     config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
-    if step is None or step.type != "revision" or not step.return_to:
-        raise HTTPException(
-            status_code=409,
-            detail="External source links are only allowed during mastering revision steps.",
-        )
-    return_step = get_step_by_id(get_steps(config), step.return_to)
-    if return_step is None or not _target_is_mastering_related(return_step):
+    if step is None or step.type != "revision" or not _is_mastering_revision_step(config, step):
         raise HTTPException(
             status_code=409,
             detail="External source links are only allowed during mastering revision steps.",
         )
 
-    # NEW: Validate that external link is allowed for this revision
     if track.requested_revision_type == "source_audio":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1036,7 +1025,7 @@ def create_track(
         external_composer_names=external_composer_names,
         proxy_submission=proxy_submission,
         external_submitter_name=external_submitter_name,
-        include_current_user_by_default=True,
+        include_current_user_by_default=False,
     )
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(title)}_v1")
@@ -1171,7 +1160,7 @@ def request_track_upload(
         external_composer_names=params.external_composer_names,
         proxy_submission=params.proxy_submission,
         external_submitter_name=params.external_submitter_name,
-        include_current_user_by_default=True,
+        include_current_user_by_default=False,
     )
 
     from app.services.r2 import make_object_key
@@ -1209,7 +1198,7 @@ def confirm_track_upload(
         external_composer_names=params.external_composer_names,
         proxy_submission=params.proxy_submission,
         external_submitter_name=params.external_submitter_name,
-        include_current_user_by_default=True,
+        include_current_user_by_default=False,
     )
 
     _validate_r2_object_key(params.object_key, expected_prefix=f"tracks/new/source/{current_user.id}")
