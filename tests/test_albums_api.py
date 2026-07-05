@@ -2,6 +2,7 @@ import copy
 import json
 from datetime import date, datetime, timedelta, timezone
 
+from app.models.album import Album
 from app.models.circle import CircleMember
 from app.routers import albums as albums_router
 from app.models.issue import IssuePhase, IssueStatus
@@ -10,27 +11,76 @@ from app.models.workflow_event import WorkflowEvent
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 
-def test_create_album(client, factory, auth_headers):
+def test_create_album_requires_circle(client, db_session, factory, auth_headers):
     user = factory.user(role="producer")
     response = client.post(
         "/api/albums",
         headers=auth_headers(user),
         json={"title": "My Album", "description": "desc"},
     )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Circle is required when creating an album."
+    assert db_session.query(Album).count() == 0
+
+
+def test_create_album(client, factory, auth_headers):
+    user = factory.user(role="producer")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(user),
+        json={"name": "Back Kitchen", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(user),
+        json={"title": "My Album", "description": "desc", "circle_id": circle_response.json()["id"]},
+    )
     assert response.status_code == 201
     body = response.json()
     assert body["title"] == "My Album"
+    assert body["circle_id"] == circle_response.json()["id"]
     assert body["producer_id"] == user.id
     assert body["checklist_enabled"] is False
     assert any(m["user_id"] == user.id for m in body["members"])
 
 
+def test_create_album_rejects_inaccessible_circle(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    outsider = factory.user(role="producer", username="outsider")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Private Circle", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(outsider),
+        json={"title": "Blocked Album", "circle_id": circle_response.json()["id"]},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Not a member of this circle."
+    assert db_session.query(Album).count() == 0
+
+
 def test_create_album_accepts_explicit_checklist_override(client, factory, auth_headers):
     user = factory.user(role="producer")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(user),
+        json={"name": "Checklist Circle", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+
     response = client.post(
         "/api/albums",
         headers=auth_headers(user),
-        json={"title": "Checklist Album", "checklist_enabled": True},
+        json={"title": "Checklist Album", "circle_id": circle_response.json()["id"], "checklist_enabled": True},
     )
 
     assert response.status_code == 201
@@ -513,11 +563,17 @@ def test_list_album_tracks_forbidden_for_outsider(client, factory, auth_headers)
 
 def test_create_album_sets_default_workflow_config(client, factory, auth_headers):
     producer = factory.user(role="producer")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Workflow Circle", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
 
     response = client.post(
         "/api/albums",
         headers=auth_headers(producer),
-        json={"title": "Workflow Album", "description": "desc"},
+        json={"title": "Workflow Album", "description": "desc", "circle_id": circle_response.json()["id"]},
     )
 
     assert response.status_code == 201

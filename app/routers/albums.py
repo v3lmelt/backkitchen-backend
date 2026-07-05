@@ -422,6 +422,11 @@ def create_album(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
+    if payload.circle_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Circle is required when creating an album.",
+        )
     circle, workflow_template, effective_workflow = _resolve_album_workflow(payload, current_user, db)
     _ensure_album_create_allowed(circle, current_user, db)
     team_payload = AlbumTeamUpdate(
