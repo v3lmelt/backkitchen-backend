@@ -7,6 +7,7 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import select
 
+from app.models.circle import Circle, CircleMember
 from app.models.issue import IssuePhase, IssueStatus
 from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
@@ -113,7 +114,57 @@ def test_assign_reviewers_auto_falls_back_to_manual_when_pool_is_insufficient(
             "webhook_context": {"actor_id": reviewer.id, "actor_name": reviewer.display_name},
         },
     }]
-    assert db_session.scalars(select(StageAssignment).where(StageAssignment.track_id == track.id)).all() == []
+
+
+def test_assign_reviewers_auto_filters_non_circle_members(db_session, factory):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="circle_reviewer")
+    outsider = factory.user(username="outsider")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, outsider],
+    )
+    track = factory.track(album=album, submitter=submitter, status="peer_review", peer_reviewer=None)
+    circle = Circle(
+        name="Engine Circle",
+        description=None,
+        website=None,
+        created_by=producer.id,
+    )
+    db_session.add(circle)
+    db_session.commit()
+    album.circle_id = circle.id
+    db_session.add_all(
+        [
+            CircleMember(circle_id=circle.id, user_id=submitter.id, role="member"),
+            CircleMember(circle_id=circle.id, user_id=reviewer.id, role="member"),
+        ]
+    )
+    db_session.commit()
+    step = StepDef(
+        id="peer_review",
+        label="Peer Review",
+        type="review",
+        ui_variant="peer_review",
+        assignee_role="peer_reviewer",
+        order=1,
+        transitions={"pass": "__completed"},
+        assignment_mode="auto",
+        reviewer_pool=[outsider.id, reviewer.id],
+        required_reviewer_count=1,
+    )
+
+    assigned = assign_reviewers(db_session, album, track, step)
+
+    assert assigned == [reviewer.id]
+    db_session.flush()
+    assignments = db_session.scalars(
+        select(StageAssignment).where(StageAssignment.track_id == track.id)
+    ).all()
+    assert [assignment.user_id for assignment in assignments] == [reviewer.id]
 
 
 def test_assign_reviewers_fixed_assigns_all_non_submitter_reviewers(

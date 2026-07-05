@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.models.comment import Comment
+from app.models.circle import CircleMember
 from app.models.discussion import TrackDiscussion, TrackDiscussionAudio
 from app.models.issue import IssuePhase, IssueStatus
 from app.models.issue_image import IssueImage
@@ -2033,6 +2034,77 @@ def test_assign_reviewer_rejects_non_album_member(client, factory, auth_headers)
 
     assert response.status_code == 400
     assert "not members" in response.text
+
+
+def test_assign_reviewer_accepts_circle_member_not_on_album(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer = factory.user(username="circle_reviewer")
+
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Circle Review", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+    circle_id = circle_response.json()["id"]
+    db_session.add_all(
+        [
+            CircleMember(circle_id=circle_id, user_id=submitter.id, role="member"),
+            CircleMember(circle_id=circle_id, user_id=reviewer.id, role="member"),
+        ]
+    )
+    db_session.commit()
+
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    album.circle_id = circle_id
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/assign-reviewer",
+        headers=auth_headers(producer),
+        json={"user_ids": [reviewer.id]},
+    )
+
+    assert response.status_code == 200
+    assert [item["user_id"] for item in response.json()] == [reviewer.id]
+
+
+def test_assign_reviewer_rejects_non_circle_member_for_circle_album(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    outsider = factory.user(username="album_only_reviewer")
+
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Circle Only", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+    circle_id = circle_response.json()["id"]
+    db_session.add(CircleMember(circle_id=circle_id, user_id=submitter.id, role="member"))
+    db_session.commit()
+
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, outsider],
+    )
+    album.circle_id = circle_id
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+    db_session.commit()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/assign-reviewer",
+        headers=auth_headers(producer),
+        json={"user_ids": [outsider.id]},
+    )
+
+    assert response.status_code == 400
+    assert "not members of this circle" in response.text
 
 
 def test_reassign_reviewer_rejects_non_album_member(client, factory, auth_headers):

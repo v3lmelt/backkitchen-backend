@@ -511,3 +511,39 @@ def test_update_workflow_rejects_forward_reject_to_target(client, factory, auth_
 
     assert response.status_code == 422
     assert "must target an earlier step" in response.text
+
+
+def test_update_circle_album_workflow_rejects_non_circle_reviewer_pool(
+    client, db_session, factory, auth_headers
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    outsider = factory.user(username="outsider")
+
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Workflow Circle", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+    circle_id = circle_response.json()["id"]
+
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[producer])
+    album.circle_id = circle_id
+    db_session.commit()
+
+    bad_config = copy.deepcopy(DEFAULT_WORKFLOW_CONFIG)
+    for step in bad_config["steps"]:
+        if step["id"] == "peer_review":
+            step["assignment_mode"] = "auto"
+            step["reviewer_pool"] = [outsider.id]
+            break
+
+    response = client.put(
+        f"/api/albums/{album.id}/workflow",
+        headers=auth_headers(producer),
+        json=bad_config,
+    )
+
+    assert response.status_code == 400
+    assert "not members of this circle" in response.text

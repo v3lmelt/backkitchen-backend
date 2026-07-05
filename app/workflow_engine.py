@@ -39,6 +39,7 @@ from app.workflow import (
     track_composer_ids,
 )
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG, SPECIAL_TARGETS, STEP_TYPE_ALIASES
+from app.workflow_user_scope import album_reviewer_scope_user_ids
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,21 @@ def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
         seen.add(user_id)
         result.append(user_id)
     return result
+
+
+def _eligible_reviewer_pool(
+    db: Session,
+    album: Album,
+    track: Track,
+    user_ids: list[int],
+) -> list[int]:
+    scoped_user_ids = album_reviewer_scope_user_ids(db, album)
+    composer_ids = track_composer_ids(track, db)
+    return [
+        user_id
+        for user_id in _dedupe_user_ids(user_ids)
+        if user_id in scoped_user_ids and user_id not in composer_ids
+    ]
 
 
 def _required_reviews_for_assignments(
@@ -570,11 +586,8 @@ def assign_reviewers(
         return []
 
     count = max(1, step.required_reviewer_count or 1)
-    composer_ids = track_composer_ids(track, db)
-
     if step.assignment_mode == "fixed":
-        pool = _dedupe_user_ids(step.reviewer_pool or [])
-        selected = [uid for uid in pool if uid not in composer_ids]
+        selected = _eligible_reviewer_pool(db, album, track, step.reviewer_pool or [])
 
         if not selected:
             logger.warning(
@@ -599,9 +612,7 @@ def assign_reviewers(
         return selected
 
     if step.assignment_mode == "auto":
-        pool = _dedupe_user_ids(step.reviewer_pool or [])
-        # Exclude every track composer from the reviewer pool.
-        candidates = [uid for uid in pool if uid not in composer_ids]
+        candidates = _eligible_reviewer_pool(db, album, track, step.reviewer_pool or [])
 
         if len(candidates) < count:
             # Fallback to manual — notify producer
@@ -669,17 +680,29 @@ def assign_peer_reviewer_for_step(
 
     # Step-level assignee_user_id override takes precedence over all other modes.
     if step.assignee_user_id:
+        selected = _eligible_reviewer_pool(db, album, track, [step.assignee_user_id])
+        if not selected:
+            logger.warning(
+                "Review assignee override for track %d step '%s' is not eligible. "
+                "Falling back to manual.",
+                track.id,
+                step.id,
+            )
+            _set_track_peer_reviewer_from_assignments(track, step, [])
+            _notify_manual_assignment_needed(db, album, track, step, background_tasks, actor)
+            db.flush()
+            return
         assignment = StageAssignment(
             track_id=track.id,
             stage_id=step.id,
-            user_id=step.assignee_user_id,
+            user_id=selected[0],
             status="pending",
             cancellation_reason=None,
             assigned_at=datetime.now(timezone.utc),
         )
         db.add(assignment)
         _set_track_peer_reviewer_from_assignments(track, step, [assignment])
-        _notify_assigned_reviewers(db, track, step, [step.assignee_user_id], background_tasks, actor=actor)
+        _notify_assigned_reviewers(db, track, step, selected, background_tasks, actor=actor)
         db.flush()
         return
 

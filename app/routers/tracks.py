@@ -81,7 +81,6 @@ from app.workflow import (
     ensure_track_visibility,
     get_all_album_member_ids,
     is_track_composer_actor,
-    get_album_member_ids,
     log_track_event,
     mask_user_read_if_needed,
     peer_identity_anonymize_user_ids_for_viewer,
@@ -89,6 +88,7 @@ from app.workflow import (
     track_composer_actor_ids_for_notify,
     track_composer_ids,
 )
+from app.workflow_user_scope import album_reviewer_scope_user_ids
 
 router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 logger = logging.getLogger(__name__)
@@ -575,16 +575,13 @@ def _validate_manual_reviewer_selection(
     if composer_ids & set(user_ids):
         raise HTTPException(status_code=400, detail="Cannot assign a track composer as reviewer.")
 
-    valid_reviewer_ids = get_album_member_ids(db, album.id)
-    if album.producer_id is not None:
-        valid_reviewer_ids.add(album.producer_id)
-    if album.mastering_engineer_id is not None:
-        valid_reviewer_ids.add(album.mastering_engineer_id)
+    valid_reviewer_ids = album_reviewer_scope_user_ids(db, album)
     invalid_user_ids = [uid for uid in user_ids if uid not in valid_reviewer_ids]
     if invalid_user_ids:
+        scope_name = "circle" if album.circle_id is not None else "album"
         raise HTTPException(
             status_code=400,
-            detail=f"Users {sorted(invalid_user_ids)} are not members of this album.",
+            detail=f"Users {sorted(invalid_user_ids)} are not members of this {scope_name}.",
         )
 
     if len(user_ids) > reviewer_limit:

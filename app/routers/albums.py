@@ -37,6 +37,7 @@ from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
 from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed, peer_identity_anonymize_user_ids_for_viewer
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
+from app.workflow_user_scope import validate_circle_workflow_user_scope
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
@@ -116,6 +117,7 @@ def _resolve_album_workflow(
     else:
         workflow_config = DEFAULT_WORKFLOW_CONFIG
 
+    validate_circle_workflow_user_scope(workflow_config, db, payload.circle_id)
     return circle, template, workflow_config
 
 
@@ -895,6 +897,7 @@ def update_workflow_config(
 
     old_config = parse_workflow_config(album)
     new_config = payload.model_dump()
+    validate_circle_workflow_user_scope(new_config, db, album.circle_id)
 
     album.workflow_config = json.dumps(new_config, ensure_ascii=False)
     migrations = migrate_tracks_on_workflow_change(db, album, old_config, new_config, background_tasks)

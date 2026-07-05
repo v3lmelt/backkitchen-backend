@@ -138,6 +138,48 @@ def test_owner_can_update_workflow_template_and_get_album_count(client, db_sessi
     assert detail_response.json()["album_count"] == 1
 
 
+def test_workflow_templates_reject_non_circle_reviewer_candidates(client, factory, auth_headers):
+    owner = factory.user(role="producer")
+    outsider = factory.user(username="outsider")
+    circle_id = _create_circle(client, owner, auth_headers)
+
+    invalid_config = copy.deepcopy(DEFAULT_WORKFLOW_CONFIG)
+    for step in invalid_config["steps"]:
+        if step["id"] == "peer_review":
+            step["assignment_mode"] = "auto"
+            step["reviewer_pool"] = [outsider.id]
+            break
+
+    create_response = client.post(
+        f"/api/circles/{circle_id}/workflow-templates",
+        headers=auth_headers(owner),
+        json={
+            "name": "Invalid Template",
+            "description": "desc",
+            "workflow_config": invalid_config,
+        },
+    )
+
+    assert create_response.status_code == 400
+    assert "not members of this circle" in create_response.text
+
+    valid_response = client.post(
+        f"/api/circles/{circle_id}/workflow-templates",
+        headers=auth_headers(owner),
+        json=_template_payload("Valid Template"),
+    )
+    assert valid_response.status_code == 201
+
+    update_response = client.put(
+        f"/api/circles/{circle_id}/workflow-templates/{valid_response.json()['id']}",
+        headers=auth_headers(owner),
+        json={"workflow_config": invalid_config},
+    )
+
+    assert update_response.status_code == 400
+    assert "not members of this circle" in update_response.text
+
+
 def test_delete_workflow_template_clears_album_references(client, db_session, factory, auth_headers):
     owner = factory.user(role="producer")
     mastering = factory.user(username="mastering")

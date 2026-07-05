@@ -18,6 +18,7 @@ from app.schemas.schemas import (
     WorkflowTemplateUpdate,
 )
 from app.security import get_current_user
+from app.workflow_user_scope import validate_circle_workflow_user_scope
 
 router = APIRouter(
     prefix="/api/circles/{circle_id}/workflow-templates",
@@ -128,6 +129,7 @@ def create_template(
 ):
     circle, _ = _get_circle_membership(circle_id, current_user, db)
     _ensure_circle_owner(current_user, circle)
+    validate_circle_workflow_user_scope(data.workflow_config, db, circle_id)
 
     template = WorkflowTemplate(
         circle_id=circle_id,
@@ -164,6 +166,7 @@ def update_template(
     if data.description is not None:
         template.description = data.description
     if data.workflow_config is not None:
+        validate_circle_workflow_user_scope(data.workflow_config, db, circle_id)
         template.workflow_config = json.dumps(
             data.workflow_config.model_dump(), ensure_ascii=False
         )
