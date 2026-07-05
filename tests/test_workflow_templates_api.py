@@ -97,6 +97,36 @@ def test_only_circle_owner_can_manage_workflow_templates(client, db_session, fac
     assert forbidden_delete.status_code == 403
 
 
+def test_co_producer_can_manage_workflow_templates(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    co_producer = factory.user(username="co")
+    circle_id = _create_circle(client, owner, auth_headers)
+    db_session.add(CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"))
+    db_session.commit()
+
+    created = client.post(
+        f"/api/circles/{circle_id}/workflow-templates",
+        headers=auth_headers(co_producer),
+        json=_template_payload(),
+    )
+    assert created.status_code == 201
+    template_id = created.json()["id"]
+
+    updated = client.put(
+        f"/api/circles/{circle_id}/workflow-templates/{template_id}",
+        headers=auth_headers(co_producer),
+        json={"name": "Managed Template"},
+    )
+    deleted = client.delete(
+        f"/api/circles/{circle_id}/workflow-templates/{template_id}",
+        headers=auth_headers(co_producer),
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "Managed Template"
+    assert deleted.status_code == 204
+
+
 def test_owner_can_update_workflow_template_and_get_album_count(client, db_session, factory, auth_headers):
     owner = factory.user(role="producer")
     mastering = factory.user(username="mastering")

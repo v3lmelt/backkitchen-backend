@@ -353,6 +353,59 @@ def test_update_album_team_forbidden_for_non_producer(client, factory, auth_head
     assert response.status_code == 403
 
 
+def test_co_producer_can_manage_circle_album_team(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    co_producer = factory.user(username="co")
+    mastering = factory.user(role="mastering_engineer")
+    member = factory.user(username="member")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Circle One", "description": "desc"},
+    )
+    circle_id = create_response.json()["id"]
+    db_session.add_all([
+        CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"),
+        CircleMember(circle_id=circle_id, user_id=mastering.id, role="mastering_engineer"),
+        CircleMember(circle_id=circle_id, user_id=member.id, role="member"),
+    ])
+    album = factory.album(producer=owner, mastering_engineer=mastering, members=[member])
+    album.circle_id = circle_id
+    db_session.commit()
+
+    response = client.patch(
+        f"/api/albums/{album.id}/team",
+        headers=auth_headers(co_producer),
+        json={"mastering_engineer_id": mastering.id, "member_ids": [member.id]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["mastering_engineer_id"] == mastering.id
+
+
+def test_co_producer_does_not_manage_unlinked_album(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    co_producer = factory.user(username="co")
+    mastering = factory.user(role="mastering_engineer")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Circle One", "description": "desc"},
+    )
+    circle_id = create_response.json()["id"]
+    db_session.add(CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"))
+    album = factory.album(producer=owner, mastering_engineer=mastering)
+    db_session.commit()
+
+    response = client.patch(
+        f"/api/albums/{album.id}/metadata",
+        headers=auth_headers(co_producer),
+        json={"title": "Should Not Update"},
+    )
+
+    assert response.status_code == 403
+
+
 def test_album_stats(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")

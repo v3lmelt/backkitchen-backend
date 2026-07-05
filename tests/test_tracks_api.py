@@ -96,6 +96,32 @@ def _start_uploaded_track_through_mastering(client, factory, auth_headers):
     return producer, mastering, submitter, track_id
 
 
+def test_co_producer_can_execute_producer_workflow_transition(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    co_producer = factory.user(username="co")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Circle One", "description": "desc"},
+    )
+    circle_id = create_response.json()["id"]
+    db_session.add_all([
+        CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"),
+        CircleMember(circle_id=circle_id, user_id=mastering.id, role="mastering_engineer"),
+        CircleMember(circle_id=circle_id, user_id=submitter.id, role="member"),
+    ])
+    album = factory.album(producer=owner, mastering_engineer=mastering, members=[submitter])
+    album.circle_id = circle_id
+    track = factory.track(album=album, submitter=submitter, status="intake")
+    db_session.commit()
+
+    response = _transition(client, auth_headers, track.id, co_producer, "accept_producer_direct")
+
+    assert response["status"] == "producer_gate"
+
+
 def _upload_confirm_and_approve_master(client, auth_headers, track_id: int, producer, mastering, submitter) -> dict:
     delivery = client.post(
         f"/api/tracks/{track_id}/master-deliveries",
@@ -318,6 +344,106 @@ def test_create_track_accepts_active_non_member_composer_uid(client, factory, au
     albums = client.get("/api/albums", headers=auth_headers(composer))
     assert albums.status_code == 200
     assert album.id not in {item["id"] for item in albums.json()}
+
+
+def test_create_track_for_circle_album_restricts_platform_composers_to_circle(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    circle_composer = factory.user(username="circle-composer")
+    outsider = factory.user(username="outsider-composer")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Composer Circle", "description": "desc"},
+    )
+    circle_id = circle_response.json()["id"]
+    db_session.add_all(
+        [
+            CircleMember(circle_id=circle_id, user_id=submitter.id, role="member"),
+            CircleMember(circle_id=circle_id, user_id=circle_composer.id, role="member"),
+        ]
+    )
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    album.circle_id = circle_id
+    db_session.commit()
+
+    rejected = client.post(
+        "/api/tracks",
+        headers=auth_headers(submitter),
+        data={
+            "title": "Outside Composer",
+            "artist": "Nova",
+            "album_id": str(album.id),
+            "composer_ids": [str(outsider.id)],
+        },
+        files={"file": ("outside.wav", b"RIFFdata", "audio/wav")},
+    )
+    accepted = client.post(
+        "/api/tracks",
+        headers=auth_headers(submitter),
+        data={
+            "title": "Circle Composer",
+            "artist": "Nova",
+            "album_id": str(album.id),
+            "composer_ids": [str(circle_composer.id)],
+        },
+        files={"file": ("circle.wav", b"RIFFdata", "audio/wav")},
+    )
+
+    assert rejected.status_code == 422
+    assert "not members of this circle" in rejected.text
+    assert accepted.status_code == 201
+    assert accepted.json()["composer_ids"] == [circle_composer.id]
+
+
+def test_r2_track_upload_for_circle_album_rejects_non_circle_composer(client, db_session, factory, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "R2_ENABLED", True)
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    outsider = factory.user(username="outsider-composer")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "R2 Composer Circle", "description": "desc"},
+    )
+    circle_id = circle_response.json()["id"]
+    db_session.add(CircleMember(circle_id=circle_id, user_id=submitter.id, role="member"))
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    album.circle_id = circle_id
+    db_session.commit()
+
+    request_response = client.post(
+        "/api/tracks/request-upload",
+        headers=auth_headers(submitter),
+        json={
+            "filename": "outside.wav",
+            "content_type": "audio/wav",
+            "file_size": 16,
+            "album_id": album.id,
+            "title": "Outside Composer",
+            "artist": "Nova",
+            "composer_ids": [outsider.id],
+        },
+    )
+    confirm_response = client.post(
+        "/api/tracks/confirm-upload",
+        headers=auth_headers(submitter),
+        json={
+            "upload_id": "upload-1",
+            "object_key": f"tracks/new/source/{submitter.id}/outside.wav",
+            "album_id": album.id,
+            "title": "Outside Composer",
+            "artist": "Nova",
+            "composer_ids": [outsider.id],
+        },
+    )
+
+    assert request_response.status_code == 422
+    assert "not members of this circle" in request_response.text
+    assert confirm_response.status_code == 422
+    assert "not members of this circle" in confirm_response.text
 
 
 def test_proxy_submitter_identity_is_hidden_from_peer_reviewer(client, db_session, factory, auth_headers):

@@ -29,6 +29,7 @@ from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus, RejectionMode, WorkflowVariant
 from app.models.user import User
+from app.circle_permissions import album_manager_user_ids, is_album_manager
 from app.notifications import notify
 from app.workflow import (
     current_source_version,
@@ -195,12 +196,12 @@ def _notify_manual_assignment_needed(
     background_tasks: BackgroundTasks | None,
     actor: User | None = None,
 ) -> None:
-    if not background_tasks or not album.producer_id:
+    if not background_tasks:
         return
     step_label = _step_label_zh(step)
     notify(
         db,
-        [album.producer_id],
+        list(album_manager_user_ids(db, album)),
         "reviewer_assignment_needed",
         "需要手动指派评审人",
         f"「{track.title}」已进入「{step_label}」阶段，需要制作人手动指派评审人。",
@@ -515,7 +516,22 @@ def resolve_assignee(album: Album, track: Track, role_spec: str) -> int | None:
     return None
 
 
-def user_matches_role(user: User, album: Album, track: Track, step: StepDef) -> bool:
+def _user_matches_role_spec(
+    user: User,
+    album: Album,
+    track: Track,
+    role_spec: str,
+    db: Session | None = None,
+) -> bool:
+    if role_spec == "submitter" and is_track_composer_actor(track, album, user.id):
+        return True
+    if role_spec == "producer":
+        return is_album_manager(album, user, db) if db is not None else user.id == album.producer_id
+    role_id = resolve_assignee(album, track, role_spec)
+    return role_id is not None and user.id == role_id
+
+
+def user_matches_role(user: User, album: Album, track: Track, step: StepDef, db: Session | None = None) -> bool:
     """Check whether a user may act on a step.
 
     For steps with ``assignee_user_id`` override, use that directly.
@@ -526,17 +542,11 @@ def user_matches_role(user: User, album: Album, track: Track, step: StepDef) -> 
     """
     if step.assignee_user_id:
         return user.id == step.assignee_user_id
-    if step.assignee_role == "submitter" and is_track_composer_actor(track, album, user.id):
-        return True
-    assignee_id = resolve_assignee(album, track, step.assignee_role)
-    if assignee_id is not None and user.id == assignee_id:
+    if _user_matches_role_spec(user, album, track, step.assignee_role, db):
         return True
     if step.actor_roles:
         for role in step.actor_roles:
-            if role == "submitter" and is_track_composer_actor(track, album, user.id):
-                return True
-            role_id = resolve_assignee(album, track, role)
-            if role_id is not None and user.id == role_id:
+            if _user_matches_role_spec(user, album, track, role, db):
                 return True
     return False
 
@@ -559,7 +569,7 @@ def user_matches_role_or_assignment(
             return assignment is not None
         if step.assignment_mode == "manual":
             return False
-    return user_matches_role(user, album, track, step)
+    return user_matches_role(user, album, track, step, db)
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +851,7 @@ def get_allowed_transitions(
             can_finalize_group_review
         ) and not can_request_direct_revision:
             return []
-    elif not user_matches_role(user, album, track, step):
+    elif not user_matches_role(user, album, track, step, db):
         return []
 
     options: list[TransitionOption] = []
@@ -909,7 +919,7 @@ def get_allowed_action_names(
     # Review steps without active assignments → producer should assign reviewers
     if step and step.type == "review" and db is not None:
         review_assignments = _review_active_assignments(db, track.id, step.id)
-        if not review_assignments and user.id == album.producer_id:
+        if not review_assignments and is_album_manager(album, user, db):
             actions.append("assign_reviewer")
 
     # For revision steps, add the implicit "upload_revision" action
@@ -928,8 +938,12 @@ def get_allowed_action_names(
 
     # For delivery steps with unconfirmed delivery, show confirm action
     if step and step.type == "delivery" and step.require_confirmation:
-        assignee_id = step.assignee_user_id or resolve_assignee(album, track, step.assignee_role)
-        if user.id == assignee_id:
+        assignee_matches = (
+            user.id == step.assignee_user_id
+            if step.assignee_user_id is not None
+            else _user_matches_role_spec(user, album, track, step.assignee_role, db)
+        )
+        if assignee_matches:
             from app.models.master_delivery import MasterDelivery
             # Check for unconfirmed delivery
             if db:
@@ -948,7 +962,7 @@ def get_allowed_action_names(
         from app.workflow import current_master_delivery
         delivery = current_master_delivery(track)
         if delivery:
-            is_producer = user.id == album.producer_id
+            is_producer = is_album_manager(album, user, db)
             is_submitter = is_track_composer_actor(track, album, user.id, db)
             if (is_producer and not delivery.producer_approved_at) or (
                 is_submitter and not delivery.submitter_approved_at
@@ -1046,7 +1060,7 @@ def execute_transition(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You are not authorised to act on this step.",
             )
-    elif not user_matches_role(user, album, track, step):
+    elif not user_matches_role(user, album, track, step, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not authorised to act on this step.",
@@ -1711,7 +1725,7 @@ def execute_reopen(
 
     # Notify relevant parties
     notify_targets = set(track_composer_actor_ids_for_notify(track, album, db, skip_user_id=actor.id))
-    notify_targets.add(album.producer_id)
+    notify_targets.update(album_manager_user_ids(db, album))
     if album.mastering_engineer_id:
         notify_targets.add(album.mastering_engineer_id)
     notify_targets.discard(actor.id)
@@ -1799,10 +1813,12 @@ def _notify_transition(
         }
         if target == "__rejected_resubmittable":
             webhook_context["composer_email_event"] = "revision_requested"
-        notify_targets = track_composer_actor_ids_for_notify(track, album, db, skip_user_id=actor_id)
+        notify_targets = set(track_composer_actor_ids_for_notify(track, album, db, skip_user_id=actor_id))
+        notify_targets.update(album_manager_user_ids(db, album))
+        notify_targets.discard(actor_id)
         notify(
             db,
-            notify_targets,
+            list(notify_targets),
             "track_status_changed",
             target_title,
             target_body,
@@ -1824,6 +1840,8 @@ def _notify_transition(
         assignee_ids = [target_step.assignee_user_id]
     elif target_step.assignee_role == "submitter":
         assignee_ids = track_composer_actor_ids_for_notify(track, album, db, skip_user_id=actor_id)
+    elif target_step.assignee_role == "producer":
+        assignee_ids = list(album_manager_user_ids(db, album))
     else:
         assignee_id = resolve_assignee(album, track, target_step.assignee_role)
         assignee_ids = [assignee_id] if assignee_id is not None else []

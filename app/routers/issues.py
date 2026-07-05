@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, selectinload
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.config import settings
+from app.circle_permissions import album_manager_user_ids, is_album_manager
 from app.database import get_db
 from app.models.album import Album
 from app.models.comment import Comment
@@ -239,7 +240,12 @@ def _phase_reviewer_ids(issue: Issue, track: Track, album: Album, db: Session) -
             return reviewer_ids
 
     fallback = _phase_reviewer_id(issue, track, album)
-    return {fallback} if fallback is not None else set()
+    if fallback is not None:
+        phase = _effective_issue_phase(issue, track, album)
+        if phase in {IssuePhase.PRODUCER.value, IssuePhase.FINAL_REVIEW.value, "producer_gate", "final_review"}:
+            return album_manager_user_ids(db, album)
+        return {fallback}
+    return set()
 
 
 def _status_handler_ids(issue: Issue, track: Track, album: Album, db: Session) -> set[int]:
@@ -250,6 +256,9 @@ def _status_handler_ids(issue: Issue, track: Track, album: Album, db: Session) -
 
 def _ensure_issue_visible_to_user(issue: Issue, track: Track, user: User) -> None:
     album = track.album
+    db = Session.object_session(issue) or Session.object_session(track)
+    if album is not None and db is not None and is_album_manager(album, user, db):
+        return
     if album is not None and user.id == album.producer_id:
         return
     # Pending-discussion issues are hidden from composers until discussion ends.
@@ -259,7 +268,7 @@ def _ensure_issue_visible_to_user(issue: Issue, track: Track, user: User) -> Non
 
 def _ensure_comment_visible_to_user(comment: Comment, track: Track, user: User, db: Session) -> None:
     album = db.get(Album, track.album_id)
-    if album and user.id == album.producer_id:
+    if album and is_album_manager(album, user, db):
         return
     if comment.visibility == "internal" and is_track_composer(track, user.id, db):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")

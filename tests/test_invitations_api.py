@@ -1,3 +1,6 @@
+from app.models.circle import CircleMember
+
+
 def test_create_invitation(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
@@ -14,6 +17,57 @@ def test_create_invitation(client, factory, auth_headers):
     assert body["user_id"] == invitee.id
     assert body["status"] == "pending"
     assert body["album"]["id"] == album.id
+
+
+def test_create_invitation_for_circle_album_rejects_non_circle_user(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    circle_member = factory.user(username="circle-member")
+    outsider = factory.user(username="outsider")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Invite Circle", "description": "desc"},
+    )
+    circle_id = circle_response.json()["id"]
+    db_session.add(CircleMember(circle_id=circle_id, user_id=circle_member.id, role="member"))
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    album.circle_id = circle_id
+    db_session.commit()
+
+    response = client.post(
+        f"/api/albums/{album.id}/invitations",
+        headers=auth_headers(producer),
+        json={"user_id": outsider.id},
+    )
+
+    assert response.status_code == 400
+    assert "not a member of this circle" in response.json()["detail"]
+
+
+def test_create_invitation_for_circle_album_accepts_circle_member(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    circle_member = factory.user(username="circle-member")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Invite Circle", "description": "desc"},
+    )
+    circle_id = circle_response.json()["id"]
+    db_session.add(CircleMember(circle_id=circle_id, user_id=circle_member.id, role="member"))
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    album.circle_id = circle_id
+    db_session.commit()
+
+    response = client.post(
+        f"/api/albums/{album.id}/invitations",
+        headers=auth_headers(producer),
+        json={"user_id": circle_member.id},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["user_id"] == circle_member.id
 
 
 def test_create_invitation_forbidden_for_non_producer(client, factory, auth_headers):
