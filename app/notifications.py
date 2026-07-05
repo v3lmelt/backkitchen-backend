@@ -2,6 +2,7 @@ import json
 import logging
 
 from fastapi import BackgroundTasks
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -175,57 +176,65 @@ def _try_dispatch_composer_email(
 
     from app.models.track import Track
     from app.models.user import User
+    from app.workflow import track_composer_ordered_ids
 
     track = db.get(Track, resolved_track_id)
-    if track is None or track.album_id != album_id or track.submitter_id is None:
-        return
-
-    submitter = db.get(User, track.submitter_id)
-    if (
-        submitter is None
-        or not submitter.email
-        or not submitter.email_verified
-        or submitter.deleted_at is not None
-        or submitter.suspended_at is not None
-    ):
+    if track is None or track.album_id != album_id:
         return
 
     actor_id = (webhook_context or {}).get("actor_id")
-    if actor_id == submitter.id:
+    composer_ids = track_composer_ordered_ids(track, db)
+    if not composer_ids:
         return
+    composers_by_id = {
+        user.id: user
+        for user in db.scalars(select(User).where(User.id.in_(composer_ids))).all()
+    }
 
     action_url = _composer_email_action_url(composer_event, track.id, issue_id)
     subject = f"[BackKitchen] {title}"
-    dedupe_key = json.dumps(
-        {
-            "event_type": composer_event,
-            "email": submitter.email,
-            "track_id": track.id,
-            "issue_id": issue_id,
-            "title": title,
-            "body": body,
-            "action_url": action_url,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
     scheduled_emails = getattr(background_tasks, "_scheduled_composer_email_keys", None)
     if scheduled_emails is None:
         scheduled_emails = set()
         setattr(background_tasks, "_scheduled_composer_email_keys", scheduled_emails)
-    if dedupe_key in scheduled_emails:
-        return
-    scheduled_emails.add(dedupe_key)
 
-    background_tasks.add_task(
-        _deliver_composer_email_background,
-        submitter.email,
-        subject=subject,
-        title=title,
-        body=body,
-        action_url=action_url,
-        event_type=composer_event,
-    )
+    for composer_id in composer_ids:
+        composer = composers_by_id.get(composer_id)
+        if (
+            composer is None
+            or actor_id == composer.id
+            or not composer.email
+            or not composer.email_verified
+            or composer.deleted_at is not None
+            or composer.suspended_at is not None
+        ):
+            continue
+        dedupe_key = json.dumps(
+            {
+                "event_type": composer_event,
+                "email": composer.email,
+                "track_id": track.id,
+                "issue_id": issue_id,
+                "title": title,
+                "body": body,
+                "action_url": action_url,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if dedupe_key in scheduled_emails:
+            continue
+        scheduled_emails.add(dedupe_key)
+
+        background_tasks.add_task(
+            _deliver_composer_email_background,
+            composer.email,
+            subject=subject,
+            title=title,
+            body=body,
+            action_url=action_url,
+            event_type=composer_event,
+        )
 
 
 def _try_dispatch_webhook(

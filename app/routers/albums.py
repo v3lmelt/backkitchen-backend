@@ -26,6 +26,7 @@ from app.models.album_member import AlbumMember
 from app.models.circle import Circle, CircleMember
 from app.models.issue import Issue, IssueStatus
 from app.models.track import Track, TrackStatus
+from app.models.track_composer import TrackComposer
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.models.workflow_template import WorkflowTemplate
@@ -739,8 +740,9 @@ def list_album_tracks(
     ]
     is_privileged = current_user.id in (album.producer_id, album.mastering_engineer_id)
     if not is_privileged and not is_album_completed(db, album_id):
+        composer_track_ids = select(TrackComposer.track_id).where(TrackComposer.user_id == current_user.id)
         filters.append(
-            (Track.submitter_id == current_user.id) | (Track.peer_reviewer_id == current_user.id)
+            (Track.id.in_(composer_track_ids)) | (Track.peer_reviewer_id == current_user.id)
         )
 
     tracks = list(db.scalars(

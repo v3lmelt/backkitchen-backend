@@ -393,6 +393,7 @@ class TrackSourceVersionRead(BaseModel):
     workflow_cycle: int
     version_number: int
     file_path: str | None = None
+    source_kind: str = "file"
     duration: float | None = None
     uploaded_by_id: int | None = None
     revision_notes: str | None = None
@@ -405,7 +406,9 @@ class MasterDeliveryRead(BaseModel):
     id: int
     workflow_cycle: int
     delivery_number: int
-    file_path: str
+    file_path: str | None = None
+    delivery_kind: str = "file"
+    delivery_message: str | None = None
     uploaded_by_id: int | None = None
     confirmed_at: datetime | None = None
     producer_approved_at: datetime | None = None
@@ -443,6 +446,8 @@ class TrackBase(BaseModel):
     original_title: str | None = Field(default=None, max_length=200)
     original_artist: str | None = Field(default=None, max_length=200)
     author_notes: str | None = Field(default=None, max_length=5000)
+    composer_ids: list[int] = Field(default_factory=list)
+    external_composer_names: list[str] = Field(default_factory=list)
 
 
 class TrackMetadataUpdate(BaseModel):
@@ -455,6 +460,19 @@ class TrackMetadataUpdate(BaseModel):
 
 class AuthorNotesUpdate(BaseModel):
     author_notes: str | None = Field(default=None, max_length=5000)
+
+class TrackComposerUpdate(BaseModel):
+    composer_ids: list[int] = Field(default_factory=list)
+    external_composer_names: list[str] = Field(default_factory=list)
+
+
+class TrackExternalComposerRead(BaseModel):
+    id: int
+    name: str
+    sort_order: int = 0
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MasteringNotesUpdate(BaseModel):
@@ -487,6 +505,7 @@ class TrackRead(TrackBase):
     is_proxy_submission: bool = False
     author_notes: str | None = None
     mastering_notes: str | None = None
+    requested_revision_type: str | None = None
     is_public: bool = False
     created_at: datetime
     updated_at: datetime
@@ -494,6 +513,8 @@ class TrackRead(TrackBase):
     issue_count: int = 0
     open_issue_count: int = 0
     submitter: UserRead | None = None
+    composers: list[UserRead] = Field(default_factory=list)
+    external_composers: list[TrackExternalComposerRead] = Field(default_factory=list)
     proxy_uploader: UserRead | None = None
     peer_reviewer: UserRead | None = None
     current_source_version: TrackSourceVersionRead | None = None
@@ -839,6 +860,14 @@ class IssueBatchUpdate(BaseModel):
 
 class WorkflowTransitionRequest(BaseModel):
     decision: str = Field(..., min_length=1, max_length=50)
+    revision_type: str | None = Field(default=None)
+
+    @field_validator("revision_type")
+    @classmethod
+    def validate_revision_type(cls, value: str | None) -> str | None:
+        if value is not None and value not in ("source_audio", "stem_files"):
+            raise ValueError("revision_type must be 'source_audio' or 'stem_files'")
+        return value
 
 
 class WorkflowStepDefSchema(BaseModel):
@@ -1196,6 +1225,8 @@ class RequestTrackUploadParams(RequestUploadParams):
     author_notes: str | None = Field(default=None, max_length=5000)
     proxy_submission: bool = False
     external_submitter_name: str | None = Field(default=None, max_length=100)
+    composer_ids: list[int] = Field(default_factory=list)
+    external_composer_names: list[str] = Field(default_factory=list)
 
 
 class PresignedUploadResponse(BaseModel):
@@ -1212,6 +1243,23 @@ class ConfirmUploadParams(BaseModel):
     revision_notes: str | None = Field(default=None, max_length=5000)
     resolved_issue_ids: list[int] = Field(default_factory=list)
     resolution_note: str | None = Field(default=None, max_length=5000)
+
+class SourceExternalLinkSubmission(BaseModel):
+    revision_notes: str = Field(..., min_length=1, max_length=5000)
+    resolved_issue_ids: list[int] = Field(default_factory=list)
+    resolution_note: str | None = Field(default=None, max_length=5000)
+
+    @field_validator("revision_notes")
+    @classmethod
+    def revision_notes_must_not_be_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("External source link notes cannot be blank.")
+        return stripped
+
+
+class ConfirmMasterDeliveryUploadParams(ConfirmUploadParams):
+    delivery_message: str | None = Field(default=None, max_length=5000)
 
 
 class ConfirmSourceFollowupUploadParams(BaseModel):
@@ -1231,6 +1279,8 @@ class ConfirmTrackUploadParams(ConfirmUploadParams):
     author_notes: str | None = Field(default=None, max_length=5000)
     proxy_submission: bool = False
     external_submitter_name: str | None = Field(default=None, max_length=100)
+    composer_ids: list[int] = Field(default_factory=list)
+    external_composer_names: list[str] = Field(default_factory=list)
 
 
 class RequestCommentAudioUploadParams(BaseModel):

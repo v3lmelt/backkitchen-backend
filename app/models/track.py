@@ -90,7 +90,19 @@ class Track(Base):
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     author_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     mastering_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requested_revision_type: Mapped[str | None] = mapped_column(String(20), nullable=True, default=None)
 
+    composer_links: Mapped[list["TrackComposer"]] = relationship(  # noqa: F821
+        "TrackComposer",
+        back_populates="track",
+        cascade="all, delete-orphan",
+    )
+    external_composer_links: Mapped[list["TrackExternalComposer"]] = relationship(  # noqa: F821
+        "TrackExternalComposer",
+        back_populates="track",
+        cascade="all, delete-orphan",
+        order_by="TrackExternalComposer.sort_order",
+    )
     album: Mapped["Album"] = relationship("Album", back_populates="tracks")  # noqa: F821
     submitter: Mapped["User | None"] = relationship(  # noqa: F821
         "User", foreign_keys=[submitter_id]

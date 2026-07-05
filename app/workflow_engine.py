@@ -30,7 +30,14 @@ from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus, RejectionMode, WorkflowVariant
 from app.models.user import User
 from app.notifications import notify
-from app.workflow import current_source_version, log_track_event
+from app.workflow import (
+    current_source_version,
+    is_track_composer_actor,
+    log_track_event,
+    track_composer_actor_ids_for_notify,
+    track_composer_actor_ordered_ids,
+    track_composer_ids,
+)
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG, SPECIAL_TARGETS, STEP_TYPE_ALIASES
 
 logger = logging.getLogger(__name__)
@@ -315,6 +322,17 @@ def _is_delivery_transition_user_visible(step: "StepDef", decision: str) -> bool
         return False
     return True
 
+
+def _target_is_mastering_related(step: object) -> bool:
+    step_id = getattr(step, "id", "")
+    ui_variant = getattr(step, "ui_variant", None)
+    return (
+        getattr(step, "type", None) == "delivery"
+        or ui_variant == "mastering"
+        or "master" in step_id
+        or "mastering" in step_id
+    )
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -461,7 +479,7 @@ def resolve_assignee(album: Album, track: Track, role_spec: str) -> int | None:
     - ``"producer"`` → album.producer_id
     - ``"mastering_engineer"`` → album.mastering_engineer_id
     - ``"peer_reviewer"`` → track.peer_reviewer_id
-    - ``"submitter"`` → track.submitter_id
+    - ``"submitter"`` → first composer-side actor (platform composer, otherwise producer proxy)
     - ``"member:<user_id>"`` → the literal user ID
     """
     if role_spec == "producer":
@@ -471,7 +489,8 @@ def resolve_assignee(album: Album, track: Track, role_spec: str) -> int | None:
     if role_spec == "peer_reviewer":
         return track.peer_reviewer_id
     if role_spec == "submitter":
-        return track.submitter_id
+        actor_ids = track_composer_actor_ordered_ids(track, album)
+        return actor_ids[0] if actor_ids else None
     if role_spec.startswith("member:"):
         try:
             return int(role_spec.split(":", 1)[1])
@@ -490,13 +509,16 @@ def user_matches_role(user: User, album: Album, track: Track, step: StepDef) -> 
     (e.g. final_review where both producer and submitter can reject).
     """
     if step.assignee_user_id:
-        if user.id == step.assignee_user_id:
-            return True
+        return user.id == step.assignee_user_id
+    if step.assignee_role == "submitter" and is_track_composer_actor(track, album, user.id):
+        return True
     assignee_id = resolve_assignee(album, track, step.assignee_role)
     if assignee_id is not None and user.id == assignee_id:
         return True
     if step.actor_roles:
         for role in step.actor_roles:
+            if role == "submitter" and is_track_composer_actor(track, album, user.id):
+                return True
             role_id = resolve_assignee(album, track, role)
             if role_id is not None and user.id == role_id:
                 return True
@@ -548,10 +570,11 @@ def assign_reviewers(
         return []
 
     count = max(1, step.required_reviewer_count or 1)
+    composer_ids = track_composer_ids(track, db)
 
     if step.assignment_mode == "fixed":
         pool = _dedupe_user_ids(step.reviewer_pool or [])
-        selected = [uid for uid in pool if uid != track.submitter_id]
+        selected = [uid for uid in pool if uid not in composer_ids]
 
         if not selected:
             logger.warning(
@@ -577,8 +600,8 @@ def assign_reviewers(
 
     if step.assignment_mode == "auto":
         pool = _dedupe_user_ids(step.reviewer_pool or [])
-        # Exclude track author from pool
-        candidates = [uid for uid in pool if uid != track.submitter_id]
+        # Exclude every track composer from the reviewer pool.
+        candidates = [uid for uid in pool if uid not in composer_ids]
 
         if len(candidates) < count:
             # Fallback to manual — notify producer
@@ -868,9 +891,13 @@ def get_allowed_action_names(
 
     # For revision steps, add the implicit "upload_revision" action
     if step and step.type == "revision":
-        is_submitter = track.submitter_id == user.id
+        is_submitter = is_track_composer_actor(track, album, user.id, db)
         # For mastering engineer revision steps
         is_me = album.mastering_engineer_id == user.id
+        if step.assignee_user_id is not None:
+            if step.assignee_user_id == user.id:
+                actions.append("upload_revision")
+            return actions
         if step.assignee_role == "submitter" and is_submitter:
             actions.append("upload_revision")
         elif step.assignee_role == "mastering_engineer" and is_me:
@@ -899,7 +926,7 @@ def get_allowed_action_names(
         delivery = current_master_delivery(track)
         if delivery:
             is_producer = user.id == album.producer_id
-            is_submitter = user.id == track.submitter_id
+            is_submitter = is_track_composer_actor(track, album, user.id, db)
             if (is_producer and not delivery.producer_approved_at) or (
                 is_submitter and not delivery.submitter_approved_at
             ):
@@ -909,7 +936,7 @@ def get_allowed_action_names(
     if (
         track.status == TrackStatus.REJECTED
         and track.rejection_mode == RejectionMode.RESUBMITTABLE
-        and track.submitter_id == user.id
+        and is_track_composer_actor(track, album, user.id, db)
     ):
         actions.append("resubmit")
 
@@ -928,6 +955,7 @@ def execute_transition(
     user: User,
     decision: str,
     background_tasks: BackgroundTasks,
+    revision_type: str | None = None,
 ) -> None:
     """Execute a workflow transition on a track with a custom workflow.
 
@@ -1189,6 +1217,29 @@ def execute_transition(
         else:
             # Forward: auto-assign reviewers if entering a review step
             assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks, user)
+
+        # Handle requested_revision_type for mastering revisions
+        if target_step.type == "revision":
+            # Check if this is a mastering revision
+            is_mastering_revision = False
+            if target_step.return_to:
+                return_step = get_step_by_id(steps, target_step.return_to)
+                is_mastering_revision = return_step and _target_is_mastering_related(return_step)
+
+            if is_mastering_revision:
+                # Mastering revisions REQUIRE a revision type
+                if revision_type not in ("source_audio", "stem_files"):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Mastering revision requests must specify revision_type ('source_audio' or 'stem_files').",
+                    )
+                track.requested_revision_type = revision_type
+            else:
+                # Non-mastering revisions: no restriction, default to None
+                track.requested_revision_type = None
+        else:
+            # Clear the field when not in a revision step
+            track.requested_revision_type = None
 
     # Mark the current user's assignment when it wasn't already handled above.
     if step.type == "review" and pending_assignment and pending_assignment.status == "pending":
@@ -1636,7 +1687,8 @@ def execute_reopen(
         assign_peer_reviewer_for_step(db, album, track, target_step, background_tasks, actor)
 
     # Notify relevant parties
-    notify_targets = {track.submitter_id, album.producer_id}
+    notify_targets = set(track_composer_actor_ids_for_notify(track, album, db, skip_user_id=actor.id))
+    notify_targets.add(album.producer_id)
     if album.mastering_engineer_id:
         notify_targets.add(album.mastering_engineer_id)
     notify_targets.discard(actor.id)
@@ -1724,9 +1776,10 @@ def _notify_transition(
         }
         if target == "__rejected_resubmittable":
             webhook_context["composer_email_event"] = "revision_requested"
+        notify_targets = track_composer_actor_ids_for_notify(track, album, db, skip_user_id=actor_id)
         notify(
             db,
-            [track.submitter_id],
+            notify_targets,
             "track_status_changed",
             target_title,
             target_body,
@@ -1741,24 +1794,29 @@ def _notify_transition(
     if target_step is None:
         return
 
-    # Notify the assignee of the target step
-    assignee_id = (
-        target_step.assignee_user_id
-        or resolve_assignee(album, track, target_step.assignee_role)
-    )
+    # Notify the assignee of the target step. Submitter-targeted steps notify
+    # every composer because any listed composer may perform composer-side work.
+    assignee_ids: list[int] = []
+    if target_step.assignee_user_id:
+        assignee_ids = [target_step.assignee_user_id]
+    elif target_step.assignee_role == "submitter":
+        assignee_ids = track_composer_actor_ids_for_notify(track, album, db, skip_user_id=actor_id)
+    else:
+        assignee_id = resolve_assignee(album, track, target_step.assignee_role)
+        assignee_ids = [assignee_id] if assignee_id is not None else []
     target_label = _step_label_zh(target_step)
-    if assignee_id:
+    if assignee_ids:
         webhook_context = {
             "actor_id": actor_id,
             "actor_name": actor_name,
             "from_step": from_label,
             "to_step": target_label,
         }
-        if target_step.type == "revision" and assignee_id == track.submitter_id:
+        if target_step.type == "revision" and target_step.assignee_role == "submitter":
             webhook_context["composer_email_event"] = "revision_requested"
         notify(
             db,
-            [assignee_id],
+            assignee_ids,
             "track_status_changed",
             f"曲目进入「{target_label}」",
             f"「{track.title}」已进入「{target_label}」阶段。",
