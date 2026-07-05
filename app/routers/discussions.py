@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import ALLOWED_AUDIO_TYPES, AUDIO_EXT_MAP, MAX_AUDIOS_PER_UPLOAD
 from app.config import settings
+from app.circle_permissions import album_manager_user_ids, is_album_manager
 from app.database import get_db
 from app.models.album import Album
 from app.models.discussion import TrackDiscussion, TrackDiscussionAudio, TrackDiscussionImage
@@ -111,7 +112,7 @@ def _ensure_discussion_visible_to_user(
     if discussion.phase == "mastering":
         if album is None or not is_mastering_participant(user, track, album):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to mastering discussions.")
-    if discussion.visibility == "internal" and album is not None and user.id == album.producer_id:
+    if discussion.visibility == "internal" and album is not None and is_album_manager(album, user, db):
         return
     if discussion.visibility == "internal" and is_track_composer(track, user.id, db):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to internal discussions.")
@@ -417,7 +418,7 @@ async def create_discussion(
     composer_actor_ids = track_composer_actor_ordered_ids(track, album, db)
     # Notify participants — mastering discussions notify composers, mastering engineer, and producer
     if phase == "mastering":
-        participant_ids: set[int | None] = set(composer_actor_ids) | {album.producer_id}
+        participant_ids: set[int | None] = set(composer_actor_ids) | album_manager_user_ids(db, album)
         if album.mastering_engineer_id:
             participant_ids.add(album.mastering_engineer_id)
         notify_body = f"「{track.title}」有新的母带讨论"
@@ -430,7 +431,7 @@ async def create_discussion(
                 )
             ).all()
         )
-        participant_ids = set(composer_actor_ids) | {track.peer_reviewer_id, album.producer_id, *reviewer_ids}
+        participant_ids = set(composer_actor_ids) | {track.peer_reviewer_id, *reviewer_ids} | album_manager_user_ids(db, album)
         if album.mastering_engineer_id:
             participant_ids.add(album.mastering_engineer_id)
         notify_body = f"「{track.title}」有新的讨论"

@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.admin_permissions import has_admin_role
+from app.circle_permissions import require_circle_manager
 from app.database import get_db
 from app.models.album import Album
 from app.models.circle import Circle, CircleMember
@@ -18,6 +19,7 @@ from app.schemas.schemas import (
     WorkflowTemplateUpdate,
 )
 from app.security import get_current_user
+from app.workflow_user_scope import validate_circle_workflow_user_scope
 
 router = APIRouter(
     prefix="/api/circles/{circle_id}/workflow-templates",
@@ -43,11 +45,8 @@ def _get_circle_membership(
     return circle, membership
 
 
-def _ensure_circle_owner(user: User, circle: Circle) -> None:
-    if circle.created_by != user.id and not has_admin_role(user, "operator"):
-        raise HTTPException(
-            status_code=403, detail="Only the circle owner can manage workflow templates"
-        )
+def _ensure_circle_manager(user: User, circle: Circle, db: Session) -> None:
+    require_circle_manager(circle, user, db)
 
 
 def _template_to_read(template: WorkflowTemplate, album_count: int) -> WorkflowTemplateRead:
@@ -127,7 +126,8 @@ def create_template(
     current_user: User = Depends(get_current_user),
 ):
     circle, _ = _get_circle_membership(circle_id, current_user, db)
-    _ensure_circle_owner(current_user, circle)
+    _ensure_circle_manager(current_user, circle, db)
+    validate_circle_workflow_user_scope(data.workflow_config, db, circle_id)
 
     template = WorkflowTemplate(
         circle_id=circle_id,
@@ -153,7 +153,7 @@ def update_template(
     current_user: User = Depends(get_current_user),
 ):
     circle, _ = _get_circle_membership(circle_id, current_user, db)
-    _ensure_circle_owner(current_user, circle)
+    _ensure_circle_manager(current_user, circle, db)
 
     template = db.get(WorkflowTemplate, template_id)
     if not template or template.circle_id != circle_id:
@@ -164,6 +164,7 @@ def update_template(
     if data.description is not None:
         template.description = data.description
     if data.workflow_config is not None:
+        validate_circle_workflow_user_scope(data.workflow_config, db, circle_id)
         template.workflow_config = json.dumps(
             data.workflow_config.model_dump(), ensure_ascii=False
         )
@@ -181,7 +182,7 @@ def delete_template(
     current_user: User = Depends(get_current_user),
 ):
     circle, _ = _get_circle_membership(circle_id, current_user, db)
-    _ensure_circle_owner(current_user, circle)
+    _ensure_circle_manager(current_user, circle, db)
 
     template = db.get(WorkflowTemplate, template_id)
     if not template or template.circle_id != circle_id:

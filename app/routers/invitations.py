@@ -16,6 +16,7 @@ from app.schemas.schemas import (
 from app.security import get_current_user
 from app.notifications import notify
 from app.workflow import ensure_album_producer, ensure_album_visibility, get_album_member_ids
+from app.workflow_user_scope import circle_workflow_user_ids
 
 router = APIRouter(tags=["invitations"])
 
@@ -48,6 +49,12 @@ def create_invitation(
     invited_user = db.get(User, payload.user_id)
     if invited_user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    if album.circle_id is not None and payload.user_id not in circle_workflow_user_ids(db, album.circle_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User is not a member of this circle.",
+        )
 
     member_ids = get_album_member_ids(db, album_id)
     if payload.user_id in member_ids:

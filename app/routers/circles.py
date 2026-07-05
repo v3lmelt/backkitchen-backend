@@ -8,6 +8,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.admin_permissions import has_admin_role
+from app.circle_permissions import (
+    CIRCLE_ROLE_CO_PRODUCER,
+    CIRCLE_ROLE_OWNER,
+    require_circle_manager,
+    require_circle_owner,
+)
 from app.config import settings
 from app.database import get_db
 from app.models.album import Album
@@ -17,6 +23,7 @@ from app.models.workflow_template import WorkflowTemplate
 from app.schemas.schemas import (
     CircleCreate,
     CircleMemberRead,
+    CircleMemberRoleUpdate,
     CircleRead,
     CircleSummary,
     CircleUpdate,
@@ -31,9 +38,8 @@ from app.services.upload import stream_upload
 router = APIRouter(prefix="/api/circles", tags=["circles"])
 
 
-def _ensure_circle_producer(circle: Circle, current_user: User) -> None:
-    if circle.created_by != current_user.id and not has_admin_role(current_user, "operator"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the circle creator can do this")
+def _ensure_circle_manager(circle: Circle, current_user: User, db: Session) -> None:
+    require_circle_manager(circle, current_user, db)
 
 
 def _circle_to_read(circle: Circle) -> CircleRead:
@@ -163,7 +169,7 @@ def update_circle(
     circle = db.get(Circle, circle_id)
     if not circle:
         raise HTTPException(status_code=404, detail="Circle not found")
-    _ensure_circle_producer(circle, current_user)
+    _ensure_circle_manager(circle, current_user, db)
 
     if data.name is not None:
         circle.name = data.name
@@ -190,7 +196,7 @@ async def upload_logo(
     circle = db.get(Circle, circle_id)
     if not circle:
         raise HTTPException(status_code=404, detail="Circle not found")
-    _ensure_circle_producer(circle, current_user)
+    _ensure_circle_manager(circle, current_user, db)
 
     from app.config import MAX_IMAGE_UPLOAD_SIZE
 
@@ -234,7 +240,7 @@ def create_invite_code(
     circle = db.get(Circle, circle_id)
     if not circle:
         raise HTTPException(status_code=404, detail="Circle not found")
-    _ensure_circle_producer(circle, current_user)
+    _ensure_circle_manager(circle, current_user, db)
 
     code = secrets.token_urlsafe(10)[:12]
     expires_at = datetime.now(timezone.utc) + timedelta(days=data.expires_in_days)
@@ -262,7 +268,7 @@ def list_invite_codes(
     circle = db.get(Circle, circle_id)
     if not circle:
         raise HTTPException(status_code=404, detail="Circle not found")
-    _ensure_circle_producer(circle, current_user)
+    _ensure_circle_manager(circle, current_user, db)
 
     codes = db.execute(
         select(CircleInviteCode).where(CircleInviteCode.circle_id == circle_id)
@@ -281,7 +287,7 @@ def revoke_invite_code(
     circle = db.get(Circle, circle_id)
     if not circle:
         raise HTTPException(status_code=404, detail="Circle not found")
-    _ensure_circle_producer(circle, current_user)
+    _ensure_circle_manager(circle, current_user, db)
 
     invite = db.get(CircleInviteCode, code_id)
     if not invite or invite.circle_id != circle_id:
@@ -337,6 +343,43 @@ def join_circle(
 
 
 # ── remove member from circle ─────────────────────────────────────────────────
+@router.patch("/{circle_id}/members/{user_id}", response_model=CircleMemberRead)
+def update_member_role(
+    circle_id: int,
+    user_id: int,
+    data: CircleMemberRoleUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    circle = db.get(Circle, circle_id)
+    if not circle:
+        raise HTTPException(status_code=404, detail="Circle not found")
+    require_circle_owner(circle, current_user)
+
+    member = db.execute(
+        select(CircleMember).where(
+            CircleMember.circle_id == circle_id,
+            CircleMember.user_id == user_id,
+        )
+    ).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if member.role == CIRCLE_ROLE_OWNER or user_id == circle.created_by:
+        raise HTTPException(status_code=400, detail="The circle owner role cannot be changed.")
+
+    member.role = data.role
+    db.commit()
+    db.refresh(member)
+    return CircleMemberRead(
+        id=member.id,
+        circle_id=member.circle_id,
+        user_id=member.user_id,
+        role=member.role,
+        joined_at=member.joined_at,
+        user=UserRead.model_validate(member.user),
+    )
+
+
 @router.delete("/{circle_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_member(
     circle_id: int,
@@ -347,7 +390,7 @@ def remove_member(
     circle = db.get(Circle, circle_id)
     if not circle:
         raise HTTPException(status_code=404, detail="Circle not found")
-    _ensure_circle_producer(circle, current_user)
+    _ensure_circle_manager(circle, current_user, db)
 
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot remove yourself")
@@ -360,6 +403,12 @@ def remove_member(
     ).scalar_one_or_none()
     if not member:
         raise HTTPException(status_code=404, detail="Member not found")
+    if member.role == CIRCLE_ROLE_OWNER or user_id == circle.created_by:
+        raise HTTPException(status_code=400, detail="The circle owner cannot be removed.")
+    if member.role == CIRCLE_ROLE_CO_PRODUCER and not (
+        circle.created_by == current_user.id or has_admin_role(current_user, "operator")
+    ):
+        raise HTTPException(status_code=403, detail="Only the circle owner can remove a co-producer.")
 
     db.delete(member)
     db.commit()
@@ -403,7 +452,7 @@ def delete_circle(
     circle = db.get(Circle, circle_id)
     if not circle:
         raise HTTPException(status_code=404, detail="Circle not found")
-    _ensure_circle_producer(circle, current_user)
+    require_circle_owner(circle, current_user)
 
     # Refuse if any non-archived album is still linked to this circle.
     active_album = db.execute(

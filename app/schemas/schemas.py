@@ -343,6 +343,10 @@ class CircleUpdate(BaseModel):
     default_checklist_enabled: bool | None = None
 
 
+class CircleMemberRoleUpdate(BaseModel):
+    role: str = Field(pattern=r"^(member|mastering_engineer|co_producer)$")
+
+
 class CircleRead(CircleBase):
     id: int
     logo_url: str | None = None
@@ -368,7 +372,7 @@ class CircleSummary(BaseModel):
 
 class InviteCodeCreate(BaseModel):
     role: str = Field(default="member", pattern=r"^(member|mastering_engineer)$")
-    expires_in_days: int = Field(default=7, ge=1, le=30)
+    expires_in_days: int = Field(default=7, ge=1, le=365)
 
 
 class InviteCodeRead(BaseModel):

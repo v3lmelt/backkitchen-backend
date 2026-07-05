@@ -13,6 +13,7 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.admin_permissions import has_admin_role
+from app.circle_permissions import album_manager_user_ids, is_album_manager, require_album_manager
 from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
@@ -248,7 +249,8 @@ def _mention_candidate_ids(db: Session, track: Track, album: Album) -> list[int]
 
     for user_id in track_composer_ordered_ids(track, db):
         add(user_id)
-    add(album.producer_id)
+    for user_id in album_manager_user_ids(db, album):
+        add(user_id)
     add(album.mastering_engineer_id)
     add(track.peer_reviewer_id)
 
@@ -293,8 +295,9 @@ def _can_user_see_general_track_area(
     album_member_ids: set[int],
     assignment_ids: set[int],
     composer_ids: set[int],
+    manager_ids: set[int],
 ) -> bool:
-    if user_id in composer_ids or user_id in {track.peer_reviewer_id, album.producer_id, album.mastering_engineer_id}:
+    if user_id in composer_ids or user_id in ({track.peer_reviewer_id, album.mastering_engineer_id} | manager_ids):
         return True
     if user_id in assignment_ids:
         return True
@@ -347,15 +350,16 @@ def build_mention_candidates(
         ).all()
     )
     composer_ids = track_composer_ids(track, db)
+    manager_ids = album_manager_user_ids(db, album)
     general_ids = {
         user_id
         for user_id in ordered_ids
-        if _can_user_see_general_track_area(user_id, track, album, album_member_ids, assignment_ids, composer_ids)
+        if _can_user_see_general_track_area(user_id, track, album, album_member_ids, assignment_ids, composer_ids, manager_ids)
     }
 
     viewer_can_see_mastering = is_mastering_participant(viewer, track, album)
     mastering_ids = (
-        (composer_ids | {album.producer_id, album.mastering_engineer_id}) & set(ordered_ids)
+        (composer_ids | manager_ids | {album.mastering_engineer_id}) & set(ordered_ids)
         if viewer_can_see_mastering
         else set()
     )
@@ -419,13 +423,7 @@ def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Album not found.",
         )
-    if has_admin_role(user, "operator"):
-        return album
-    if album.producer_id != user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the album producer can perform this action.",
-        )
+    require_album_manager(album, user, db)
     return album
 
 
@@ -433,7 +431,8 @@ def ensure_album_visibility(album: Album, user: User, db: Session) -> None:
     if has_admin_role(user, "viewer"):
         return
     member_ids = get_album_member_ids(db, album.id)
-    visible_ids = {album.producer_id, album.mastering_engineer_id}
+    visible_ids = {album.mastering_engineer_id}
+    visible_ids.update(album_manager_user_ids(db, album))
     visible_ids.update(member_ids)
     if user.id not in visible_ids:
         raise HTTPException(
@@ -463,7 +462,12 @@ def should_anonymize_track(track: Track, user: User, album: Album) -> bool:
     Full info is shown to: the album producer, the mastering engineer, and every
     composer on the track. Everyone else sees artist/composer identities redacted.
     """
-    if user.id in (album.producer_id, album.mastering_engineer_id):
+    if user.id == album.mastering_engineer_id:
+        return False
+    if db := Session.object_session(album):
+        if is_album_manager(album, user, db):
+            return False
+    elif user.id == album.producer_id:
         return False
     if is_track_composer(track, user.id):
         return False
@@ -471,12 +475,18 @@ def should_anonymize_track(track: Track, user: User, album: Album) -> bool:
 
 
 def _is_identity_privileged_viewer(user: User, album: Album) -> bool:
-    return user.id in (album.producer_id, album.mastering_engineer_id)
+    if user.id == album.mastering_engineer_id:
+        return True
+    db = Session.object_session(album)
+    return is_album_manager(album, user, db) if db is not None else user.id == album.producer_id
 
 
 def is_mastering_participant(user: User, track: Track, album: Album) -> bool:
     """Return True if user is composer, producer, or mastering engineer for this track."""
-    return is_track_composer(track, user.id) or user.id in {album.producer_id, album.mastering_engineer_id}
+    if is_track_composer(track, user.id) or user.id == album.mastering_engineer_id:
+        return True
+    db = Session.object_session(album)
+    return is_album_manager(album, user, db) if db is not None else user.id == album.producer_id
 
 
 def _hash_user_id(user_id: int) -> str:
@@ -582,8 +592,7 @@ def ensure_track_visibility(track: Track, user: User, db: Session) -> Album:
     # Admins bypass all visibility checks
     if has_admin_role(user, "viewer"):
         return album
-    # Producer and mastering engineer always have access
-    if user.id in (album.producer_id, album.mastering_engineer_id):
+    if user.id == album.mastering_engineer_id or is_album_manager(album, user, db):
         return album
     # Composers and peer reviewer of this specific track always have access
     if is_track_composer(track, user.id, db) or user.id == track.peer_reviewer_id:
@@ -659,7 +668,7 @@ def track_allowed_actions(
         if pending_followup:
             if is_track_composer_actor(track, album, user.id, db):
                 actions.append("cancel_source_followup")
-            if user.id in {album.producer_id, album.mastering_engineer_id}:
+            if user.id == album.mastering_engineer_id or is_album_manager(album, user, db):
                 actions.append("decide_source_followup")
         return actions
 
@@ -748,6 +757,9 @@ def _can_request_source_followup(
 
 def _issue_visible_to_user(issue: Issue, track: Track, user: User) -> bool:
     album = track.album
+    db = Session.object_session(album) if album is not None else None
+    if album is not None and db is not None and is_album_manager(album, user, db):
+        return True
     if album is not None and user.id == album.producer_id:
         return True
     return not (
@@ -758,6 +770,9 @@ def _issue_visible_to_user(issue: Issue, track: Track, user: User) -> bool:
 
 def _comment_visible_to_user(comment: Comment, issue: Issue, track: Track, user: User) -> bool:
     album = track.album
+    db = Session.object_session(album) if album is not None else None
+    if album is not None and db is not None and is_album_manager(album, user, db):
+        return _issue_visible_to_user(issue, track, user)
     if album is not None and user.id == album.producer_id:
         return _issue_visible_to_user(issue, track, user)
     if comment.visibility == "internal" and is_track_composer(track, user.id):

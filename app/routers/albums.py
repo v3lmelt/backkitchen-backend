@@ -19,6 +19,7 @@ from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
 
 from app.admin_permissions import has_admin_role
+from app.circle_permissions import is_album_manager, is_circle_manager, require_album_manager
 from app.config import MAX_ALBUM_COVER_UPLOAD_SIZE, settings
 from app.database import get_db
 from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
@@ -32,11 +33,12 @@ from app.models.workflow_event import WorkflowEvent
 from app.models.workflow_template import WorkflowTemplate
 from app.notifications import notify
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema, WorkflowEventRead
-from app.security import get_current_user, require_producer
+from app.security import get_current_user
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
 from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed, peer_identity_anonymize_user_ids_for_viewer
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
+from app.workflow_user_scope import validate_circle_workflow_user_scope
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
 
@@ -116,7 +118,19 @@ def _resolve_album_workflow(
     else:
         workflow_config = DEFAULT_WORKFLOW_CONFIG
 
+    validate_circle_workflow_user_scope(workflow_config, db, payload.circle_id)
     return circle, template, workflow_config
+
+
+def _ensure_album_create_allowed(circle: Circle | None, current_user: User, db: Session) -> None:
+    if has_admin_role(current_user, "operator") or current_user.role == "producer":
+        return
+    if circle is not None and is_circle_manager(circle, current_user, db):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Only producers or circle managers can create albums.",
+    )
 
 
 def _validate_album_team_payload(
@@ -406,9 +420,10 @@ def _album_to_read(album: Album, db: Session, *, summary: AlbumStats | None = No
 def create_album(
     payload: AlbumCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_producer),
+    current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
     circle, workflow_template, effective_workflow = _resolve_album_workflow(payload, current_user, db)
+    _ensure_album_create_allowed(circle, current_user, db)
     team_payload = AlbumTeamUpdate(
         mastering_engineer_id=payload.mastering_engineer_id,
         member_ids=payload.member_ids,
@@ -478,7 +493,10 @@ def list_albums(
         visible_albums = []
         for album in albums:
             member_ids = members_by_album.get(album.id, set())
-            if current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids:
+            if (
+                current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids
+                or is_album_manager(album, current_user, db)
+            ):
                 visible_albums.append(album)
     summaries = _build_album_stats_summary_map(visible_albums, db, current_user)
     return [_album_to_read(album, db, summary=summaries.get(album.id)) for album in visible_albums]
@@ -524,8 +542,7 @@ def remove_album_member(
     album = db.get(Album, album_id)
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
-    if current_user.id != album.producer_id and not has_admin_role(current_user, "operator"):
-        raise HTTPException(status_code=403, detail="Only the album producer can remove members.")
+    require_album_manager(album, current_user, db)
     if user_id == album.producer_id:
         raise HTTPException(status_code=400, detail="Cannot remove the album producer.")
     if user_id == current_user.id:
@@ -738,7 +755,7 @@ def list_album_tracks(
         Track.archived_at.is_(None),
         Track.status != TrackStatus.REJECTED,
     ]
-    is_privileged = current_user.id in (album.producer_id, album.mastering_engineer_id)
+    is_privileged = current_user.id == album.mastering_engineer_id or is_album_manager(album, current_user, db)
     if not is_privileged and not is_album_completed(db, album_id):
         composer_track_ids = select(TrackComposer.track_id).where(TrackComposer.user_id == current_user.id)
         filters.append(
@@ -762,7 +779,7 @@ def list_archived_tracks(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-    if current_user.id != album.producer_id and not has_admin_role(current_user, "viewer"):
+    if not is_album_manager(album, current_user, db) and not has_admin_role(current_user, "viewer"):
         raise HTTPException(status_code=403, detail="Only the album producer can view archived tracks.")
 
     tracks = list(db.scalars(
@@ -895,6 +912,7 @@ def update_workflow_config(
 
     old_config = parse_workflow_config(album)
     new_config = payload.model_dump()
+    validate_circle_workflow_user_scope(new_config, db, album.circle_id)
 
     album.workflow_config = json.dumps(new_config, ensure_ascii=False)
     migrations = migrate_tracks_on_workflow_change(db, album, old_config, new_config, background_tasks)
@@ -1245,7 +1263,7 @@ def restore_album(
     album = db.get(Album, album_id)
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
-    if album.producer_id != current_user.id and not has_admin_role(current_user, "operator"):
+    if not is_album_manager(album, current_user, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the album producer can restore albums.",

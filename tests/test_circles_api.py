@@ -98,6 +98,76 @@ def test_update_circle_requires_creator(client, db_session, factory, auth_header
     assert allowed.json()["name"] == "After"
 
 
+def test_owner_can_promote_member_to_co_producer(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    member = factory.user(username="co")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Circle One", "description": "desc"},
+    )
+    circle_id = create_response.json()["id"]
+    db_session.add(CircleMember(circle_id=circle_id, user_id=member.id, role="member"))
+    db_session.commit()
+
+    response = client.patch(
+        f"/api/circles/{circle_id}/members/{member.id}",
+        headers=auth_headers(owner),
+        json={"role": "co_producer"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["role"] == "co_producer"
+
+
+def test_co_producer_can_manage_circle_but_not_ownership_boundaries(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    co_producer = factory.user(username="co")
+    member = factory.user(username="member")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Circle One", "description": "desc"},
+    )
+    circle_id = create_response.json()["id"]
+    db_session.add_all([
+        CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"),
+        CircleMember(circle_id=circle_id, user_id=member.id, role="member"),
+    ])
+    db_session.commit()
+
+    update_response = client.patch(
+        f"/api/circles/{circle_id}",
+        headers=auth_headers(co_producer),
+        json={"name": "Managed Circle"},
+    )
+    invite_response = client.post(
+        f"/api/circles/{circle_id}/invite-codes",
+        headers=auth_headers(co_producer),
+        json={"role": "member", "expires_in_days": 7},
+    )
+    promote_response = client.patch(
+        f"/api/circles/{circle_id}/members/{member.id}",
+        headers=auth_headers(co_producer),
+        json={"role": "co_producer"},
+    )
+    remove_member_response = client.delete(
+        f"/api/circles/{circle_id}/members/{member.id}",
+        headers=auth_headers(co_producer),
+    )
+    delete_response = client.delete(
+        f"/api/circles/{circle_id}",
+        headers=auth_headers(co_producer),
+    )
+
+    assert update_response.status_code == 200
+    assert update_response.json()["name"] == "Managed Circle"
+    assert invite_response.status_code == 201
+    assert remove_member_response.status_code == 204
+    assert promote_response.status_code == 403
+    assert delete_response.status_code == 403
+
+
 def test_invite_code_lifecycle(client, db_session, factory, auth_headers):
     producer = factory.user(role="producer")
     create_response = client.post(
@@ -129,6 +199,30 @@ def test_invite_code_lifecycle(client, db_session, factory, auth_headers):
     assert revoked.status_code == 204
     assert invite is not None
     assert invite.is_active is False
+
+
+def test_invite_code_expiry_accepts_one_year_limit(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Circle One", "description": "desc"},
+    )
+    circle_id = create_response.json()["id"]
+
+    accepted = client.post(
+        f"/api/circles/{circle_id}/invite-codes",
+        headers=auth_headers(producer),
+        json={"role": "member", "expires_in_days": 365},
+    )
+    rejected = client.post(
+        f"/api/circles/{circle_id}/invite-codes",
+        headers=auth_headers(producer),
+        json={"role": "member", "expires_in_days": 366},
+    )
+
+    assert accepted.status_code == 201
+    assert rejected.status_code == 422
 
 
 def test_join_circle_accepts_active_code(client, db_session, factory, auth_headers):
