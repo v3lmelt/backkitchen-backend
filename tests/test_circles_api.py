@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.models.circle import CircleInviteCode, CircleMember
+from app.models.circle import Circle, CircleInviteCode, CircleMember
 
 
 def test_create_circle_requires_producer(client, factory, auth_headers):
@@ -97,6 +97,46 @@ def test_update_circle_requires_creator(client, db_session, factory, auth_header
     assert allowed.status_code == 200
     assert allowed.json()["name"] == "After"
 
+
+def test_list_circles_marks_album_creation_access_per_circle(client, db_session, factory, auth_headers):
+    viewer = factory.user(username="circle-manager")
+    creator = factory.user(role="producer", username="circle-owner")
+    producer_viewer = factory.user(role="producer", username="album-producer")
+
+    owned_circle = Circle(name="Owned Circle", description=None, website=None, created_by=creator.id)
+    managed_circle = Circle(name="Managed Circle", description=None, website=None, created_by=creator.id)
+    member_circle = Circle(name="Member Circle", description=None, website=None, created_by=creator.id)
+    producer_member_circle = Circle(name="Producer Member Circle", description=None, website=None, created_by=creator.id)
+    db_session.add_all([owned_circle, managed_circle, member_circle, producer_member_circle])
+    db_session.flush()
+    db_session.add_all([
+        CircleMember(circle_id=owned_circle.id, user_id=viewer.id, role="owner"),
+        CircleMember(circle_id=managed_circle.id, user_id=viewer.id, role="co_producer"),
+        CircleMember(circle_id=member_circle.id, user_id=viewer.id, role="member"),
+        CircleMember(circle_id=producer_member_circle.id, user_id=producer_viewer.id, role="member"),
+    ])
+    db_session.commit()
+
+    response = client.get("/api/circles", headers=auth_headers(viewer))
+
+    assert response.status_code == 200
+    access_by_name = {
+        circle["name"]: circle["viewer_can_create_album"]
+        for circle in response.json()
+    }
+    assert access_by_name == {
+        "Owned Circle": True,
+        "Managed Circle": True,
+        "Member Circle": False,
+    }
+
+    producer_response = client.get("/api/circles", headers=auth_headers(producer_viewer))
+    producer_access_by_name = {
+        circle["name"]: circle["viewer_can_create_album"]
+        for circle in producer_response.json()
+    }
+    assert producer_response.status_code == 200
+    assert producer_access_by_name == {"Producer Member Circle": True}
 
 def test_owner_can_promote_member_to_co_producer(client, db_session, factory, auth_headers):
     owner = factory.user(role="producer")

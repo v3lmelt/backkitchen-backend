@@ -795,6 +795,7 @@ def build_track_read(
     *,
     anonymize: bool = False,
     anonymize_user_ids: set[int] | None = None,
+    viewer_is_album_manager: bool | None = None,
 ) -> TrackRead:
     from app.workflow_engine import (
         get_allowed_transitions,
@@ -841,6 +842,12 @@ def build_track_read(
     external_names = [] if anonymize else track_external_composer_names(track, db)
     external_submitter_name = external_names[0] if external_names else track.external_submitter_name
 
+    resolved_viewer_is_album_manager = (
+        viewer_is_album_manager
+        if viewer_is_album_manager is not None
+        else is_album_manager(album, user, db) if db is not None else user.id == album.producer_id
+    )
+
     return TrackRead(
         id=track.id,
         title=track.title,
@@ -865,6 +872,7 @@ def build_track_read(
         peer_reviewer_id=track.peer_reviewer_id,
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
+        viewer_is_album_manager=resolved_viewer_is_album_manager,
         external_submitter_name=None if anonymize else external_submitter_name,
         is_proxy_submission=False if anonymize else bool(external_names and track.proxy_uploader_id),
         created_at=track.created_at,

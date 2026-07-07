@@ -660,7 +660,7 @@ def admin_list_albums(
             | Album.circle_name.ilike(pattern, escape="\\")
         )
     albums = list(db.scalars(stmt.limit(limit).offset(offset)).unique().all())
-    return [_album_to_read(album, db) for album in albums]
+    return [_album_to_read(album, db, current_user=_admin) for album in albums]
 
 
 @router.get("/circles", response_model=list[CircleSummary])

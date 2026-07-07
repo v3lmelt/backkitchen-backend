@@ -348,10 +348,17 @@ def _build_album_stats_summary_map(
 
 def _read_album_with_summary(album: Album, db: Session, current_user: User) -> AlbumRead:
     summary = _build_album_stats_summary_map([album], db, current_user).get(album.id)
-    return _album_to_read(album, db, summary=summary)
+    return _album_to_read(album, db, current_user=current_user, summary=summary)
 
 
-def _album_to_read(album: Album, db: Session, *, summary: AlbumStats | None = None) -> AlbumRead:
+def _album_to_read(
+    album: Album,
+    db: Session,
+    *,
+    current_user: User | None = None,
+    summary: AlbumStats | None = None,
+    viewer_is_album_manager: bool | None = None,
+) -> AlbumRead:
     members = [
         {
             "id": member.id,
@@ -377,6 +384,12 @@ def _album_to_read(album: Album, db: Session, *, summary: AlbumStats | None = No
     if album.workflow_template_id and album.workflow_template:
         template_name = album.workflow_template.name
 
+    resolved_viewer_is_album_manager = (
+        viewer_is_album_manager
+        if viewer_is_album_manager is not None
+        else is_album_manager(album, current_user, db) if current_user is not None else False
+    )
+
     return AlbumRead(
         id=album.id,
         title=album.title,
@@ -392,6 +405,7 @@ def _album_to_read(album: Album, db: Session, *, summary: AlbumStats | None = No
         cover_image=album.cover_image,
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
+        viewer_is_album_manager=resolved_viewer_is_album_manager,
         deadline=album.deadline,
         phase_deadlines=phase_deadlines,
         workflow_config=workflow_config,
@@ -493,18 +507,31 @@ def list_albums(
         stmt = stmt.where(Album.title.ilike(pattern) | Album.description.ilike(pattern))
     albums = list(db.scalars(stmt).all())
     visible_albums = albums
-    if not current_user.is_admin:
+    viewer_manager_by_album_id: dict[int, bool] = {}
+    if current_user.is_admin:
+        viewer_manager_by_album_id = {
+            album.id: is_album_manager(album, current_user, db) for album in visible_albums
+        }
+    else:
         members_by_album = get_all_album_member_ids(db)
         visible_albums = []
         for album in albums:
             member_ids = members_by_album.get(album.id, set())
-            if (
-                current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids
-                or is_album_manager(album, current_user, db)
-            ):
+            viewer_is_manager = is_album_manager(album, current_user, db)
+            if current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids or viewer_is_manager:
                 visible_albums.append(album)
+                viewer_manager_by_album_id[album.id] = viewer_is_manager
     summaries = _build_album_stats_summary_map(visible_albums, db, current_user)
-    return [_album_to_read(album, db, summary=summaries.get(album.id)) for album in visible_albums]
+    return [
+        _album_to_read(
+            album,
+            db,
+            current_user=current_user,
+            viewer_is_album_manager=viewer_manager_by_album_id.get(album.id),
+            summary=summaries.get(album.id),
+        )
+        for album in visible_albums
+    ]
 
 
 @router.get("/{album_id}", response_model=AlbumRead)
@@ -760,7 +787,8 @@ def list_album_tracks(
         Track.archived_at.is_(None),
         Track.status != TrackStatus.REJECTED,
     ]
-    is_privileged = current_user.id == album.mastering_engineer_id or is_album_manager(album, current_user, db)
+    viewer_is_album_manager = is_album_manager(album, current_user, db)
+    is_privileged = current_user.id == album.mastering_engineer_id or viewer_is_album_manager
     if not is_privileged and not is_album_completed(db, album_id):
         composer_track_ids = select(TrackComposer.track_id).where(TrackComposer.user_id == current_user.id)
         filters.append(
@@ -771,7 +799,10 @@ def list_album_tracks(
         select(Track).where(*filters)
         .order_by(Track.track_number.asc().nulls_last(), Track.id)
     ).all())
-    return [build_track_read(track, current_user, album, db=db) for track in tracks]
+    return [
+        build_track_read(track, current_user, album, db=db, viewer_is_album_manager=viewer_is_album_manager)
+        for track in tracks
+    ]
 
 
 @router.get("/{album_id}/archived-tracks", response_model=list[TrackRead])
@@ -784,7 +815,8 @@ def list_archived_tracks(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-    if not is_album_manager(album, current_user, db) and not has_admin_role(current_user, "viewer"):
+    viewer_is_album_manager = is_album_manager(album, current_user, db)
+    if not viewer_is_album_manager and not has_admin_role(current_user, "viewer"):
         raise HTTPException(status_code=403, detail="Only the album producer can view archived tracks.")
 
     tracks = list(db.scalars(
@@ -794,7 +826,10 @@ def list_archived_tracks(
         )
         .order_by(Track.archived_at.desc())
     ).all())
-    return [build_track_read(track, current_user, album, db=db) for track in tracks]
+    return [
+        build_track_read(track, current_user, album, db=db, viewer_is_album_manager=viewer_is_album_manager)
+        for track in tracks
+    ]
 
 
 @router.patch("/{album_id}/track-order", response_model=list[TrackRead])
@@ -805,6 +840,7 @@ def reorder_tracks(
     current_user: User = Depends(get_current_user),
 ) -> list[TrackRead]:
     album = ensure_album_producer(album_id, current_user, db)
+    viewer_is_album_manager = True
 
     tracks = list(db.scalars(select(Track).where(Track.album_id == album_id)).all())
     track_map = {t.id: t for t in tracks}
@@ -819,7 +855,10 @@ def reorder_tracks(
     for t in tracks:
         db.refresh(t)
     ordered = sorted(tracks, key=lambda x: (x.track_number is None, x.track_number or 0, x.id))
-    return [build_track_read(t, current_user, album, db=db) for t in ordered]
+    return [
+        build_track_read(t, current_user, album, db=db, viewer_is_album_manager=viewer_is_album_manager)
+        for t in ordered
+    ]
 
 
 @router.get("/{album_id}/webhook", response_model=WebhookConfig)

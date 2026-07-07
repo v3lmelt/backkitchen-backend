@@ -117,6 +117,12 @@ def test_co_producer_can_execute_producer_workflow_transition(client, db_session
     track = factory.track(album=album, submitter=submitter, status="intake")
     db_session.commit()
 
+    detail_response = client.get(f"/api/tracks/{track.id}", headers=auth_headers(co_producer))
+    assert detail_response.status_code == 200
+    detail_body = detail_response.json()["track"]
+    assert detail_body["viewer_is_album_manager"] is True
+    assert "accept_producer_direct" in detail_body["allowed_actions"]
+
     response = _transition(client, auth_headers, track.id, co_producer, "accept_producer_direct")
 
     assert response["status"] == "producer_gate"

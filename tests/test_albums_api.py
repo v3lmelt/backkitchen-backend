@@ -430,7 +430,13 @@ def test_co_producer_can_manage_circle_album_team(client, db_session, factory, a
     )
 
     assert response.status_code == 200
-    assert response.json()["mastering_engineer_id"] == mastering.id
+    body = response.json()
+    assert body["mastering_engineer_id"] == mastering.id
+    assert body["viewer_is_album_manager"] is True
+
+    detail_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(co_producer))
+    assert detail_response.status_code == 200
+    assert detail_response.json()["viewer_is_album_manager"] is True
 
 
 def test_co_producer_does_not_manage_unlinked_album(client, db_session, factory, auth_headers):
@@ -444,16 +450,34 @@ def test_co_producer_does_not_manage_unlinked_album(client, db_session, factory,
     )
     circle_id = create_response.json()["id"]
     db_session.add(CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"))
-    album = factory.album(producer=owner, mastering_engineer=mastering)
+    inaccessible_album = factory.album(producer=owner, mastering_engineer=mastering)
+    visible_unlinked_album = factory.album(
+        producer=owner,
+        mastering_engineer=mastering,
+        members=[co_producer],
+    )
     db_session.commit()
 
-    response = client.patch(
-        f"/api/albums/{album.id}/metadata",
+    inaccessible_response = client.get(
+        f"/api/albums/{inaccessible_album.id}",
+        headers=auth_headers(co_producer),
+    )
+    assert inaccessible_response.status_code == 403
+
+    detail_response = client.get(
+        f"/api/albums/{visible_unlinked_album.id}",
+        headers=auth_headers(co_producer),
+    )
+    assert detail_response.status_code == 200
+    assert detail_response.json()["viewer_is_album_manager"] is False
+
+    manager_response = client.patch(
+        f"/api/albums/{visible_unlinked_album.id}/metadata",
         headers=auth_headers(co_producer),
         json={"title": "Should Not Update"},
     )
 
-    assert response.status_code == 403
+    assert manager_response.status_code == 403
 
 
 def test_album_stats(client, factory, auth_headers):

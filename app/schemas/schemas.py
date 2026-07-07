@@ -294,6 +294,7 @@ class AlbumRead(AlbumBase):
     cover_image: str | None = None
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
+    viewer_is_album_manager: bool = False
     deadline: datetime | None = None
     phase_deadlines: dict[str, str] | None = None
     workflow_config: "WorkflowConfigSchema | None" = None
@@ -366,6 +367,7 @@ class CircleSummary(BaseModel):
     default_checklist_enabled: bool
     created_by: int
     member_count: int = 0
+    viewer_can_create_album: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -505,6 +507,7 @@ class TrackRead(TrackBase):
     peer_reviewer_id: int | None = None
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
+    viewer_is_album_manager: bool = False
     external_submitter_name: str | None = None
     is_proxy_submission: bool = False
     author_notes: str | None = None
