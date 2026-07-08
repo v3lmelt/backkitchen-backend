@@ -128,6 +128,259 @@ def test_co_producer_can_execute_producer_workflow_transition(client, db_session
     assert response["status"] == "producer_gate"
 
 
+def _create_progress_circle_album(client, db_session, factory, auth_headers, *, actor_role: str = "owner", workflow_config: dict | None = None, track_status: str = "intake"):
+    owner = factory.user(role="producer")
+    actor = owner if actor_role == "owner" else factory.user(username=f"{actor_role}-actor")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": f"Progress Circle {actor_role}", "description": "desc"},
+    )
+    assert create_response.status_code == 201, create_response.text
+    circle_id = create_response.json()["id"]
+    memberships = [
+        CircleMember(circle_id=circle_id, user_id=mastering.id, role="mastering_engineer"),
+        CircleMember(circle_id=circle_id, user_id=submitter.id, role="member"),
+    ]
+    if actor_role != "owner":
+        memberships.append(CircleMember(circle_id=circle_id, user_id=actor.id, role=actor_role))
+    db_session.add_all(memberships)
+    album = factory.album(
+        producer=owner,
+        mastering_engineer=mastering,
+        members=[submitter],
+        workflow_config=workflow_config,
+        checklist_enabled=False,
+    )
+    album.circle_id = circle_id
+    track = factory.track(album=album, submitter=submitter, status=track_status)
+    db_session.commit()
+    return owner, actor, mastering, submitter, album, track, circle_id
+
+
+def _force_progress(client, auth_headers, track_id: int, actor, new_status: str, reason: str | None = None):
+    payload = {"new_status": new_status}
+    if reason is not None:
+        payload["reason"] = reason
+    return client.post(
+        f"/api/tracks/{track_id}/force-status",
+        headers=auth_headers(actor),
+        json=payload,
+    )
+
+
+def test_circle_owner_can_force_track_progress_for_bound_album(client, db_session, factory, auth_headers):
+    _, owner, _, _, _, track, _ = _create_progress_circle_album(
+        client, db_session, factory, auth_headers
+    )
+
+    response = _force_progress(client, auth_headers, track.id, owner, "peer_review", "Need another review")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "peer_review"
+    event = db_session.scalar(
+        select(WorkflowEvent).where(
+            WorkflowEvent.track_id == track.id,
+            WorkflowEvent.event_type == "track_force_status",
+        )
+    )
+    assert event is not None
+    assert event.from_status == "intake"
+    assert event.to_status == "peer_review"
+
+
+def test_co_producer_can_force_track_progress_for_bound_album(client, db_session, factory, auth_headers):
+    _, co_producer, _, _, _, track, _ = _create_progress_circle_album(
+        client, db_session, factory, auth_headers, actor_role="co_producer"
+    )
+
+    response = _force_progress(client, auth_headers, track.id, co_producer, "peer_review")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "peer_review"
+
+
+def test_force_track_progress_prepares_review_assignments_without_duplicates(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    reviewer_a = factory.user(username="reviewer-a")
+    reviewer_b = factory.user(username="reviewer-b")
+    workflow_config = {
+        "version": 2,
+        "steps": [
+            {
+                "id": "peer_review",
+                "label": "Peer Review",
+                "type": "review",
+                "ui_variant": "peer_review",
+                "assignee_role": "peer_reviewer",
+                "order": 0,
+                "required_reviewer_count": 2,
+                "transitions": {"pass": "mastering"},
+            },
+            {
+                "id": "mastering",
+                "label": "Mastering",
+                "type": "delivery",
+                "assignee_role": "mastering_engineer",
+                "order": 1,
+                "transitions": {},
+            },
+        ],
+    }
+    _, owner, _, _, album, track, circle_id = _create_progress_circle_album(
+        client,
+        db_session,
+        factory,
+        auth_headers,
+        workflow_config=workflow_config,
+        track_status="mastering",
+    )
+    db_session.add_all([
+        CircleMember(circle_id=circle_id, user_id=reviewer_a.id, role="member"),
+        CircleMember(circle_id=circle_id, user_id=reviewer_b.id, role="member"),
+    ])
+    now = datetime.now(timezone.utc)
+    db_session.add_all([
+        StageAssignment(
+            track_id=track.id,
+            stage_id="peer_review",
+            user_id=reviewer_a.id,
+            status="completed",
+            decision="pass",
+            assigned_at=now,
+            completed_at=now,
+        ),
+        StageAssignment(
+            track_id=track.id,
+            stage_id="peer_review",
+            user_id=reviewer_b.id,
+            status="pending",
+            assigned_at=now,
+        ),
+    ])
+    db_session.commit()
+
+    response = _force_progress(client, auth_headers, track.id, owner, "peer_review", "Recheck reviews")
+
+    assert response.status_code == 200, response.text
+    assignments = db_session.scalars(
+        select(StageAssignment)
+        .where(
+            StageAssignment.track_id == track.id,
+            StageAssignment.stage_id == "peer_review",
+            StageAssignment.status.in_(["pending", "completed"]),
+        )
+        .order_by(StageAssignment.user_id.asc())
+    ).all()
+    assert len(assignments) == 2
+    assert {assignment.user_id for assignment in assignments} == {
+        reviewer_a.id,
+        reviewer_b.id,
+    }
+    assert all(assignment.status == "pending" for assignment in assignments)
+
+
+def test_force_track_progress_rejects_unbound_album(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    co_producer = factory.user(username="co")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Unbound Circle", "description": "desc"},
+    )
+    assert create_response.status_code == 201, create_response.text
+    circle_id = create_response.json()["id"]
+    db_session.add(CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"))
+    album = factory.album(producer=owner, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="intake")
+    db_session.commit()
+
+    response = _force_progress(client, auth_headers, track.id, co_producer, "peer_review")
+
+    assert response.status_code == 403
+
+
+def test_force_track_progress_rejects_other_circle_album(client, db_session, factory, auth_headers):
+    owner_a = factory.user(role="producer", username="owner-a")
+    owner_b = factory.user(role="producer", username="owner-b")
+    co_producer = factory.user(username="co")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    circle_a = client.post(
+        "/api/circles",
+        headers=auth_headers(owner_a),
+        json={"name": "Circle A", "description": "desc"},
+    )
+    circle_b = client.post(
+        "/api/circles",
+        headers=auth_headers(owner_b),
+        json={"name": "Circle B", "description": "desc"},
+    )
+    assert circle_a.status_code == 201, circle_a.text
+    assert circle_b.status_code == 201, circle_b.text
+    db_session.add(CircleMember(circle_id=circle_a.json()["id"], user_id=co_producer.id, role="co_producer"))
+    album = factory.album(producer=owner_b, mastering_engineer=mastering, members=[submitter])
+    album.circle_id = circle_b.json()["id"]
+    track = factory.track(album=album, submitter=submitter, status="intake")
+    db_session.commit()
+
+    response = _force_progress(client, auth_headers, track.id, co_producer, "peer_review")
+
+    assert response.status_code == 403
+
+
+def test_force_track_progress_rejects_member(client, db_session, factory, auth_headers):
+    _, member, _, _, _, track, _ = _create_progress_circle_album(
+        client, db_session, factory, auth_headers, actor_role="member"
+    )
+
+    response = _force_progress(client, auth_headers, track.id, member, "peer_review")
+
+    assert response.status_code == 403
+
+
+def test_force_track_progress_rejects_invalid_or_disallowed_status(client, db_session, factory, auth_headers):
+    _, owner, _, _, _, track, _ = _create_progress_circle_album(
+        client, db_session, factory, auth_headers
+    )
+
+    rejected_response = _force_progress(client, auth_headers, track.id, owner, TrackStatus.REJECTED.value)
+    missing_response = _force_progress(client, auth_headers, track.id, owner, "does_not_exist")
+
+    assert rejected_response.status_code == 400
+    assert missing_response.status_code == 400
+
+
+def test_force_track_progress_rejects_archived_track_or_album(client, db_session, factory, auth_headers):
+    _, owner, _, _, album, track, _ = _create_progress_circle_album(
+        client, db_session, factory, auth_headers
+    )
+    track.archived_at = datetime.now(timezone.utc)
+    db_session.commit()
+
+    archived_track_response = _force_progress(client, auth_headers, track.id, owner, "peer_review")
+
+    assert archived_track_response.status_code == 409
+    assert archived_track_response.json()["detail"] == "Archived tracks cannot have progress adjusted."
+
+    track.archived_at = None
+    album.archived_at = datetime.now(timezone.utc)
+    db_session.commit()
+
+    archived_album_response = _force_progress(client, auth_headers, track.id, owner, "peer_review")
+
+    assert archived_album_response.status_code == 409
+    assert archived_album_response.json()["detail"] == "Archived albums cannot have track progress adjusted."
+
+
 def _upload_confirm_and_approve_master(client, auth_headers, track_id: int, producer, mastering, submitter) -> dict:
     delivery = client.post(
         f"/api/tracks/{track_id}/master-deliveries",

@@ -19,7 +19,7 @@ from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
 
 from app.admin_permissions import has_admin_role
-from app.circle_permissions import is_album_manager, is_circle_manager, require_album_manager
+from app.circle_permissions import is_album_manager, is_circle_bound_album_manager, is_circle_manager, require_album_manager
 from app.config import MAX_ALBUM_COVER_UPLOAD_SIZE, settings
 from app.database import get_db
 from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
@@ -389,6 +389,11 @@ def _album_to_read(
         if viewer_is_album_manager is not None
         else is_album_manager(album, current_user, db) if current_user is not None else False
     )
+    resolved_viewer_can_force_track_status = (
+        is_circle_bound_album_manager(album, current_user, db)
+        if current_user is not None
+        else False
+    )
 
     return AlbumRead(
         id=album.id,
@@ -406,6 +411,7 @@ def _album_to_read(
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
         viewer_is_album_manager=resolved_viewer_is_album_manager,
+        viewer_can_force_track_status=resolved_viewer_can_force_track_status,
         deadline=album.deadline,
         phase_deadlines=phase_deadlines,
         workflow_config=workflow_config,

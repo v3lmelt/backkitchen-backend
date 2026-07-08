@@ -295,6 +295,7 @@ class AlbumRead(AlbumBase):
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
     viewer_is_album_manager: bool = False
+    viewer_can_force_track_status: bool = False
     deadline: datetime | None = None
     phase_deadlines: dict[str, str] | None = None
     workflow_config: "WorkflowConfigSchema | None" = None
@@ -875,6 +876,9 @@ class WorkflowTransitionRequest(BaseModel):
         if value is not None and value not in ("source_audio", "stem_files"):
             raise ValueError("revision_type must be 'source_audio' or 'stem_files'")
         return value
+
+class TrackForceStatusRequest(AdminOptionalReasonMixin):
+    new_status: str = Field(..., min_length=1, max_length=50)
 
 
 class WorkflowStepDefSchema(BaseModel):

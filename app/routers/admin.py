@@ -51,15 +51,9 @@ from app.schemas.schemas import (
     WorkflowEventRead,
 )
 from app.services.cleanup import cleanup_files, collect_track_files
+from app.services.track_progress import force_track_status
 from app.workflow import build_track_read, log_track_event, track_composer_ids_for_notify
-from app.workflow_engine import (
-    ASSIGNMENT_CANCEL_REASON_REASSIGNED,
-    _cancel_active_review_assignments,
-    get_step_by_id,
-    get_steps,
-    parse_workflow_config,
-    prepare_review_assignments_for_stage_entry,
-)
+from app.workflow_engine import ASSIGNMENT_CANCEL_REASON_REASSIGNED, _cancel_active_review_assignments
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -983,37 +977,17 @@ def admin_force_status(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
 
-    config = parse_workflow_config(album)
-    valid_step_ids = {step["id"] for step in config.get("steps", [])}
-    terminal = {status_value.value for status_value in TrackStatus}
-    valid_statuses = valid_step_ids | terminal
-    if payload.new_status not in valid_statuses:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status. Valid: {sorted(valid_statuses)}",
-        )
-
     before = _track_snapshot(track)
-    old_status = track.status
-    track.status = payload.new_status
-    target_step = get_step_by_id(get_steps(config), payload.new_status)
-    if target_step is not None and target_step.type == "review":
-        prepare_review_assignments_for_stage_entry(
-            db,
-            album,
-            track,
-            target_step.id,
-            background_tasks,
-            actor=admin,
-        )
-    log_track_event(
+    force_track_status(
         db,
+        album,
         track,
         admin,
-        "admin_force_status",
-        from_status=old_status,
-        to_status=payload.new_status,
-        payload={"reason": payload.reason},
+        payload.new_status,
+        payload.reason,
+        background_tasks,
+        allowed_terminal_statuses={status_value.value for status_value in TrackStatus},
+        event_type="admin_force_status",
     )
     record_admin_audit(
         db,

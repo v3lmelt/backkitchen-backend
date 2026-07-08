@@ -82,6 +82,22 @@ def require_album_manager(album: Album, user: User, db: Session) -> None:
             detail="Only the album manager can perform this action.",
         )
 
+def is_circle_bound_album_manager(album: Album, user: User, db: Session) -> bool:
+    if has_admin_role(user, "operator"):
+        return True
+    if album.circle_id is None:
+        return False
+    circle = album.circle or db.get(Circle, album.circle_id)
+    return circle is not None and is_circle_manager(circle, user, db)
+
+
+def require_circle_bound_album_manager(album: Album, user: User, db: Session) -> None:
+    if not is_circle_bound_album_manager(album, user, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only a circle manager can adjust track progress.",
+        )
+
 
 def album_manager_user_ids(db: Session, album: Album) -> set[int]:
     ids: set[int] = set()

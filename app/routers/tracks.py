@@ -11,7 +11,7 @@ from sqlalchemy import func, func as sqlfunc, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.admin_permissions import has_admin_role
-from app.circle_permissions import album_manager_user_ids, is_album_manager
+from app.circle_permissions import album_manager_user_ids, is_album_manager, require_circle_bound_album_manager
 from app.config import settings
 from app.database import get_db
 from app.models.album import Album
@@ -49,6 +49,7 @@ from app.schemas.schemas import (
     SourceFollowupDecisionRequest,
     StageAssignmentRead,
     TrackDetailResponse,
+    TrackForceStatusRequest,
     TrackListItem,
     TrackMetadataUpdate,
     TrackComposerUpdate,
@@ -72,6 +73,7 @@ from app.realtime import broadcast_track_updated
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.audio import extract_audio_metadata
 from app.services.track_delete import prepare_track_hard_delete
+from app.services.track_progress import force_track_status as apply_force_track_status
 from app.services.upload import stream_upload_sync
 from app.workflow import (
     build_track_detail,
@@ -1908,6 +1910,40 @@ def workflow_transition(
     engine_execute_transition(
         db, album, track, current_user, payload.decision, background_tasks,
         revision_type=payload.revision_type
+    )
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track_id)
+    return build_track_read(track, current_user, album, db=db)
+
+@router.post("/{track_id}/force-status", response_model=TrackRead)
+def force_track_progress_status(
+    track_id: int,
+    payload: TrackForceStatusRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    require_circle_bound_album_manager(album, current_user, db)
+    if album.archived_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Archived albums cannot have track progress adjusted.")
+    if track.archived_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Archived tracks cannot have progress adjusted.")
+
+    apply_force_track_status(
+        db,
+        album,
+        track,
+        current_user,
+        payload.new_status,
+        payload.reason,
+        background_tasks,
+        allowed_terminal_statuses={TrackStatus.COMPLETED.value},
+        event_type="track_force_status",
     )
     db.commit()
     db.refresh(track)
