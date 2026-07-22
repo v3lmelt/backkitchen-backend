@@ -33,6 +33,7 @@ from app.schemas.schemas import (
     UserRead,
 )
 from app.security import get_current_user, require_producer
+from app.services.circle_membership import revoke_circle_member_resource_access
 from app.services.upload import stream_upload
 
 router = APIRouter(prefix="/api/circles", tags=["circles"])
@@ -447,6 +448,7 @@ def remove_member(
     ):
         raise HTTPException(status_code=403, detail="Only the circle owner can remove a co-producer.")
 
+    revoke_circle_member_resource_access(db, circle_id, user_id)
     db.delete(member)
     db.commit()
 
@@ -475,6 +477,7 @@ def leave_circle(
     if not member:
         raise HTTPException(status_code=404, detail="You are not a member of this circle")
 
+    revoke_circle_member_resource_access(db, circle_id, current_user.id)
     db.delete(member)
     db.commit()
 

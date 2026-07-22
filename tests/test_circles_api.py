@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
 
+from app.models.album_member import AlbumMember
 from app.models.circle import Circle, CircleInviteCode, CircleMember
+from app.models.invitation import Invitation
+from app.models.stage_assignment import StageAssignment
 
 
 def test_create_circle_requires_producer(client, factory, auth_headers):
@@ -206,6 +209,133 @@ def test_co_producer_can_manage_circle_but_not_ownership_boundaries(client, db_s
     assert remove_member_response.status_code == 204
     assert promote_response.status_code == 403
     assert delete_response.status_code == 403
+
+
+def test_remove_member_revokes_circle_derived_album_access(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer", username="owner")
+    member = factory.user(username="departing")
+    circle = Circle(name="Circle", description=None, website=None, created_by=owner.id)
+    db_session.add(circle)
+    db_session.flush()
+    membership = CircleMember(circle_id=circle.id, user_id=member.id, role="member")
+    db_session.add(membership)
+    db_session.commit()
+
+    album = factory.album(producer=owner, mastering_engineer=member, members=[member])
+    album.circle_id = circle.id
+    track = factory.track(album=album, submitter=owner, peer_reviewer=member)
+    assignments = [
+        StageAssignment(track_id=track.id, stage_id="peer_review", user_id=member.id, status="pending"),
+        StageAssignment(track_id=track.id, stage_id="producer_gate", user_id=member.id, status="completed"),
+        StageAssignment(
+            track_id=track.id,
+            stage_id="mastering",
+            user_id=member.id,
+            status="cancelled",
+            cancellation_reason="revision_requested",
+        ),
+        StageAssignment(
+            track_id=track.id,
+            stage_id="final_review",
+            user_id=member.id,
+            status="cancelled",
+            cancellation_reason="reassigned",
+        ),
+    ]
+    db_session.add_all(assignments)
+    invitation = Invitation(
+        album_id=album.id,
+        user_id=member.id,
+        invited_by_user_id=owner.id,
+        status="pending",
+    )
+    db_session.add(invitation)
+    db_session.commit()
+
+    membership_id = membership.id
+    album_member_id = db_session.query(AlbumMember).filter_by(
+        album_id=album.id,
+        user_id=member.id,
+    ).one().id
+    invitation_id = invitation.id
+    assignment_ids = [assignment.id for assignment in assignments]
+
+    response = client.delete(
+        f"/api/circles/{circle.id}/members/{member.id}",
+        headers=auth_headers(owner),
+    )
+
+    assert response.status_code == 204
+    db_session.expire_all()
+    assert db_session.get(CircleMember, membership_id) is None
+    assert db_session.get(AlbumMember, album_member_id) is None
+    assert db_session.get(Invitation, invitation_id) is None
+    assert db_session.get(type(album), album.id).mastering_engineer_id is None
+    assert db_session.get(type(track), track.id).peer_reviewer_id is None
+    refreshed_assignments = [db_session.get(StageAssignment, assignment_id) for assignment_id in assignment_ids]
+    assert [assignment.status for assignment in refreshed_assignments[:3]] == ["cancelled"] * 3
+    assert [assignment.cancellation_reason for assignment in refreshed_assignments[:3]] == [
+        "circle_membership_revoked",
+    ] * 3
+    assert refreshed_assignments[3].cancellation_reason == "reassigned"
+
+
+def test_leave_circle_revokes_circle_derived_album_membership(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer", username="owner")
+    co_producer = factory.user(username="departing-co-producer")
+    circle = Circle(name="Circle", description=None, website=None, created_by=owner.id)
+    db_session.add(circle)
+    db_session.flush()
+    db_session.add(CircleMember(circle_id=circle.id, user_id=co_producer.id, role="co_producer"))
+    db_session.commit()
+
+    album = factory.album(producer=owner, mastering_engineer=owner, members=[co_producer])
+    album.circle_id = circle.id
+    db_session.commit()
+    album_member_id = db_session.query(AlbumMember).filter_by(
+        album_id=album.id,
+        user_id=co_producer.id,
+    ).one().id
+
+    response = client.post(
+        f"/api/circles/{circle.id}/leave",
+        headers=auth_headers(co_producer),
+    )
+
+    assert response.status_code == 204
+    db_session.expire_all()
+    assert db_session.get(AlbumMember, album_member_id) is None
+    assert db_session.query(CircleMember).filter_by(
+        circle_id=circle.id,
+        user_id=co_producer.id,
+    ).one_or_none() is None
+
+
+def test_role_downgrade_keeps_explicit_album_membership(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer", username="owner")
+    co_producer = factory.user(username="co-producer")
+    circle = Circle(name="Circle", description=None, website=None, created_by=owner.id)
+    db_session.add(circle)
+    db_session.flush()
+    db_session.add(CircleMember(circle_id=circle.id, user_id=co_producer.id, role="co_producer"))
+    db_session.commit()
+
+    album = factory.album(producer=owner, mastering_engineer=owner, members=[co_producer])
+    album.circle_id = circle.id
+    db_session.commit()
+
+    response = client.patch(
+        f"/api/circles/{circle.id}/members/{co_producer.id}",
+        headers=auth_headers(owner),
+        json={"role": "member"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["role"] == "member"
+    assert db_session.query(AlbumMember).filter_by(
+        album_id=album.id,
+        user_id=co_producer.id,
+    ).one_or_none() is not None
 
 
 def test_invite_code_lifecycle(client, db_session, factory, auth_headers):

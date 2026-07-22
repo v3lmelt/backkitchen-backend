@@ -1,4 +1,7 @@
+from app.models.album_member import AlbumMember
 from app.models.circle import CircleMember
+from app.models.invitation import Invitation
+from app.models.notification import Notification
 
 
 def test_create_invitation(client, factory, auth_headers):
@@ -170,6 +173,82 @@ def test_accept_invitation(client, db_session, factory, auth_headers):
     )
     assert response.status_code == 200
     assert response.json()["status"] == "accepted"
+
+
+def test_accept_circle_album_invitation_revalidates_membership(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    invitee = factory.user(username="invitee")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Invite Circle", "description": "desc"},
+    )
+    circle_id = circle_response.json()["id"]
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    album.circle_id = circle_id
+    invitation = factory.invitation(album=album, user=invitee, invited_by=producer)
+
+    response = client.post(
+        f"/api/invitations/{invitation.id}/accept",
+        headers=auth_headers(invitee),
+    )
+
+    assert response.status_code == 409
+    assert "not a member of the circle" in response.json()["detail"]
+    db_session.expire_all()
+    assert db_session.query(AlbumMember).filter_by(
+        album_id=album.id,
+        user_id=invitee.id,
+    ).one_or_none() is None
+    assert db_session.get(Invitation, invitation.id).status == "pending"
+    assert db_session.query(Notification).filter_by(
+        user_id=producer.id,
+        type="invitation_accepted",
+    ).one_or_none() is None
+
+
+def test_accept_circle_album_invitation_succeeds_for_current_member(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    invitee = factory.user(username="invitee")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Invite Circle", "description": "desc"},
+    )
+    circle_id = circle_response.json()["id"]
+    db_session.add(CircleMember(circle_id=circle_id, user_id=invitee.id, role="member"))
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    album.circle_id = circle_id
+    invitation = factory.invitation(album=album, user=invitee, invited_by=producer)
+
+    response = client.post(
+        f"/api/invitations/{invitation.id}/accept",
+        headers=auth_headers(invitee),
+    )
+
+    assert response.status_code == 200
+    assert db_session.query(AlbumMember).filter_by(
+        album_id=album.id,
+        user_id=invitee.id,
+    ).one_or_none() is not None
+
+
+def test_accept_invitation_rejects_existing_album_member(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    invitee = factory.user(username="invitee")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[invitee])
+    invitation = factory.invitation(album=album, user=invitee, invited_by=producer)
+
+    response = client.post(
+        f"/api/invitations/{invitation.id}/accept",
+        headers=auth_headers(invitee),
+    )
+
+    assert response.status_code == 409
+    assert "already a member" in response.json()["detail"]
 
 
 def test_accept_invitation_forbidden_for_wrong_user(client, factory, auth_headers):

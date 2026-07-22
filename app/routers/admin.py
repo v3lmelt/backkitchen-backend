@@ -233,6 +233,15 @@ def _assert_user_can_be_deactivated(db: Session, user: User) -> None:
 
 
 def _ensure_album_membership(db: Session, album_id: int, user_id: int) -> None:
+    pending = any(
+        isinstance(item, AlbumMember)
+        and item.album_id == album_id
+        and item.user_id == user_id
+        for item in db.new
+    )
+    if pending:
+        return
+
     existing = db.scalar(
         select(AlbumMember.id).where(
             AlbumMember.album_id == album_id,
@@ -255,6 +264,16 @@ def _ensure_circle_owner_membership(db: Session, circle_id: int, user_id: int) -
         return
     membership.role = "owner"
 
+
+def _demote_circle_owner_membership(db: Session, circle_id: int, user_id: int) -> None:
+    membership = db.scalar(
+        select(CircleMember).where(
+            CircleMember.circle_id == circle_id,
+            CircleMember.user_id == user_id,
+        )
+    )
+    if membership is not None and membership.role == "owner":
+        membership.role = "member"
 
 
 def _transfer_track_composer_link(
@@ -304,6 +323,7 @@ def _transfer_user_ownership(
     for circle in circles:
         circle.created_by = target_user.id
         _ensure_circle_owner_membership(db, circle.id, target_user.id)
+        _demote_circle_owner_membership(db, circle.id, source_user.id)
         counts["circles"] += 1
 
     if counts["circles"]:

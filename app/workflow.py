@@ -179,8 +179,13 @@ def track_composer_actor_ordered_ids(
     platform_ids = track_composer_ordered_ids(track, db)
     if platform_ids:
         return platform_ids
-    if track_external_composer_names(track, db) and album.producer_id is not None:
-        return [album.producer_id]
+    if track_external_composer_names(track, db):
+        actor_id = track.proxy_uploader_id
+        if actor_id is None:
+            actor_id = album.producer_id
+        if actor_id is None:
+            actor_id = track.submitter_id
+        return [actor_id] if actor_id is not None else []
     return [track.submitter_id] if track.submitter_id is not None else []
 
 

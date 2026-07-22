@@ -9,7 +9,9 @@ from app.workflow import (
     current_master_delivery,
     current_source_version,
     ensure_track_visibility,
+    is_track_composer_actor,
     log_track_event,
+    track_composer_actor_ordered_ids,
 )
 
 
@@ -73,3 +75,58 @@ def test_log_track_event_serializes_enums_and_datetimes(factory):
     assert event.payload is not None
     assert "resolved" in event.payload
     assert "2024-01-01T00:00:00+00:00" in event.payload
+
+
+def test_external_only_track_uses_proxy_uploader_as_composer_actor(factory):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    proxy_uploader = factory.user(username="co-producer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    track = factory.track(
+        album=album,
+        submitter=proxy_uploader,
+        include_submitter_composer=False,
+        external_composers=["Offline Composer"],
+    )
+    track.proxy_uploader_id = proxy_uploader.id
+    factory.session.commit()
+
+    assert track_composer_actor_ordered_ids(track, album, factory.session) == [proxy_uploader.id]
+    assert is_track_composer_actor(track, album, proxy_uploader.id, factory.session) is True
+    assert is_track_composer_actor(track, album, producer.id, factory.session) is False
+
+
+def test_external_only_legacy_track_falls_back_to_album_producer(factory):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        include_submitter_composer=False,
+        external_composers=["Offline Composer"],
+    )
+    track.proxy_uploader_id = None
+    factory.session.commit()
+
+    assert track_composer_actor_ordered_ids(track, album, factory.session) == [producer.id]
+
+
+def test_platform_composers_take_priority_over_proxy_uploader(factory):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    composer = factory.user(username="composer")
+    proxy_uploader = factory.user(username="proxy")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    track = factory.track(
+        album=album,
+        submitter=composer,
+        composers=[composer],
+        external_composers=["Offline Composer"],
+    )
+    track.proxy_uploader_id = proxy_uploader.id
+    factory.session.commit()
+
+    assert track_composer_actor_ordered_ids(track, album, factory.session) == [composer.id]
+    assert is_track_composer_actor(track, album, proxy_uploader.id, factory.session) is False

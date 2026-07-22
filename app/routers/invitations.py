@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import exists, insert, literal, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
+from app.models.circle import Circle, CircleMember
 from app.models.invitation import Invitation
 from app.models.user import User
 from app.schemas.schemas import (
@@ -141,13 +143,53 @@ def accept_invitation(
             detail="This invitation is no longer pending.",
         )
 
-    db.add(AlbumMember(album_id=invitation.album_id, user_id=current_user.id))
+    album = db.get(Album, invitation.album_id)
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+
+    member_insert = insert(AlbumMember)
+    if album.circle_id is not None:
+        has_current_circle_access = or_(
+            exists(
+                select(CircleMember.id).where(
+                    CircleMember.circle_id == album.circle_id,
+                    CircleMember.user_id == current_user.id,
+                )
+            ),
+            exists(
+                select(Circle.id).where(
+                    Circle.id == album.circle_id,
+                    Circle.created_by == current_user.id,
+                )
+            ),
+        )
+        member_insert = member_insert.from_select(
+            ["album_id", "user_id"],
+            select(literal(album.id), literal(current_user.id)).where(has_current_circle_access),
+        )
+    else:
+        member_insert = member_insert.values(album_id=album.id, user_id=current_user.id)
+
+    try:
+        result = db.execute(member_insert)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User is already a member of this album.",
+        ) from exc
+
+    if album.circle_id is not None and result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This invitation is no longer valid because you are not a member of the circle.",
+        )
+
     invitation.status = "accepted"
 
-    album = db.get(Album, invitation.album_id)
-    album_title = album.title if album else "未知专辑"
     notify(db, [invitation.invited_by_user_id], "invitation_accepted", "邀请已被接受",
-           f"{current_user.display_name or current_user.username} 已接受加入「{album_title}」的邀请")
+           f"{current_user.display_name or current_user.username} 已接受加入「{album.title}」的邀请")
 
     db.commit()
     db.refresh(invitation)

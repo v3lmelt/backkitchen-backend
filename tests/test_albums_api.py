@@ -1,6 +1,8 @@
 import copy
 import json
+import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from app.models.album import Album
 from app.models.circle import CircleMember
@@ -680,3 +682,98 @@ def test_update_circle_album_workflow_rejects_non_circle_reviewer_pool(
 
     assert response.status_code == 400
     assert "not members of this circle" in response.text
+
+
+def test_export_download_id_is_bound_to_its_album(client, factory, auth_headers, tmp_path):
+    producer_a = factory.user(role="producer", username="producer-a")
+    producer_b = factory.user(role="producer", username="producer-b")
+    mastering = factory.user(role="mastering_engineer")
+    album_a = factory.album(producer=producer_a, mastering_engineer=mastering, title="Album A")
+    album_b = factory.album(producer=producer_b, mastering_engineer=mastering, title="Album B")
+    export_path = tmp_path / "album-a.zip"
+    export_path.write_bytes(b"album-a-export")
+    download_id = "album-a-download"
+    artifact = albums_router.ExportArtifact(
+        album_id=album_a.id,
+        file_path=str(export_path),
+        created_at=time.time(),
+    )
+    with albums_router._export_temp_store_lock:
+        albums_router._export_temp_store[download_id] = artifact
+
+    wrong_album_response = client.get(
+        f"/api/albums/{album_b.id}/export/download/{download_id}",
+        headers=auth_headers(producer_b),
+    )
+
+    assert wrong_album_response.status_code == 404
+    assert export_path.exists() is True
+    with albums_router._export_temp_store_lock:
+        assert albums_router._export_temp_store.get(download_id) == artifact
+
+    correct_response = client.get(
+        f"/api/albums/{album_a.id}/export/download/{download_id}",
+        headers=auth_headers(producer_a),
+    )
+
+    assert correct_response.status_code == 200
+    assert correct_response.content == b"album-a-export"
+    assert export_path.exists() is False
+    with albums_router._export_temp_store_lock:
+        assert download_id not in albums_router._export_temp_store
+
+    repeat_response = client.get(
+        f"/api/albums/{album_a.id}/export/download/{download_id}",
+        headers=auth_headers(producer_a),
+    )
+    assert repeat_response.status_code == 404
+
+
+def test_unauthorized_export_download_does_not_consume_artifact(client, factory, auth_headers, tmp_path):
+    producer = factory.user(role="producer", username="producer")
+    outsider = factory.user(role="producer", username="outsider")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    export_path = tmp_path / "album.zip"
+    export_path.write_bytes(b"album-export")
+    download_id = "protected-download"
+    artifact = albums_router.ExportArtifact(
+        album_id=album.id,
+        file_path=str(export_path),
+        created_at=time.time(),
+    )
+    with albums_router._export_temp_store_lock:
+        albums_router._export_temp_store[download_id] = artifact
+
+    response = client.get(
+        f"/api/albums/{album.id}/export/download/{download_id}",
+        headers=auth_headers(outsider),
+    )
+
+    assert response.status_code == 403
+    assert export_path.exists() is True
+    with albums_router._export_temp_store_lock:
+        assert albums_router._export_temp_store.get(download_id) == artifact
+
+    with albums_router._export_temp_store_lock:
+        albums_router._export_temp_store.pop(download_id, None)
+    Path(export_path).unlink(missing_ok=True)
+
+
+def test_cleanup_expired_exports_uses_album_bound_artifacts(tmp_path, monkeypatch):
+    export_path = tmp_path / "expired.zip"
+    export_path.write_bytes(b"expired")
+    download_id = "expired-download"
+    with albums_router._export_temp_store_lock:
+        albums_router._export_temp_store[download_id] = albums_router.ExportArtifact(
+            album_id=123,
+            file_path=str(export_path),
+            created_at=100.0,
+        )
+    monkeypatch.setattr(albums_router.time, "time", lambda: 100.0 + albums_router._EXPORT_TTL_SECONDS + 1)
+
+    albums_router._cleanup_expired_exports()
+
+    assert export_path.exists() is False
+    with albums_router._export_temp_store_lock:
+        assert download_id not in albums_router._export_temp_store

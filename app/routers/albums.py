@@ -7,8 +7,10 @@ import time
 import uuid
 import zipfile
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import AsyncGenerator
 
 logger = logging.getLogger(__name__)
@@ -976,17 +978,30 @@ def update_workflow_config(
 # Album export – SSE progress stream + temp-file download
 # ---------------------------------------------------------------------------
 
-# In-memory store for completed export temp files: download_id -> (path, created_ts)
-_export_temp_store: dict[str, tuple[str, float]] = {}
+@dataclass(frozen=True)
+class ExportArtifact:
+    album_id: int
+    file_path: str
+    created_at: float
+
+
+_export_temp_store: dict[str, ExportArtifact] = {}
+_export_temp_store_lock = Lock()
 _EXPORT_TTL_SECONDS = 600  # 10 minutes
 
 
 def _cleanup_expired_exports() -> None:
     now = time.time()
-    expired = [k for k, (_, ts) in _export_temp_store.items() if now - ts > _EXPORT_TTL_SECONDS]
-    for k in expired:
-        p, _ = _export_temp_store.pop(k, ("", 0))
-        Path(p).unlink(missing_ok=True)
+    with _export_temp_store_lock:
+        expired = [
+            (download_id, artifact)
+            for download_id, artifact in _export_temp_store.items()
+            if now - artifact.created_at > _EXPORT_TTL_SECONDS
+        ]
+        for download_id, _ in expired:
+            _export_temp_store.pop(download_id, None)
+    for _, artifact in expired:
+        Path(artifact.file_path).unlink(missing_ok=True)
 
 
 def _resolve_delivery_file(delivery, upload_dir: Path) -> tuple[Path, bool]:
@@ -1209,7 +1224,13 @@ async def export_album_stream(
                 safe_album = album_title.replace(" ", "_").replace("/", "_").replace("\\", "_")
                 tmp_path = Path(tempfile.gettempdir()) / f"export_{download_id}_{safe_album}.zip"
                 tmp_path.write_bytes(buf.getvalue())
-                _export_temp_store[download_id] = (str(tmp_path), time.time())
+                artifact = ExportArtifact(
+                    album_id=album_id,
+                    file_path=str(tmp_path),
+                    created_at=time.time(),
+                )
+                with _export_temp_store_lock:
+                    _export_temp_store[download_id] = artifact
                 return download_id
 
             download_id = await asyncio.to_thread(_build_zip)
@@ -1246,20 +1267,22 @@ async def export_album_download(
     current_user: User = Depends(get_current_user),
 ):
     """Download a completed export ZIP by its temporary download ID."""
-    # Auth check – must be album producer
-    ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_producer(album_id, current_user, db)
+    _cleanup_expired_exports()
 
-    entry = _export_temp_store.get(download_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail="Export not found or expired.")
+    with _export_temp_store_lock:
+        artifact = _export_temp_store.get(download_id)
+        if artifact is None or artifact.album_id != album_id:
+            raise HTTPException(status_code=404, detail="Export not found or expired.")
 
-    file_path, _ = entry
-    if not Path(file_path).exists():
+        file_path = artifact.file_path
+        if not Path(file_path).exists():
+            _export_temp_store.pop(download_id, None)
+            raise HTTPException(status_code=404, detail="Export file not found.")
+
         _export_temp_store.pop(download_id, None)
-        raise HTTPException(status_code=404, detail="Export file not found.")
 
-    album = db.get(Album, album_id)
-    safe_title = (album.title if album else "album").replace(" ", "_").replace("/", "_").replace("\\", "_")
+    safe_title = album.title.replace(" ", "_").replace("/", "_").replace("\\", "_")
 
     async def _stream_and_cleanup():
         try:
@@ -1267,7 +1290,6 @@ async def export_album_download(
                 while chunk := f.read(64 * 1024):
                     yield chunk
         finally:
-            _export_temp_store.pop(download_id, None)
             Path(file_path).unlink(missing_ok=True)
 
     return StreamingResponse(
