@@ -3,15 +3,76 @@ import sys
 from io import BytesIO
 from types import SimpleNamespace
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import func, select
 
 from app.models.comment import Comment
 from app.models.issue import Issue, IssuePhase, IssueStatus
 from app.models.issue_audio import IssueAudio
+from app.models.notification import Notification
 from app.models.stage_assignment import StageAssignment
 from app.models.track import TrackStatus
 from app.models.track_source_version import TrackSourceVersion
+from app.models.workflow_event import WorkflowEvent
 from app.security import create_access_token
+
+
+INTERNAL_VISIBILITY_ERROR = "visibility='internal' is only allowed during multi-review steps."
+
+
+def _setup_review_track(
+    db_session,
+    factory,
+    *,
+    reviewer_count: int,
+    required_reviewer_count: int | None = None,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewers = [factory.user(username=f"reviewer_{index}") for index in range(reviewer_count)]
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, *reviewers],
+    )
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewers[0],
+    )
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "peer_review",
+                    "label": "Peer Review",
+                    "type": "review",
+                    "ui_variant": "peer_review",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "__completed"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": required_reviewer_count or reviewer_count,
+                },
+            ],
+        }
+    )
+    db_session.add_all(
+        [
+            StageAssignment(
+                track_id=track.id,
+                stage_id="peer_review",
+                user_id=reviewer.id,
+                status="pending",
+            )
+            for reviewer in reviewers
+        ]
+    )
+    db_session.commit()
+    return track, submitter, reviewers
 
 
 def test_create_peer_issue_binds_to_current_source_version(client, db_session, factory, auth_headers):
@@ -103,6 +164,156 @@ def test_create_general_issue_no_markers(client, factory, auth_headers):
 
     assert response.status_code == 201
     assert response.json()["markers"] == []
+
+
+@pytest.mark.parametrize(
+    ("track_status", "phase"),
+    [
+        ("producer_gate", "producer"),
+        (TrackStatus.FINAL_REVIEW, "final_review"),
+    ],
+)
+def test_create_approval_issue_rejects_internal_before_any_side_effect(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+    upload_dir,
+    track_status,
+    phase,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=track_status)
+    counts_before = (
+        db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id)),
+        db_session.scalar(select(func.count(WorkflowEvent.id)).where(WorkflowEvent.track_id == track.id)),
+        db_session.scalar(select(func.count(Notification.id)).where(Notification.related_track_id == track.id)),
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(producer),
+        data={
+            "title": "Internal approval note",
+            "description": "Must not be silently published.",
+            "phase": phase,
+            "severity": "major",
+            "visibility": "internal",
+            "markers_json": "[]",
+        },
+        files={"images": ("approval.png", BytesIO(b"pngdata"), "image/png")},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": INTERNAL_VISIBILITY_ERROR}
+    assert (
+        db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id)),
+        db_session.scalar(select(func.count(WorkflowEvent.id)).where(WorkflowEvent.track_id == track.id)),
+        db_session.scalar(select(func.count(Notification.id)).where(Notification.related_track_id == track.id)),
+    ) == counts_before
+    assert not (upload_dir / "issue_images").exists()
+
+
+def test_create_single_reviewer_issue_rejects_explicit_internal_json(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    track, _submitter, reviewers = _setup_review_track(db_session, factory, reviewer_count=1)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewers[0]),
+        json={
+            "title": "Reviewer-only note",
+            "description": "Single-review issues cannot be internal.",
+            "phase": "peer",
+            "severity": "major",
+            "visibility": "internal",
+            "markers": [],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": INTERNAL_VISIBILITY_ERROR}
+    assert db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id)) == 0
+
+
+def test_create_multi_reviewer_internal_issue_stays_pending_and_hidden(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    track, submitter, reviewers = _setup_review_track(
+        db_session,
+        factory,
+        reviewer_count=2,
+        required_reviewer_count=1,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewers[0]),
+        data={
+            "title": "Needs reviewer discussion",
+            "description": "Keep this between reviewers for now.",
+            "phase": "peer",
+            "severity": "major",
+            "visibility": "internal",
+            "markers_json": "[]",
+        },
+        files={"images": ("internal.png", BytesIO(b"pngdata"), "image/png")},
+    )
+
+    assert response.status_code == 201
+    issue_id = response.json()["id"]
+    assert response.json()["status"] == IssueStatus.PENDING_DISCUSSION.value
+    assert client.get(f"/api/issues/{issue_id}", headers=auth_headers(submitter)).status_code == 404
+    submitter_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
+    assert submitter_list.status_code == 200
+    assert all(issue["id"] != issue_id for issue in submitter_list.json())
+    assert db_session.scalar(
+        select(func.count(Notification.id)).where(Notification.related_track_id == track.id)
+    ) == 0
+
+
+def test_create_multi_reviewer_public_issue_stays_open_and_visible(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    track, submitter, reviewers = _setup_review_track(db_session, factory, reviewer_count=2)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewers[0]),
+        data={
+            "title": "Public review issue",
+            "description": "The submitter should see this immediately.",
+            "phase": "peer",
+            "severity": "major",
+            "visibility": "public",
+            "markers_json": "[]",
+        },
+        files={"images": ("public.png", BytesIO(b"pngdata"), "image/png")},
+    )
+
+    assert response.status_code == 201
+    issue_id = response.json()["id"]
+    assert response.json()["status"] == IssueStatus.OPEN.value
+    assert client.get(f"/api/issues/{issue_id}", headers=auth_headers(submitter)).status_code == 200
+    submitter_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
+    assert submitter_list.status_code == 200
+    assert any(issue["id"] == issue_id for issue in submitter_list.json())
+    assert db_session.scalar(
+        select(func.count(Notification.id)).where(Notification.related_track_id == track.id)
+    ) >= 1
 
 
 def test_create_multi_marker_issue(client, factory, auth_headers):
