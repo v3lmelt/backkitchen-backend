@@ -501,6 +501,11 @@ async def create_issue(
         and infer_issue_phase_for_step(current_step) == effective_phase
         and reviewer_scope_count > 1
     )
+    if visibility_provided and issue_visibility == "internal" and not multi_reviewer_context:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="visibility='internal' is only allowed during multi-review steps.",
+        )
     initial_status = (
         IssueStatus.PENDING_DISCUSSION
         if multi_reviewer_context and (issue_visibility == "internal" or not visibility_provided)

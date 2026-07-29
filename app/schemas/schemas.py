@@ -582,7 +582,15 @@ class IssueBase(BaseModel):
 class IssueCreate(IssueBase):
     phase: str
     markers: list[IssueMarkerCreate] = []
-    visibility: str = "public"  # "public" → open, "internal" → pending_discussion (reviewer-only)
+    visibility: str = Field(
+        default="public",
+        description=(
+            "Initial issue visibility. Explicit 'internal' is allowed only during an active multi-review "
+            "step and creates a pending_discussion issue hidden from track composers; 'public' creates an open "
+            "issue. When omitted, multi-review steps retain the submitter-hidden default and other steps "
+            "default to public."
+        ),
+    )
 
 
 class IssueUpdate(BaseModel):
