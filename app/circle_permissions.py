@@ -82,6 +82,20 @@ def require_album_manager(album: Album, user: User, db: Session) -> None:
             detail="Only the album manager can perform this action.",
         )
 
+
+def album_viewer_circle_role(album: Album, user: User, db: Session) -> str | None:
+    """The viewer's role in the album's circle, or None when unlinked/not a member."""
+    if album.circle_id is None:
+        return None
+    circle = album.circle or db.get(Circle, album.circle_id)
+    if circle is None:
+        return None
+    if is_circle_owner(circle, user):
+        return CIRCLE_ROLE_OWNER
+    membership = get_circle_membership(db, circle.id, user.id)
+    return membership.role if membership is not None else None
+
+
 def is_circle_bound_album_manager(album: Album, user: User, db: Session) -> bool:
     if has_admin_role(user, "operator"):
         return True

@@ -421,7 +421,7 @@ def get_all_album_member_ids(db: Session, album_id: int | None = None) -> dict[i
     return result
 
 
-def ensure_album_producer(album_id: int, user: User, db: Session) -> Album:
+def ensure_album_manager(album_id: int, user: User, db: Session) -> Album:
     album = db.get(Album, album_id)
     if album is None:
         raise HTTPException(

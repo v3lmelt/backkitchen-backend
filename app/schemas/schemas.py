@@ -296,6 +296,7 @@ class AlbumRead(AlbumBase):
     mastering_engineer_id: int | None = None
     viewer_is_album_manager: bool = False
     viewer_can_force_track_status: bool = False
+    viewer_circle_role: str | None = None
     deadline: datetime | None = None
     phase_deadlines: dict[str, str] | None = None
     workflow_config: "WorkflowConfigSchema | None" = None
@@ -1145,6 +1146,11 @@ class StageAssignmentRead(BaseModel):
     user: UserRead | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ReviewerCandidateRead(BaseModel):
+    user_id: int
+    user: UserRead
 
 
 class AssignReviewerRequest(BaseModel):

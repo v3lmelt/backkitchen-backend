@@ -17,7 +17,7 @@ from app.schemas.schemas import (
 )
 from app.security import get_current_user
 from app.notifications import notify
-from app.workflow import ensure_album_producer, ensure_album_visibility, get_album_member_ids
+from app.workflow import ensure_album_manager, ensure_album_visibility, get_album_member_ids
 from app.workflow_user_scope import circle_workflow_user_ids
 
 router = APIRouter(tags=["invitations"])
@@ -46,7 +46,7 @@ def create_invitation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> InvitationRead:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
 
     invited_user = db.get(User, payload.user_id)
     if invited_user is None:
@@ -96,7 +96,7 @@ def list_album_invitations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[InvitationRead]:
-    ensure_album_producer(album_id, current_user, db)
+    ensure_album_manager(album_id, current_user, db)
 
     invitations = list(
         db.scalars(
@@ -237,7 +237,7 @@ def cancel_invitation(
     invitation = db.get(Invitation, invitation_id)
     if invitation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invitation not found.")
-    ensure_album_producer(invitation.album_id, current_user, db)
+    ensure_album_manager(invitation.album_id, current_user, db)
 
     db.delete(invitation)
     db.commit()

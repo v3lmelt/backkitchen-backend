@@ -21,7 +21,7 @@ from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
 
 from app.admin_permissions import has_admin_role
-from app.circle_permissions import is_album_manager, is_circle_bound_album_manager, is_circle_manager, require_album_manager
+from app.circle_permissions import album_viewer_circle_role, is_album_manager, is_circle_bound_album_manager, is_circle_manager, require_album_manager
 from app.config import MAX_ALBUM_COVER_UPLOAD_SIZE, settings
 from app.database import get_db
 from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
@@ -38,7 +38,7 @@ from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataU
 from app.security import get_current_user
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
-from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_producer, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed, peer_identity_anonymize_user_ids_for_viewer
+from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_manager, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed, peer_identity_anonymize_user_ids_for_viewer
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 from app.workflow_user_scope import validate_circle_workflow_user_scope
 
@@ -396,6 +396,11 @@ def _album_to_read(
         if current_user is not None
         else False
     )
+    resolved_viewer_circle_role = (
+        album_viewer_circle_role(album, current_user, db)
+        if current_user is not None
+        else None
+    )
 
     return AlbumRead(
         id=album.id,
@@ -414,6 +419,7 @@ def _album_to_read(
         mastering_engineer_id=album.mastering_engineer_id,
         viewer_is_album_manager=resolved_viewer_is_album_manager,
         viewer_can_force_track_status=resolved_viewer_can_force_track_status,
+        viewer_circle_role=resolved_viewer_circle_role,
         deadline=album.deadline,
         phase_deadlines=phase_deadlines,
         workflow_config=workflow_config,
@@ -562,7 +568,7 @@ def update_album_team(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     mastering_engineer_id, desired_member_ids = _validate_album_team_payload(
         album, payload, current_user, db
     )
@@ -640,7 +646,7 @@ def update_deadlines(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     album.deadline = payload.deadline
     album.phase_deadlines = (
         json.dumps(payload.phase_deadlines, ensure_ascii=False)
@@ -659,7 +665,7 @@ def update_album_metadata(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     updated_fields = payload.model_fields_set
     if "title" in updated_fields and payload.title is not None:
         album.title = payload.title
@@ -689,7 +695,7 @@ async def upload_album_cover(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
 
     allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
     allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -847,7 +853,7 @@ def reorder_tracks(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[TrackRead]:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     viewer_is_album_manager = True
 
     tracks = list(db.scalars(select(Track).where(Track.album_id == album_id)).all())
@@ -875,7 +881,7 @@ def get_webhook_config(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> WebhookConfig:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     if album.webhook_config:
         config = json.loads(album.webhook_config)
         return WebhookConfig(**config)
@@ -889,7 +895,7 @@ def update_webhook_config(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> WebhookConfig:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     album.webhook_config = json.dumps(payload.model_dump())
     db.commit()
     db.refresh(album)
@@ -902,7 +908,7 @@ async def test_webhook(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, bool]:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     if not album.webhook_config:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No webhook configured.")
     config = json.loads(album.webhook_config)
@@ -925,7 +931,7 @@ def get_webhook_deliveries(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[WebhookDeliveryRead]:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     from app.models.webhook_delivery import WebhookDelivery
     records = (
         db.query(WebhookDelivery)
@@ -960,7 +966,7 @@ def update_workflow_config(
 ) -> dict:
     from app.workflow_engine import migrate_tracks_on_workflow_change, parse_workflow_config
 
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
 
     old_config = parse_workflow_config(album)
     new_config = payload.model_dump()
@@ -1031,7 +1037,7 @@ async def export_album_stream(
     current_user: User = Depends(get_current_user),
 ):
     """SSE endpoint that exports album tracks with metadata, streaming progress."""
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
 
     completed_tracks = list(
         db.scalars(
@@ -1267,7 +1273,7 @@ async def export_album_download(
     current_user: User = Depends(get_current_user),
 ):
     """Download a completed export ZIP by its temporary download ID."""
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     _cleanup_expired_exports()
 
     with _export_temp_store_lock:
@@ -1306,7 +1312,7 @@ def archive_album(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> AlbumRead:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
     if album.archived_at is not None:
         raise HTTPException(status_code=409, detail="Album is already archived.")
     album.archived_at = datetime.now(timezone.utc)

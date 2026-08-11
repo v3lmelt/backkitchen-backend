@@ -482,6 +482,60 @@ def test_co_producer_does_not_manage_unlinked_album(client, db_session, factory,
     assert manager_response.status_code == 403
 
 
+def test_album_read_exposes_viewer_circle_role(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    co_producer = factory.user(username="co")
+    member = factory.user(username="member")
+    admin = factory.user(username="admin", admin_role="operator", is_admin=True)
+    mastering = factory.user(role="mastering_engineer")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Circle One", "description": "desc"},
+    )
+    circle_id = create_response.json()["id"]
+    db_session.add_all([
+        CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"),
+        CircleMember(circle_id=circle_id, user_id=member.id, role="member"),
+    ])
+    album = factory.album(producer=owner, mastering_engineer=mastering, members=[member])
+    album.circle_id = circle_id
+    db_session.commit()
+
+    owner_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(owner))
+    assert owner_response.status_code == 200
+    assert owner_response.json()["viewer_circle_role"] == "owner"
+
+    co_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(co_producer))
+    assert co_response.status_code == 200
+    assert co_response.json()["viewer_circle_role"] == "co_producer"
+
+    member_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(member))
+    assert member_response.status_code == 200
+    assert member_response.json()["viewer_circle_role"] == "member"
+
+    admin_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(admin))
+    assert admin_response.status_code == 200
+    admin_body = admin_response.json()
+    assert admin_body["viewer_is_album_manager"] is True
+    assert admin_body["viewer_circle_role"] is None
+
+    list_response = client.get("/api/albums", headers=auth_headers(co_producer))
+    assert list_response.status_code == 200
+    listed = {item["id"]: item for item in list_response.json()}
+    assert listed[album.id]["viewer_circle_role"] == "co_producer"
+
+
+def test_album_read_viewer_circle_role_is_none_without_circle(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+
+    response = client.get(f"/api/albums/{album.id}", headers=auth_headers(producer))
+    assert response.status_code == 200
+    assert response.json()["viewer_circle_role"] is None
+
+
 def test_album_stats(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")
