@@ -13,10 +13,12 @@ from sqlalchemy import exists, or_, select, text
 
 from app.config import settings
 from app.database import SessionLocal
+from app.models.admin_audit_log import AdminAuditLog
 from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
 from app.models.album_member import AlbumMember
 from app.models.checklist import ChecklistItem
 from app.models.circle import Circle, CircleMember
+from app.models.invitation import Invitation
 from app.models.issue import Issue
 from app.models.track import ARCHIVE_RETENTION_DAYS, RejectionMode, Track, TrackStatus
 from app.models.track_composer import TrackComposer, TrackExternalComposer
@@ -290,7 +292,16 @@ def _delete_file(file_path: str, storage_backend: str) -> None:
     else:
         p = Path(file_path)
         if not p.is_absolute():
-            p = settings.get_upload_path() / p
+            upload_dir = settings.get_upload_path()
+            # ``_save_upload`` stores relative paths that already include the
+            # upload dir name (e.g. ``uploads/abc.mp3``), while the attachment
+            # helpers store ``<subdir>/<file>`` paths (e.g. ``issue_audios/..``).
+            # Strip an existing leading upload-dir component so we never
+            # double-prefix into ``uploads/uploads/...``.
+            if p.parts and upload_dir.name and p.parts[0] == upload_dir.name:
+                p = upload_dir / Path(*p.parts[1:])
+            else:
+                p = upload_dir / p
         p.unlink(missing_ok=True)
 
 
@@ -417,6 +428,16 @@ def _run_archived_album_cleanup() -> int:
                 if album is None or album.archived_at is None:
                     continue
                 local_paths, r2_keys = collect_album_files(album)
+                # ``Invitation`` and ``AdminAuditLog`` reference the album via
+                # FKs with no ON DELETE action and no ORM cascade, so SQLite
+                # (with foreign_keys=ON) would reject the hard delete.  Clear
+                # those rows explicitly before deleting the album.
+                db.query(Invitation).filter(Invitation.album_id == album.id).delete(
+                    synchronize_session=False
+                )
+                db.query(AdminAuditLog).filter(AdminAuditLog.album_id == album.id).delete(
+                    synchronize_session=False
+                )
                 db.delete(album)
                 db.commit()
                 cleanup_files(local_paths, r2_keys)

@@ -552,6 +552,108 @@ def test_create_issue_returns_protected_audio_urls_for_local_uploads(client, fac
     assert download.headers["content-type"].startswith("audio/wav")
 
 
+def test_create_issue_rejects_r2_audio_key_from_another_track(
+    client, db_session, factory, auth_headers, monkeypatch
+):
+    monkeypatch.setattr("app.routers.issues.settings.R2_ENABLED", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.r2",
+        SimpleNamespace(object_exists=lambda key: True),
+    )
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    other_track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    issues_before = db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id))
+
+    # The key belongs to a *different* track's namespace (shared R2 bucket,
+    # predictable key layout) — must be rejected to prevent cross-album leaks.
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        data={
+            "title": "Cross-album audio attempt",
+            "description": "Must be rejected before any side effect.",
+            "phase": "peer",
+            "severity": "major",
+            "markers_json": "[]",
+            "audio_object_keys": f"tracks/{other_track.id}/source/leak.wav",
+            "audio_original_filenames": "leak.wav",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "does not match the expected target" in response.json()["detail"]
+    after = db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id))
+    assert after == issues_before
+
+
+def test_create_issue_accepts_r2_audio_key_scoped_to_own_track(
+    client, db_session, factory, auth_headers, monkeypatch
+):
+    monkeypatch.setattr("app.routers.issues.settings.R2_ENABLED", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.r2",
+        SimpleNamespace(
+            object_exists=lambda key: True,
+            download_to_temp=lambda key: __import__("pathlib").Path(factory._audio_file(stem="issue-r2", ext=".wav")),
+            public_url=lambda key: f"https://cdn.example.com/{key}",
+        ),
+    )
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    latest_version = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
+    ).first()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        data={
+            "title": "R2 audio note",
+            "description": "Attached from this track's own namespace.",
+            "phase": "peer",
+            "severity": "major",
+            "markers_json": "[]",
+            "audio_object_keys": f"tracks/{track.id}/issues/0/note.wav",
+            "audio_original_filenames": "note.wav",
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["source_version_id"] == latest_version.id
+    stored_audio = db_session.scalars(
+        select(IssueAudio).where(IssueAudio.issue_id == body["id"])
+    ).one()
+    assert stored_audio.storage_backend == "r2"
+    assert stored_audio.file_path == f"tracks/{track.id}/issues/0/note.wav"
+
+
 def test_add_comment_returns_protected_audio_urls_for_local_uploads(client, factory, auth_headers):
     producer = factory.user(role="producer")
     mastering = factory.user(role="mastering_engineer")

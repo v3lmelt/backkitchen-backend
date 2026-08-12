@@ -513,10 +513,12 @@ async def create_issue(
                 detail="time_end must be greater than time_start.",
             )
 
-    # Parse R2 audio keys if provided
+    # Parse R2 audio keys if provided. Scope them to this issue's track so a
+    # user who participates in multiple albums cannot attach audio belonging
+    # to another track/album (shared R2 bucket, predictable key layout).
     r2_audio_keys, r2_audio_names = parse_r2_audio_key_list(audio_object_keys, audio_original_filenames)
     if r2_audio_keys:
-        verify_r2_audio_keys(r2_audio_keys)
+        verify_r2_audio_keys(r2_audio_keys, expected_prefix=f"tracks/{track_id}")
 
     # Validate audio files
     total_issue_audio_count = len(audios) + len(r2_audio_keys)

@@ -240,6 +240,17 @@ def handle_delivery_status(
                webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
         return
     track.status = next_status
+    # If the delivery step advances into a review step, make sure reviewers are
+    # assigned so the next stage does not stall waiting for an empty assignment
+    # set. Idempotent: re-entering an existing review stage reopens the previous
+    # assignment set instead of creating duplicates.
+    prepare_review_assignments_for_stage_entry(
+        db,
+        album,
+        track,
+        next_status,
+        background_tasks,
+    )
     log_track_event(
         db, track, current_user, "master_delivery_uploaded",
         from_status=previous_status, to_status=track.status,

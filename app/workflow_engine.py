@@ -1107,7 +1107,20 @@ def can_act(
 ) -> bool:
     """Unified predicate: may ``user`` perform workflow ``action`` on ``track``?"""
     wf_config = config if config is not None else parse_workflow_config(album)
-    return action in compute_allowed_actions(wf_config, track, user, album, db=db)
+    if action in compute_allowed_actions(wf_config, track, user, album, db=db):
+        return True
+    # Delivery advancement is driven by the dedicated upload/confirm endpoints,
+    # so the ``deliver`` decision (and the legacy mastering rollback) are
+    # intentionally excluded from the action-bar allowlist. The step actor is
+    # still permitted to perform those actions — the router rejects them with a
+    # 409 that points at the upload flow. Returning True here keeps the
+    # workflow-transition pre-check from masking that more specific error.
+    step = get_current_step(wf_config, track)
+    if step is None or step.type != "delivery":
+        return False
+    if action not in step.transitions or _is_delivery_transition_user_visible(step, action):
+        return False
+    return user_matches_role(user, album, track, step, db)
 
 
 def require_can_act(
@@ -1165,7 +1178,8 @@ def execute_transition(
     quorum_reached = False
     requires_group_finalization = review_requires_group_finalization(step)
 
-    # Validate permissions — review steps depend on assignment state.
+    # Load review assignment state — used by the permission gate below and the
+    # completion logic further down.
     if step.type == "review":
         review_assignments = review_active_assignments(db, track.id, step.id)
         if not review_assignments:
@@ -1185,31 +1199,6 @@ def execute_transition(
         requires_group_finalization = review_requires_group_finalization(step, review_assignments)
         completed_reviews = sum(1 for assignment in review_assignments if assignment.status == StageAssignmentStatus.COMPLETED)
         quorum_reached = completed_reviews >= required_reviews
-        can_request_direct_revision = (
-            is_direct_revision_request
-            and step.revision_decision_policy == REVIEW_REVISION_POLICY_FIRST_REQUEST
-            and revision_target is not None
-            and revision_decision is not None
-            and (
-                pending_assignment is not None
-                or completed_assignment is not None
-                and completed_assignment.decision == revision_decision
-            )
-        )
-        if pending_assignment is None and not (
-            completed_assignment is not None
-            and requires_group_finalization
-            and quorum_reached
-        ) and not can_request_direct_revision:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You are not authorised to act on this step.",
-            )
-    elif not user_matches_role(user, album, track, step, db):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not authorised to act on this step.",
-        )
 
     if is_direct_revision_request:
         if step.type != "review":
@@ -1247,6 +1236,15 @@ def execute_transition(
             status_code=status.HTTP_409_CONFLICT,
             detail="This delivery action must be completed from the delivery upload flow, not the workflow action bar.",
         )
+
+    # Unified permission gate. Mirrors the allowed_actions predicate so the
+    # workflow-transition endpoint and this execution path share one source of
+    # truth. Kept after decision-validity and delivery-visibility so their more
+    # specific error codes (400/409) take precedence over a generic 403.
+    require_can_act(
+        config, track, user, album, decision, db=db,
+        detail="You are not authorised to act on this step.",
+    )
 
     if (
         album.checklist_enabled
@@ -1961,7 +1959,15 @@ def _notify_transition(
     # Notify the assignee of the target step. Submitter-targeted steps notify
     # every composer because any listed composer may perform composer-side work.
     assignee_ids: list[int] = []
-    if target_step.assignee_user_id:
+    if target_step.type == "review":
+        # Multi-reviewer stages: notify every reviewer currently assigned to the
+        # target stage, not just the legacy single peer_reviewer_id column.
+        assignee_ids = [
+            assignment.user_id
+            for assignment in review_active_assignments(db, track.id, target_step.id)
+            if assignment.user_id != actor_id
+        ]
+    elif target_step.assignee_user_id:
         assignee_ids = [target_step.assignee_user_id]
     elif target_step.assignee_role == "submitter":
         assignee_ids = track_composer_actor_ids_for_notify(track, album, db, skip_user_id=actor_id)

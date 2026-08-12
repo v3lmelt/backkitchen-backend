@@ -74,6 +74,7 @@ from app.workflow_engine import (
     execute_transition as engine_execute_transition,
     get_current_step as engine_get_current_step,
     parse_workflow_config as engine_parse_workflow_config,
+    require_can_act as engine_require_can_act,
     resolve_assignee as engine_resolve_assignee,
     target_is_mastering_related,
 )
@@ -1099,6 +1100,20 @@ def confirm_delivery(
         raise HTTPException(status_code=404, detail="Delivery not found.")
     if delivery.confirmed_at is not None:
         raise HTTPException(status_code=409, detail="Delivery already confirmed.")
+    # Only the latest delivery in the current workflow cycle may be confirmed.
+    # Confirming a stale delivery would let the mastering engineer advance the
+    # track from an outdated upload.
+    latest_in_cycle = db.scalar(
+        select(MasterDelivery)
+        .where(
+            MasterDelivery.track_id == track_id,
+            MasterDelivery.workflow_cycle == track.workflow_cycle,
+        )
+        .order_by(MasterDelivery.delivery_number.desc(), MasterDelivery.id.desc())
+        .limit(1)
+    )
+    if latest_in_cycle is None or latest_in_cycle.id != delivery.id:
+        raise HTTPException(status_code=409, detail="Only the latest master delivery can be confirmed.")
     _ensure_delivery_confirm_permission(track, album, current_user)
 
     delivery.confirmed_at = datetime.now(timezone.utc)
@@ -1444,6 +1459,13 @@ def workflow_transition(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
+    # Unified permission pre-check. execute_transition re-runs the same gate as
+    # defence-in-depth; keeping it here means the endpoint rejects unauthorised
+    # actors before any state is mutated.
+    engine_require_can_act(
+        engine_parse_workflow_config(album), track, current_user, album,
+        payload.decision, db=db,
+    )
     engine_execute_transition(
         db, album, track, current_user, payload.decision, background_tasks,
         revision_type=payload.revision_type
@@ -2183,7 +2205,10 @@ def approve_final_review(
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
     current_step = engine_get_current_step(engine_parse_workflow_config(album), track)
-    if (current_step is None or current_step.ui_variant != "final_review") or (
+    if (
+        current_step is None
+        or not (current_step.ui_variant == "final_review" or current_step.id == "final_review")
+    ) or (
         not is_album_manager(album, current_user, db) and not is_track_composer_actor(track, album, current_user.id, db)
     ):
         raise HTTPException(status_code=403, detail="Only the producer or a track composer can approve final review.")
@@ -2256,7 +2281,7 @@ def request_return_in_final_review(
         raise HTTPException(status_code=403, detail="Only a non-producer track composer can request a return.")
 
     # Verify track is in a final_review step
-    config = album.workflow_config or {}
+    config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
     if step is None or not (step.ui_variant == "final_review" or step.id == "final_review"):
         raise HTTPException(status_code=409, detail="Track is not in a final review step.")
