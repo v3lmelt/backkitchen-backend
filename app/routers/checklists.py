@@ -19,7 +19,9 @@ from app.schemas.schemas import (
     ChecklistTemplateUpdate,
 )
 from app.security import get_current_user
-from app.workflow import build_checklist_read, current_source_version, ensure_album_manager, ensure_album_visibility, ensure_track_visibility
+from app.services.track_queries import current_source_version
+from app.track_permissions import ensure_album_manager, ensure_album_visibility, ensure_track_visibility
+from app.track_serializers import build_checklist_read
 from app.workflow_engine import get_current_step, parse_workflow_config, user_matches_role_or_assignment
 
 router = APIRouter(tags=["checklists"])

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from app import main as main_module
+from app.services import maintenance as maintenance_module
 from app.models.album import Album
 from app.models.circle import Circle
 from app.models.track import RejectionMode, Track, TrackStatus
@@ -16,11 +16,11 @@ def test_delete_file_handles_local_relative_and_r2(upload_dir, monkeypatch):
     relative.write_bytes(b"audio")
 
     deleted_keys: list[str] = []
-    monkeypatch.setattr(main_module.settings, "UPLOAD_DIR", str(upload_dir))
+    monkeypatch.setattr(maintenance_module.settings, "UPLOAD_DIR", str(upload_dir))
     monkeypatch.setitem(sys.modules, "app.services.r2", SimpleNamespace(delete_object=lambda key: deleted_keys.append(key)))
 
-    main_module._delete_file("relative.wav", "local")
-    main_module._delete_file("r2/key.wav", "r2")
+    maintenance_module._delete_file("relative.wav", "local")
+    maintenance_module._delete_file("r2/key.wav", "r2")
 
     assert relative.exists() is False
     assert deleted_keys == ["r2/key.wav"]
@@ -56,10 +56,10 @@ def test_run_expired_source_cleanup_clears_expired_versions_and_rejected_track_f
     db_session.commit()
 
     deleted: list[tuple[str, str]] = []
-    monkeypatch.setattr(main_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(main_module, "_delete_file", lambda path, backend: deleted.append((path, backend)))
+    monkeypatch.setattr(maintenance_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(maintenance_module, "_delete_file", lambda path, backend: deleted.append((path, backend)))
 
-    cleaned = main_module._run_expired_source_cleanup()
+    cleaned = maintenance_module._run_expired_source_cleanup()
 
     db_session.expire_all()
     refreshed_track = db_session.get(Track, track.id)
@@ -100,9 +100,9 @@ def test_backfill_workflow_data_preserves_disabled_checklist_flags(
     album_id = album.id
     circle_id = circle.id
 
-    monkeypatch.setattr(main_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(maintenance_module, "SessionLocal", session_factory)
 
-    main_module._backfill_workflow_data()
+    maintenance_module._backfill_workflow_data()
 
     db_session.expire_all()
     refreshed_album = db_session.get(Album, album_id)
@@ -134,11 +134,11 @@ def test_run_archived_track_cleanup_deletes_expired_tracks_and_cleans_files(
     db_session.commit()
 
     cleanup_calls: list[tuple[list[Path], list[str]]] = []
-    monkeypatch.setattr(main_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(maintenance_module, "SessionLocal", session_factory)
     monkeypatch.setattr(cleanup_service, "collect_track_files", lambda track: ([Path(f"track-{track.id}.wav")], [f"r2/{track.id}"]))
     monkeypatch.setattr(cleanup_service, "cleanup_files", lambda local_paths, r2_keys: cleanup_calls.append((local_paths, r2_keys)))
 
-    deleted = main_module._run_archived_track_cleanup()
+    deleted = maintenance_module._run_archived_track_cleanup()
 
     db_session.expire_all()
 
@@ -165,11 +165,11 @@ def test_run_archived_album_cleanup_deletes_expired_albums_and_cleans_files(
     db_session.commit()
 
     cleanup_calls: list[tuple[list[Path], list[str]]] = []
-    monkeypatch.setattr(main_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(maintenance_module, "SessionLocal", session_factory)
     monkeypatch.setattr(cleanup_service, "collect_album_files", lambda album: ([Path(f"album-{album.id}.zip")], [f"r2/album-{album.id}"]))
     monkeypatch.setattr(cleanup_service, "cleanup_files", lambda local_paths, r2_keys: cleanup_calls.append((local_paths, r2_keys)))
 
-    deleted = main_module._run_archived_album_cleanup()
+    deleted = maintenance_module._run_archived_album_cleanup()
 
     db_session.expire_all()
 

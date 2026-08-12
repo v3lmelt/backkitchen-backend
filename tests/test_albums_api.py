@@ -677,6 +677,8 @@ def test_create_album_sets_default_workflow_config(client, factory, auth_headers
         ]:
             if step.get(key) is None:
                 step.pop(key, None)
+        # Server-computed output metadata, not part of the stored config.
+        step.pop("is_mastering_related", None)
 
     assert normalized_response == normalized_default
 

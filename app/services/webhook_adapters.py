@@ -8,6 +8,10 @@ import base64
 import hashlib
 import hmac
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.services.webhook import NotificationContext
 
 # Event type → Feishu card header color
 _FEISHU_COLOR_MAP: dict[str, str] = {
@@ -57,7 +61,7 @@ def _feishu(
     title = payload.get("title", "")
     body = payload.get("body", "")
     event = payload.get("event", "")
-    ctx = payload.get("context") or {}
+    ctx: NotificationContext = payload.get("context") or {}
 
     color = _FEISHU_COLOR_MAP.get(event, "orange")
 

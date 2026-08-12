@@ -26,15 +26,25 @@ from sqlalchemy.orm import Session
 from app.models.album import Album
 from app.models.checklist import ChecklistItem
 from app.models.master_delivery import MasterDelivery
-from app.models.stage_assignment import StageAssignment
+from app.models.reopen_request import ReopenRequest, ReopenRequestStatus
+from app.models.stage_assignment import StageAssignment, StageAssignmentStatus
 from app.models.track import Track, TrackStatus, RejectionMode, WorkflowVariant
 from app.models.user import User
 from app.circle_permissions import album_manager_user_ids, is_album_manager
 from app.notifications import notify
-from app.workflow import (
+# Assignment status constants live in track_queries (the leaf module at the
+# bottom of the import graph); they are re-exported here for existing callers.
+from app.services.track_queries import (
+    ASSIGNMENT_ACTIVE_STATUSES,
+    ASSIGNMENT_CANCEL_REASON_QUORUM_MET,
+    ASSIGNMENT_CANCEL_REASON_REASSIGNED,
+    ASSIGNMENT_CANCEL_REASON_SUPERSEDED,
+    ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED,
+    current_master_delivery,
     current_source_version,
     is_track_composer_actor,
     log_track_event,
+    pending_source_followup_request,
     track_composer_actor_ids_for_notify,
     track_composer_actor_ordered_ids,
     track_composer_ids,
@@ -44,17 +54,12 @@ from app.workflow_user_scope import album_reviewer_scope_user_ids
 
 logger = logging.getLogger(__name__)
 
-ASSIGNMENT_ACTIVE_STATUSES = ("pending", "completed")
-ASSIGNMENT_CANCEL_REASON_QUORUM_MET = "quorum_met"
-ASSIGNMENT_CANCEL_REASON_REASSIGNED = "reassigned"
-ASSIGNMENT_CANCEL_REASON_SUPERSEDED = "superseded"
-ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED = "revision_requested"
 REVIEW_FORWARD_DECISIONS = {"pass", "approve"}
 REVIEW_REVISION_POLICY_FIRST_REQUEST = "first_revision_request"
 DIRECT_REVISION_REQUEST_DECISION = "request_revision_now"
 
 
-def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
+def dedupe_user_ids(user_ids: list[int]) -> list[int]:
     seen: set[int] = set()
     result: list[int] = []
     for user_id in user_ids:
@@ -75,12 +80,12 @@ def _eligible_reviewer_pool(
     composer_ids = track_composer_ids(track, db)
     return [
         user_id
-        for user_id in _dedupe_user_ids(user_ids)
+        for user_id in dedupe_user_ids(user_ids)
         if user_id in scoped_user_ids and user_id not in composer_ids
     ]
 
 
-def _required_reviews_for_assignments(
+def required_reviews_for_assignments(
     step: "StepDef",
     assignments: list["StageAssignment"] | None = None,
 ) -> int:
@@ -89,11 +94,11 @@ def _required_reviews_for_assignments(
     return max(1, step.required_reviewer_count or 1)
 
 
-def _review_requires_group_finalization(
+def review_requires_group_finalization(
     step: "StepDef",
     assignments: list["StageAssignment"] | None = None,
 ) -> bool:
-    return step.type == "review" and _required_reviews_for_assignments(step, assignments) > 1
+    return step.type == "review" and required_reviews_for_assignments(step, assignments) > 1
 
 
 def _review_revision_target(step: "StepDef", steps: list["StepDef"]) -> str | None:
@@ -118,9 +123,9 @@ def _review_revision_decision(step: "StepDef", revision_target: str | None) -> s
 
 
 def _should_prefer_assignment(candidate: StageAssignment, current: StageAssignment) -> bool:
-    if candidate.status == "pending" and current.status != "pending":
+    if candidate.status == StageAssignmentStatus.PENDING and current.status != StageAssignmentStatus.PENDING:
         return True
-    if candidate.status != "pending" and current.status == "pending":
+    if candidate.status != StageAssignmentStatus.PENDING and current.status == StageAssignmentStatus.PENDING:
         return False
     if candidate.assigned_at != current.assigned_at:
         return candidate.assigned_at > current.assigned_at
@@ -154,11 +159,11 @@ def _mark_superseded_active_assignments(
         if assignment.id in canonical_ids:
             continue
         if assignment.status in ASSIGNMENT_ACTIVE_STATUSES:
-            assignment.status = "cancelled"
+            assignment.status = StageAssignmentStatus.CANCELLED
             assignment.cancellation_reason = ASSIGNMENT_CANCEL_REASON_SUPERSEDED
 
 
-def _review_active_assignments(
+def review_active_assignments(
     db: Session,
     track_id: int,
     stage_id: str,
@@ -259,7 +264,7 @@ def _cancel_review_assignments(
             StageAssignment.stage_id == stage_id,
             StageAssignment.status.in_(statuses),
         )
-        .values(status="cancelled", cancellation_reason=reason)
+        .values(status=StageAssignmentStatus.CANCELLED.value, cancellation_reason=reason)
     )
 
 
@@ -275,11 +280,11 @@ def _cancel_pending_review_assignments(
         track_id,
         stage_id,
         reason=reason,
-        statuses=("pending",),
+        statuses=(StageAssignmentStatus.PENDING.value,),
     )
 
 
-def _cancel_active_review_assignments(
+def cancel_active_review_assignments(
     db: Session,
     track_id: int,
     stage_id: str,
@@ -295,12 +300,16 @@ def _cancel_active_review_assignments(
     )
 
 
-def _clear_current_cycle_master_delivery_approvals(db: Session, track: Track) -> None:
+def _clear_current_cycle_master_delivery_approvals(
+    db: Session,
+    track: Track,
+    workflow_cycle: int | None = None,
+) -> None:
     db.execute(
         update(MasterDelivery)
         .where(
             MasterDelivery.track_id == track.id,
-            MasterDelivery.workflow_cycle == track.workflow_cycle,
+            MasterDelivery.workflow_cycle == (track.workflow_cycle if workflow_cycle is None else workflow_cycle),
         )
         .values(
             producer_approved_at=None,
@@ -340,7 +349,7 @@ def _is_delivery_transition_user_visible(step: "StepDef", decision: str) -> bool
     return True
 
 
-def _target_is_mastering_related(step: object) -> bool:
+def target_is_mastering_related(step: object) -> bool:
     step_id = getattr(step, "id", "")
     ui_variant = getattr(step, "ui_variant", None)
     return (
@@ -553,10 +562,17 @@ def user_matches_role(user: User, album: Album, track: Track, step: StepDef, db:
 
 def user_matches_role_or_assignment(
     user: User, album: Album, track: Track, step: StepDef, db: Session,
+    review_assignments: list[StageAssignment] | None = None,
 ) -> bool:
-    """Like user_matches_role but also checks StageAssignment for review steps."""
+    """Like user_matches_role but also checks StageAssignment for review steps.
+
+    ``review_assignments`` lets callers that already computed the active
+    assignments for this step pass them in to avoid a duplicate query.
+    """
     if step.type == "review":
-        has_assignments = bool(_review_active_assignments(db, track.id, step.id))
+        if review_assignments is None:
+            review_assignments = review_active_assignments(db, track.id, step.id)
+        has_assignments = bool(review_assignments)
         if has_assignments:
             assignment = db.scalar(
                 select(StageAssignment.id).where(
@@ -614,7 +630,7 @@ def assign_reviewers(
                 track_id=track.id,
                 stage_id=step.id,
                 user_id=uid,
-                status="pending",
+                status=StageAssignmentStatus.PENDING.value,
                 cancellation_reason=None,
                 assigned_at=now,
             ))
@@ -642,7 +658,7 @@ def assign_reviewers(
                     func.count(StageAssignment.id),
                 ).where(
                     StageAssignment.user_id.in_(candidates),
-                    StageAssignment.status == "pending",
+                    StageAssignment.status == StageAssignmentStatus.PENDING.value,
                 ).group_by(StageAssignment.user_id)
             ).all()
         )
@@ -656,7 +672,7 @@ def assign_reviewers(
                 track_id=track.id,
                 stage_id=step.id,
                 user_id=uid,
-                status="pending",
+                status=StageAssignmentStatus.PENDING.value,
                 cancellation_reason=None,
                 assigned_at=now,
             ))
@@ -681,7 +697,7 @@ def assign_peer_reviewer_for_step(
     if step.type != "review":
         return
 
-    _cancel_active_review_assignments(
+    cancel_active_review_assignments(
         db,
         track.id,
         step.id,
@@ -706,7 +722,7 @@ def assign_peer_reviewer_for_step(
             track_id=track.id,
             stage_id=step.id,
             user_id=selected[0],
-            status="pending",
+            status=StageAssignmentStatus.PENDING.value,
             cancellation_reason=None,
             assigned_at=datetime.now(timezone.utc),
         )
@@ -723,7 +739,7 @@ def assign_peer_reviewer_for_step(
 
     assigned = assign_reviewers(db, album, track, step, background_tasks, actor)
     assignments = [
-        StageAssignment(track_id=track.id, stage_id=step.id, user_id=uid, status="pending")
+        StageAssignment(track_id=track.id, stage_id=step.id, user_id=uid, status=StageAssignmentStatus.PENDING.value)
         for uid in assigned
     ]
     _set_track_peer_reviewer_from_assignments(track, step, assignments)
@@ -765,7 +781,7 @@ def prepare_review_assignments_for_stage_entry(
         for assignment in existing_assignments
         if assignment.status in ASSIGNMENT_ACTIVE_STATUSES
         or (
-            assignment.status == "cancelled"
+            assignment.status == StageAssignmentStatus.CANCELLED
             and assignment.cancellation_reason in {
                 None,
                 ASSIGNMENT_CANCEL_REASON_QUORUM_MET,
@@ -779,8 +795,8 @@ def prepare_review_assignments_for_stage_entry(
 
     reopened_user_ids: list[int] = []
     for assignment in canonical_assignments:
-        if assignment.status in {"completed", "cancelled"}:
-            assignment.status = "pending"
+        if assignment.status in {StageAssignmentStatus.COMPLETED, StageAssignmentStatus.CANCELLED}:
+            assignment.status = StageAssignmentStatus.PENDING
             assignment.completed_at = None
             assignment.decision = None
             assignment.cancellation_reason = None
@@ -799,39 +815,79 @@ def prepare_review_assignments_for_stage_entry(
 # ---------------------------------------------------------------------------
 
 
+def classify_transition(config: dict, track: Track, target: str) -> tuple[str, bool]:
+    """Classify a transition target into (kind, requires_confirmation).
+
+    Kind is derived from the target step semantics rather than the decision
+    name: terminal ``__rejected*`` targets and backwards transitions are
+    ``reject``, revision steps are ``revision``, forward/terminal-complete
+    targets are ``approve`` and anything else is ``neutral``.
+    ``requires_confirmation`` is only set for rejections to a terminal
+    ``__rejected*`` target.
+    """
+    if target == "__completed":
+        return "approve", False
+    if target.startswith("__rejected"):
+        return "reject", True
+
+    steps = get_steps(config)
+    target_step = get_step_by_id(steps, target)
+    if target_step is None:
+        return "neutral", False
+    if target_step.type == "revision":
+        return "revision", False
+
+    current_step = get_current_step(config, track)
+    if current_step is not None:
+        if target_step.order < current_step.order:
+            return "reject", False
+        if target_step.order > current_step.order:
+            return "approve", False
+    return "neutral", False
+
+
 def get_allowed_transitions(
     config: dict, track: Track, user: User, album: Album,
     db: Session | None = None,
+    review_assignments: list[StageAssignment] | None = None,
 ) -> list[TransitionOption]:
-    """Return the transitions the current user may take on this track."""
+    """Return the transitions the current user may take on this track.
+
+    ``review_assignments`` lets callers that already computed the active
+    assignments for the current review step pass them in to avoid duplicate
+    queries; when omitted they are queried here (requires ``db``).
+    """
     step = get_current_step(config, track)
     if step is None:
         return []
 
     steps = get_steps(config)
     configured_transitions_allowed = True
+    can_request_direct_revision = False
+    revision_target: str | None = None
 
     # Review steps use assignment state rather than the legacy role fallback.
     if step.type == "review":
-        if db is None:
-            return []
-        review_assignments = _review_active_assignments(db, track.id, step.id)
+        if review_assignments is None:
+            if db is None:
+                return []
+            review_assignments = review_active_assignments(db, track.id, step.id)
         if not review_assignments:
             return []
         user_pending_assignment = next(
-            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "pending"),
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == StageAssignmentStatus.PENDING),
             None,
         )
         user_completed_assignment = next(
-            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "completed"),
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == StageAssignmentStatus.COMPLETED),
             None,
         )
-        completed_reviews = sum(1 for assignment in review_assignments if assignment.status == "completed")
-        required_reviews = _required_reviews_for_assignments(step, review_assignments)
+        completed_reviews = sum(1 for assignment in review_assignments if assignment.status == StageAssignmentStatus.COMPLETED)
+        required_reviews = required_reviews_for_assignments(step, review_assignments)
         quorum_reached = completed_reviews >= required_reviews
         can_finalize_group_review = (
             user_completed_assignment is not None
-            and _review_requires_group_finalization(step, review_assignments)
+            and review_requires_group_finalization(step, review_assignments)
             and quorum_reached
         )
         configured_transitions_allowed = user_pending_assignment is not None or can_finalize_group_review
@@ -875,33 +931,12 @@ def get_allowed_transitions(
             label = decision.replace("_", " ").title()
             options.append(TransitionOption(decision=decision, target=target, label=label))
 
-    if step.type == "review" and db is not None:
-        review_assignments = _review_active_assignments(db, track.id, step.id)
-        user_pending_assignment = next(
-            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "pending"),
-            None,
-        )
-        user_completed_assignment = next(
-            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "completed"),
-            None,
-        )
-        revision_target = _review_revision_target(step, steps)
-        revision_decision = _review_revision_decision(step, revision_target)
-        if (
-            step.revision_decision_policy == REVIEW_REVISION_POLICY_FIRST_REQUEST
-            and revision_target is not None
-            and revision_decision is not None
-            and (
-                user_pending_assignment is not None
-                or user_completed_assignment is not None
-                and user_completed_assignment.decision == revision_decision
-            )
-        ):
-            options.append(TransitionOption(
-                decision=DIRECT_REVISION_REQUEST_DECISION,
-                target=revision_target,
-                label="Request Revision Now",
-            ))
+    if step.type == "review" and can_request_direct_revision:
+        options.append(TransitionOption(
+            decision=DIRECT_REVISION_REQUEST_DECISION,
+            target=revision_target,
+            label="Request Revision Now",
+        ))
 
     return options
 
@@ -909,16 +944,25 @@ def get_allowed_transitions(
 def get_allowed_action_names(
     config: dict, track: Track, user: User, album: Album,
     db: Session | None = None,
+    review_assignments: list[StageAssignment] | None = None,
 ) -> list[str]:
-    """Return action names for the ``allowed_actions`` field on TrackRead."""
-    transitions = get_allowed_transitions(config, track, user, album, db=db)
+    """Return action names for the ``allowed_actions`` field on TrackRead.
+
+    ``review_assignments`` lets callers that already computed the active
+    assignments for the current review step pass them in to avoid duplicate
+    queries; when omitted they are queried here (requires ``db``).
+    """
+    transitions = get_allowed_transitions(
+        config, track, user, album, db=db, review_assignments=review_assignments,
+    )
     actions = [t.decision for t in transitions]
 
     step = get_current_step(config, track)
 
     # Review steps without active assignments → producer should assign reviewers
     if step and step.type == "review" and db is not None:
-        review_assignments = _review_active_assignments(db, track.id, step.id)
+        if review_assignments is None:
+            review_assignments = review_active_assignments(db, track.id, step.id)
         if not review_assignments and is_album_manager(album, user, db):
             actions.append("assign_reviewer")
 
@@ -944,7 +988,6 @@ def get_allowed_action_names(
             else _user_matches_role_spec(user, album, track, step.assignee_role, db)
         )
         if assignee_matches:
-            from app.models.master_delivery import MasterDelivery
             # Check for unconfirmed delivery
             if db:
                 unconfirmed = db.scalar(
@@ -959,7 +1002,6 @@ def get_allowed_action_names(
 
     # Final review: add approve_final for producer/submitter who haven't approved yet
     if step and step.ui_variant == "final_review" and db is not None:
-        from app.workflow import current_master_delivery
         delivery = current_master_delivery(track)
         if delivery:
             is_producer = is_album_manager(album, user, db)
@@ -977,7 +1019,110 @@ def get_allowed_action_names(
     ):
         actions.append("resubmit")
 
+    # For completed tracks, expose the reopen affordances enforced by the
+    # reopen endpoints in routers/tracks.py.
+    if track.status == TrackStatus.COMPLETED and db is not None:
+        if user.id == album.mastering_engineer_id or is_album_manager(album, user, db):
+            actions.append("direct_reopen")
+        elif is_track_composer_actor(track, album, user.id, db):
+            actions.append("request_reopen")
+
     return actions
+
+
+def _can_request_source_followup(
+    db: Session,
+    wf_config: dict,
+    track: Track,
+    user: User,
+    album: Album,
+) -> bool:
+    if not album.quick_followup_enabled:
+        return False
+    if track.archived_at is not None:
+        return False
+    if not is_track_composer_actor(track, album, user.id, db):
+        return False
+    if track.status in {TrackStatus.REJECTED.value, TrackStatus.SOURCE_FOLLOWUP_PENDING.value}:
+        return False
+    step = get_current_step(wf_config, track)
+    if step is not None and step.type == "revision":
+        return False
+    pending_reopen = db.scalar(
+        select(ReopenRequest.id).where(
+            ReopenRequest.track_id == track.id,
+            ReopenRequest.status == ReopenRequestStatus.PENDING.value,
+        )
+    )
+    if pending_reopen is not None:
+        return False
+    return pending_source_followup_request(db, track.id) is None
+
+
+def compute_allowed_actions(
+    config: dict,
+    track: Track,
+    user: User,
+    album: Album,
+    db: Session | None = None,
+    review_assignments: list[StageAssignment] | None = None,
+) -> list[str]:
+    """Full workflow action set for ``user`` on ``track``.
+
+    Single source of truth behind both the ``allowed_actions`` field on
+    TrackRead and the ``can_act`` predicate: engine actions plus the
+    source-followup affordances.
+
+    ``review_assignments`` lets callers that already computed the active
+    assignments for the current review step pass them in to avoid duplicate
+    queries; when omitted they are queried here (requires ``db``).
+    """
+    actions = get_allowed_action_names(
+        config, track, user, album, db=db, review_assignments=review_assignments,
+    )
+    if db is None:
+        return actions
+
+    pending_followup = pending_source_followup_request(db, track.id)
+    if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
+        if pending_followup:
+            if is_track_composer_actor(track, album, user.id, db):
+                actions.append("cancel_source_followup")
+            if user.id == album.mastering_engineer_id or is_album_manager(album, user, db):
+                actions.append("decide_source_followup")
+        return actions
+
+    if _can_request_source_followup(db, config, track, user, album):
+        actions.append("request_source_followup")
+    return actions
+
+
+def can_act(
+    config: dict | None,
+    track: Track,
+    user: User,
+    album: Album,
+    action: str,
+    db: Session | None = None,
+) -> bool:
+    """Unified predicate: may ``user`` perform workflow ``action`` on ``track``?"""
+    wf_config = config if config is not None else parse_workflow_config(album)
+    return action in compute_allowed_actions(wf_config, track, user, album, db=db)
+
+
+def require_can_act(
+    config: dict | None,
+    track: Track,
+    user: User,
+    album: Album,
+    action: str,
+    db: Session | None = None,
+    *,
+    detail: str = "You cannot perform this action on the track in its current state.",
+) -> None:
+    """Raising variant of ``can_act`` for HTTP paths (403)."""
+    if not can_act(config, track, user, album, action, db=db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
 
 
 # ---------------------------------------------------------------------------
@@ -1018,27 +1163,27 @@ def execute_transition(
     required_reviews = max(1, step.required_reviewer_count or 1)
     completed_reviews = 0
     quorum_reached = False
-    review_requires_group_finalization = _review_requires_group_finalization(step)
+    requires_group_finalization = review_requires_group_finalization(step)
 
     # Validate permissions — review steps depend on assignment state.
     if step.type == "review":
-        review_assignments = _review_active_assignments(db, track.id, step.id)
+        review_assignments = review_active_assignments(db, track.id, step.id)
         if not review_assignments:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="This review stage is waiting for reviewer assignment.",
             )
         pending_assignment = next(
-            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "pending"),
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == StageAssignmentStatus.PENDING),
             None,
         )
         completed_assignment = next(
-            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == "completed"),
+            (assignment for assignment in review_assignments if assignment.user_id == user.id and assignment.status == StageAssignmentStatus.COMPLETED),
             None,
         )
-        required_reviews = _required_reviews_for_assignments(step, review_assignments)
-        review_requires_group_finalization = _review_requires_group_finalization(step, review_assignments)
-        completed_reviews = sum(1 for assignment in review_assignments if assignment.status == "completed")
+        required_reviews = required_reviews_for_assignments(step, review_assignments)
+        requires_group_finalization = review_requires_group_finalization(step, review_assignments)
+        completed_reviews = sum(1 for assignment in review_assignments if assignment.status == StageAssignmentStatus.COMPLETED)
         quorum_reached = completed_reviews >= required_reviews
         can_request_direct_revision = (
             is_direct_revision_request
@@ -1053,7 +1198,7 @@ def execute_transition(
         )
         if pending_assignment is None and not (
             completed_assignment is not None
-            and review_requires_group_finalization
+            and requires_group_finalization
             and quorum_reached
         ) and not can_request_direct_revision:
             raise HTTPException(
@@ -1140,13 +1285,13 @@ def execute_transition(
     # of `completed_reviews`.  If migrating to PostgreSQL, add SELECT … FOR UPDATE
     # on the StageAssignment rows to prevent the same race under MVCC.
     if step.type == "review" and pending_assignment is not None and not is_direct_revision_request:
-        pending_assignment.status = "completed"
+        pending_assignment.status = StageAssignmentStatus.COMPLETED
         pending_assignment.decision = decision
         pending_assignment.completed_at = datetime.now(timezone.utc)
         db.flush()
 
         finished_reviews = completed_reviews + 1
-        if review_requires_group_finalization or is_revision_suggestion:
+        if requires_group_finalization or is_revision_suggestion:
             log_track_event(
                 db, track, user,
                 "workflow_review_progress",
@@ -1183,7 +1328,7 @@ def execute_transition(
             return
 
     if is_direct_revision_request and pending_assignment is not None:
-        pending_assignment.status = "completed"
+        pending_assignment.status = StageAssignmentStatus.COMPLETED
         pending_assignment.decision = revision_decision
         pending_assignment.completed_at = datetime.now(timezone.utc)
         db.flush()
@@ -1210,12 +1355,12 @@ def execute_transition(
 
     # Handle special targets
     if target == "__completed":
-        track.status = "completed"
+        track.status = TrackStatus.COMPLETED.value
     elif target == "__rejected":
-        track.status = "rejected"
+        track.status = TrackStatus.REJECTED.value
         track.rejection_mode = RejectionMode.FINAL
     elif target == "__rejected_resubmittable":
-        track.status = "rejected"
+        track.status = TrackStatus.REJECTED.value
         track.rejection_mode = RejectionMode.RESUBMITTABLE
     else:
         target_step = get_step_by_id(steps, target)
@@ -1261,7 +1406,7 @@ def execute_transition(
             is_mastering_revision = False
             if target_step.return_to:
                 return_step = get_step_by_id(steps, target_step.return_to)
-                is_mastering_revision = return_step and _target_is_mastering_related(return_step)
+                is_mastering_revision = return_step and target_is_mastering_related(return_step)
 
             if is_mastering_revision:
                 # Mastering revisions REQUIRE a revision type
@@ -1279,8 +1424,8 @@ def execute_transition(
             track.requested_revision_type = None
 
     # Mark the current user's assignment when it wasn't already handled above.
-    if step.type == "review" and pending_assignment and pending_assignment.status == "pending":
-        pending_assignment.status = "completed"
+    if step.type == "review" and pending_assignment and pending_assignment.status == StageAssignmentStatus.PENDING:
+        pending_assignment.status = StageAssignmentStatus.COMPLETED
         pending_assignment.decision = revision_decision if is_direct_revision_request else decision
         pending_assignment.completed_at = datetime.now(timezone.utc)
 
@@ -1495,7 +1640,7 @@ def migrate_tracks_on_workflow_change(
                 select(func.count(StageAssignment.id)).where(
                     StageAssignment.track_id == track.id,
                     StageAssignment.stage_id == current_step.id,
-                    StageAssignment.status == "pending",
+                    StageAssignment.status == StageAssignmentStatus.PENDING.value,
                 )
             )
             needs_reassignment = not existing
@@ -1551,7 +1696,7 @@ def _collect_reopen_resets(
             select(func.count()).select_from(StageAssignment).where(
                 StageAssignment.track_id == track.id,
                 StageAssignment.stage_id.in_(later_stage_ids),
-                StageAssignment.status.in_(("completed", "cancelled")),
+                StageAssignment.status.in_((StageAssignmentStatus.COMPLETED.value, StageAssignmentStatus.CANCELLED.value)),
             )
         ) or 0
         if assignment_count:
@@ -1652,10 +1797,10 @@ def execute_reopen(
             .where(
                 StageAssignment.track_id == track.id,
                 StageAssignment.stage_id.in_(later_stage_ids),
-                StageAssignment.status.in_(("completed", "cancelled")),
+                StageAssignment.status.in_((StageAssignmentStatus.COMPLETED.value, StageAssignmentStatus.CANCELLED.value)),
             )
             .values(
-                status="pending",
+                status=StageAssignmentStatus.PENDING.value,
                 completed_at=None,
                 decision=None,
                 cancellation_reason=None,
@@ -1671,30 +1816,10 @@ def execute_reopen(
             )
         )
         # 3) Clear master delivery approval timestamps (old cycle)
-        db.execute(
-            update(MasterDelivery)
-            .where(
-                MasterDelivery.track_id == track.id,
-                MasterDelivery.workflow_cycle == track.workflow_cycle - 1,
-            )
-            .values(
-                producer_approved_at=None,
-                submitter_approved_at=None,
-            )
-        )
+        _clear_current_cycle_master_delivery_approvals(db, track, track.workflow_cycle - 1)
     else:
         # 3) Clear master delivery approval timestamps (same cycle)
-        db.execute(
-            update(MasterDelivery)
-            .where(
-                MasterDelivery.track_id == track.id,
-                MasterDelivery.workflow_cycle == track.workflow_cycle,
-            )
-            .values(
-                producer_approved_at=None,
-                submitter_approved_at=None,
-            )
-        )
+        _clear_current_cycle_master_delivery_approvals(db, track)
 
     db.flush()
 

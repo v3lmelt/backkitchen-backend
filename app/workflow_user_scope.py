@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models.album import Album
 from app.models.circle import Circle, CircleMember
-from app.workflow import get_album_member_ids
+from app.services.track_queries import get_album_member_ids
 
 
 def circle_workflow_user_ids(db: Session, circle_id: int) -> set[int]:

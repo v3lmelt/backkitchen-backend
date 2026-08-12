@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import ValidationError
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -33,26 +33,32 @@ from app.schemas.schemas import (
     PresignedCommentAudioResponse, PresignedUploadResponse, RequestCommentAudioUploadParams,
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
+from app.services.attachments import (
+    ALLOWED_IMAGE_TYPES,
+    AUDIO_MIME_MAP,
+    IMAGE_EXT_MAP,
+    parse_r2_audio_key_list,
+    save_uploaded_audios,
+    verify_r2_audio_keys,
+)
 from app.services.upload import stream_upload
 
-ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED = "revision_requested"
-from app.workflow import (
-    build_comment_read,
-    build_issue_detail_for_user,
-    build_issue_read,
-    allowed_user_mention_ids,
+from app.mentions import allowed_user_mention_ids
+from app.services.track_queries import (
     current_master_delivery,
     current_source_version,
-    ensure_track_visibility,
+    engaged_assignment_status_clause,
     is_track_composer,
     is_track_composer_actor,
     log_track_event,
     next_issue_local_number,
-    peer_identity_anonymize_user_ids_for_viewer,
     track_composer_actor_ids_for_notify,
     track_composer_actor_ordered_ids,
 )
+from app.track_permissions import ensure_track_visibility, peer_identity_anonymize_user_ids_for_viewer
+from app.track_serializers import build_comment_read, build_issue_detail_for_user, build_issue_read
 from app.workflow_engine import (
+    ASSIGNMENT_ACTIVE_STATUSES,
     get_steps,
     get_current_step,
     infer_issue_phase_for_step,
@@ -60,15 +66,7 @@ from app.workflow_engine import (
     user_matches_role_or_assignment,
 )
 
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-IMAGE_EXT_MAP = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-}
-
-from app.config import ALLOWED_AUDIO_TYPES, AUDIO_EXT_MAP, MAX_AUDIOS_PER_UPLOAD
+from app.config import ALLOWED_AUDIO_EXTENSIONS, ALLOWED_AUDIO_TYPES, MAX_AUDIOS_PER_UPLOAD
 
 MAX_AUDIOS_PER_COMMENT = MAX_AUDIOS_PER_UPLOAD
 MAX_AUDIOS_PER_ISSUE = MAX_AUDIOS_PER_UPLOAD
@@ -79,21 +77,6 @@ router = APIRouter(tags=["issues"])
 
 def _is_submitter_hidden_issue_status(status_value: IssueStatus) -> bool:
     return status_value in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}
-
-
-def _verify_r2_audio_keys(object_keys: list[str], *, expected_prefix: str | None = None) -> None:
-    from app.services.r2 import object_exists
-
-    normalized_prefix = None
-    if expected_prefix is not None:
-        normalized_prefix = expected_prefix.strip("/") + "/"
-
-    for key in object_keys:
-        normalized_key = key.strip("/")
-        if normalized_prefix and not normalized_key.startswith(normalized_prefix):
-            raise HTTPException(status_code=400, detail=f"Upload key does not match the expected target: {key}")
-        if not object_exists(normalized_key):
-            raise HTTPException(status_code=400, detail=f"Upload not found in R2: {key}")
 
 
 def _peer_anonymize_user_ids(
@@ -143,6 +126,15 @@ def _ensure_custom_issue_permission(track: Track, album: Album, user: User, phas
             detail="Only the assigned user can create issues for this step.",
         )
 
+    return infer_issue_phase_for_step(step)
+
+
+def _infer_issue_phase_for_track(track: Track, album: Album) -> str:
+    """Infer the canonical issue phase from the track's current workflow step."""
+    config = parse_workflow_config(album)
+    step = get_current_step(config, track)
+    if step is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Track is in unknown workflow step.")
     return infer_issue_phase_for_step(step)
 
 
@@ -225,14 +217,7 @@ def _phase_reviewer_ids(issue: Issue, track: Track, album: Album, db: Session) -
                 select(StageAssignment.user_id).where(
                     StageAssignment.track_id == track.id,
                     StageAssignment.stage_id.in_(matching_stage_ids),
-                    or_(
-                        StageAssignment.status.in_(["pending", "completed"]),
-                        (
-                            StageAssignment.status == "cancelled"
-                        ) & (
-                            StageAssignment.cancellation_reason == ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED
-                        ),
-                    ),
+                    engaged_assignment_status_clause(),
                 )
             ).all()
         )
@@ -393,7 +378,7 @@ async def create_issue(
 
     issue_title: str
     issue_description: str
-    issue_phase: str
+    issue_phase: str | None
     severity_enum: _IssueSeverity
     parsed_markers: list[IssueMarkerCreate]
     issue_visibility: str = "public"
@@ -435,14 +420,14 @@ async def create_issue(
         visibility = str(form.get("visibility") or "public").strip() or "public"
         markers_json = str(form.get("markers_json") or "[]")
 
-        if not title or not description or not phase:
+        if not title or not description:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="title, description and phase are required.",
+                detail="title and description are required.",
             )
         issue_title = title
         issue_description = description
-        issue_phase = phase
+        issue_phase = phase or None
         issue_visibility = visibility
         visibility_provided = "visibility" in form
 
@@ -480,6 +465,10 @@ async def create_issue(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
+    if not issue_phase:
+        # Phase omitted: infer it from the current workflow step so clients
+        # don't have to re-derive the step→phase mapping themselves.
+        issue_phase = _infer_issue_phase_for_track(track, album)
     effective_phase = _ensure_custom_issue_permission(
         track, album, current_user, issue_phase, db,
     )
@@ -491,7 +480,7 @@ async def create_issue(
             select(func.count(StageAssignment.id)).where(
                 StageAssignment.track_id == track.id,
                 StageAssignment.stage_id == current_step.id,
-                StageAssignment.status.in_(["pending", "completed"]),
+                StageAssignment.status.in_(ASSIGNMENT_ACTIVE_STATUSES),
             )
         ) or 0
     reviewer_scope_count = max(current_step.required_reviewer_count or 1, active_assignment_count) if current_step else 1
@@ -525,14 +514,9 @@ async def create_issue(
             )
 
     # Parse R2 audio keys if provided
-    r2_audio_keys: list[str] = []
-    r2_audio_names: list[str] = []
-    if audio_object_keys:
-        r2_audio_keys = [k.strip() for k in audio_object_keys.split("\n") if k.strip()]
-        r2_audio_names = [n.strip() for n in (audio_original_filenames or "").split("\n")]
-        while len(r2_audio_names) < len(r2_audio_keys):
-            r2_audio_names.append(Path(r2_audio_keys[len(r2_audio_names)]).name)
-        _verify_r2_audio_keys(r2_audio_keys)
+    r2_audio_keys, r2_audio_names = parse_r2_audio_key_list(audio_object_keys, audio_original_filenames)
+    if r2_audio_keys:
+        verify_r2_audio_keys(r2_audio_keys)
 
     # Validate audio files
     total_issue_audio_count = len(audios) + len(r2_audio_keys)
@@ -600,24 +584,12 @@ async def create_issue(
 
     # Handle direct audio uploads
     if audios:
-        from app.config import MAX_AUDIO_UPLOAD_SIZE
-
-        issue_audios_dir = settings.get_upload_path() / "issue_audios"
-        issue_audios_dir.mkdir(parents=True, exist_ok=True)
-        for audio_file in audios:
-            ext = AUDIO_EXT_MAP.get(audio_file.content_type or "", ".mp3")
-            filename = f"{uuid.uuid4()}{ext}"
-            file_path = f"issue_audios/{filename}"
-            dest = issue_audios_dir / filename
-            await stream_upload(audio_file, dest, MAX_AUDIO_UPLOAD_SIZE)
-            duration = extract_audio_metadata(dest).duration
-            original_filename = audio_file.filename or filename
-            db.add(IssueAudio(
-                issue_id=issue.id,
-                file_path=file_path,
-                original_filename=original_filename,
-                duration=duration,
-            ))
+        await save_uploaded_audios(
+            db,
+            audios,
+            subdir="issue_audios",
+            row_factory=lambda **kw: IssueAudio(issue_id=issue.id, **kw),
+        )
 
     # Handle R2 audio attachments
     if r2_audio_keys:
@@ -903,23 +875,12 @@ async def update_issue(
                 db.add(CommentImage(comment_id=comment.id, file_path=file_path))
 
         if audios:
-            from app.config import MAX_AUDIO_UPLOAD_SIZE
-            comment_audios_dir = settings.get_upload_path() / "comment_audios"
-            comment_audios_dir.mkdir(parents=True, exist_ok=True)
-            for audio_file in audios:
-                ext = AUDIO_EXT_MAP.get(audio_file.content_type or "", ".mp3")
-                filename = f"{uuid.uuid4()}{ext}"
-                file_path = f"comment_audios/{filename}"
-                dest = comment_audios_dir / filename
-                await stream_upload(audio_file, dest, MAX_AUDIO_UPLOAD_SIZE)
-                duration = extract_audio_metadata(dest).duration
-                original_filename = audio_file.filename or filename
-                db.add(CommentAudio(
-                    comment_id=comment.id,
-                    file_path=file_path,
-                    original_filename=original_filename,
-                    duration=duration,
-                ))
+            await save_uploaded_audios(
+                db,
+                audios,
+                subdir="comment_audios",
+                row_factory=lambda **kw: CommentAudio(comment_id=comment.id, **kw),
+            )
 
     if old_status != new_status and current_user.id != issue.author_id:
         track = db.get(Track, issue.track_id)
@@ -998,15 +959,8 @@ async def add_comment(
     # Normalise: pydantic v2 + python-multipart may deliver empty fields as None
     effective_content = (content or '').strip()
 
-    # Parse R2 audio keys (comma-separated) if provided
-    r2_audio_keys: list[str] = []
-    r2_audio_names: list[str] = []
-    if audio_object_keys:
-        r2_audio_keys = [k.strip() for k in audio_object_keys.split("\n") if k.strip()]
-        r2_audio_names = [n.strip() for n in (audio_original_filenames or "").split("\n")]
-        # Pad names to match keys
-        while len(r2_audio_names) < len(r2_audio_keys):
-            r2_audio_names.append(Path(r2_audio_keys[len(r2_audio_names)]).name)
+    # Parse R2 audio keys (newline-separated) if provided
+    r2_audio_keys, r2_audio_names = parse_r2_audio_key_list(audio_object_keys, audio_original_filenames)
 
     issue = db.get(Issue, issue_id)
     if issue is None:
@@ -1043,7 +997,7 @@ async def add_comment(
                 detail=f"Unsupported audio type: {audio_file.content_type}. Allowed: mp3, wav, flac, aac, ogg.",
             )
     if r2_audio_keys:
-        _verify_r2_audio_keys(r2_audio_keys, expected_prefix=f"comments/{issue_id}/0")
+        verify_r2_audio_keys(r2_audio_keys, expected_prefix=f"comments/{issue_id}/0")
 
     comment_visibility = "internal" if _is_submitter_hidden_issue_status(issue.status) else "public"
     comment = Comment(issue_id=issue_id, author_id=current_user.id, content=content or '', visibility=comment_visibility)
@@ -1064,24 +1018,12 @@ async def add_comment(
             db.add(CommentImage(comment_id=comment.id, file_path=file_path))
 
     if audios:
-        from app.config import MAX_AUDIO_UPLOAD_SIZE
-
-        comment_audios_dir = settings.get_upload_path() / "comment_audios"
-        comment_audios_dir.mkdir(parents=True, exist_ok=True)
-        for audio_file in audios:
-            ext = AUDIO_EXT_MAP.get(audio_file.content_type or "", ".mp3")
-            filename = f"{uuid.uuid4()}{ext}"
-            file_path = f"comment_audios/{filename}"
-            dest = comment_audios_dir / filename
-            await stream_upload(audio_file, dest, MAX_AUDIO_UPLOAD_SIZE)
-            duration = extract_audio_metadata(dest).duration
-            original_filename = audio_file.filename or filename
-            db.add(CommentAudio(
-                comment_id=comment.id,
-                file_path=file_path,
-                original_filename=original_filename,
-                duration=duration,
-            ))
+        await save_uploaded_audios(
+            db,
+            audios,
+            subdir="comment_audios",
+            row_factory=lambda **kw: CommentAudio(comment_id=comment.id, **kw),
+        )
 
     # R2 audio attachments
     if r2_audio_keys:
@@ -1177,8 +1119,6 @@ def request_comment_audio_upload(
         raise HTTPException(status_code=422, detail=f"A comment may contain at most {MAX_AUDIOS_PER_COMMENT} audio files.")
 
     from app.services.r2 import generate_upload_url, make_object_key
-
-    from app.routers.tracks import ALLOWED_AUDIO_EXTENSIONS
 
     uploads = []
     for f in params.files:
@@ -1314,11 +1254,7 @@ def serve_issue_audio(
     file_path = settings.get_upload_path() / audio.file_path
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Audio file missing from disk.")
-    mime_map = {
-        ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
-        ".ogg": "audio/ogg", ".aac": "audio/aac", ".m4a": "audio/mp4",
-    }
-    media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
+    media_type = AUDIO_MIME_MAP.get(file_path.suffix.lower(), "audio/octet-stream")
     return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)
 
 
@@ -1365,11 +1301,7 @@ def serve_comment_audio(
     file_path = settings.get_upload_path() / audio.file_path
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Audio file missing from disk.")
-    mime_map = {
-        ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
-        ".ogg": "audio/ogg", ".aac": "audio/aac", ".m4a": "audio/mp4",
-    }
-    media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
+    media_type = AUDIO_MIME_MAP.get(file_path.suffix.lower(), "audio/octet-stream")
     return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)
 
 

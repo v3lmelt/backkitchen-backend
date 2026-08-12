@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.models.album import Album
 from app.models.track import Track
 from app.models.user import User
-from app.workflow import log_track_event
+from app.services.track_queries import log_track_event
 from app.workflow_engine import (
     get_step_by_id,
     get_steps,

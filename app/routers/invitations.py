@@ -7,7 +7,7 @@ from app.database import get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.circle import Circle, CircleMember
-from app.models.invitation import Invitation
+from app.models.invitation import Invitation, InvitationStatus
 from app.models.user import User
 from app.schemas.schemas import (
     AlbumSummary,
@@ -17,7 +17,8 @@ from app.schemas.schemas import (
 )
 from app.security import get_current_user
 from app.notifications import notify
-from app.workflow import ensure_album_manager, ensure_album_visibility, get_album_member_ids
+from app.services.track_queries import get_album_member_ids
+from app.track_permissions import ensure_album_manager, ensure_album_visibility
 from app.workflow_user_scope import circle_workflow_user_ids
 
 router = APIRouter(tags=["invitations"])
@@ -69,7 +70,7 @@ def create_invitation(
         select(Invitation).where(
             Invitation.album_id == album_id,
             Invitation.user_id == payload.user_id,
-            Invitation.status == "pending",
+            Invitation.status == InvitationStatus.PENDING.value,
         )
     ).first()
     if existing:
@@ -82,7 +83,7 @@ def create_invitation(
         album_id=album_id,
         user_id=payload.user_id,
         invited_by_user_id=current_user.id,
-        status="pending",
+        status=InvitationStatus.PENDING.value,
     )
     db.add(invitation)
     db.commit()
@@ -101,7 +102,7 @@ def list_album_invitations(
     invitations = list(
         db.scalars(
             select(Invitation)
-            .where(Invitation.album_id == album_id, Invitation.status == "pending")
+            .where(Invitation.album_id == album_id, Invitation.status == InvitationStatus.PENDING.value)
             .order_by(Invitation.created_at.desc())
         ).all()
     )
@@ -116,7 +117,7 @@ def list_my_invitations(
     invitations = list(
         db.scalars(
             select(Invitation)
-            .where(Invitation.user_id == current_user.id, Invitation.status == "pending")
+            .where(Invitation.user_id == current_user.id, Invitation.status == InvitationStatus.PENDING.value)
             .order_by(Invitation.created_at.desc())
         ).all()
     )
@@ -137,7 +138,7 @@ def accept_invitation(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not the invited user.",
         )
-    if invitation.status != "pending":
+    if invitation.status != InvitationStatus.PENDING:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This invitation is no longer pending.",
@@ -186,7 +187,7 @@ def accept_invitation(
             detail="This invitation is no longer valid because you are not a member of the circle.",
         )
 
-    invitation.status = "accepted"
+    invitation.status = InvitationStatus.ACCEPTED
 
     notify(db, [invitation.invited_by_user_id], "invitation_accepted", "邀请已被接受",
            f"{current_user.display_name or current_user.username} 已接受加入「{album.title}」的邀请")
@@ -210,13 +211,13 @@ def decline_invitation(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not the invited user.",
         )
-    if invitation.status != "pending":
+    if invitation.status != InvitationStatus.PENDING:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This invitation is no longer pending.",
         )
 
-    invitation.status = "declined"
+    invitation.status = InvitationStatus.DECLINED
 
     album = db.get(Album, invitation.album_id)
     album_title = album.title if album else "未知专辑"

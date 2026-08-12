@@ -9,7 +9,13 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.config import ALLOWED_AUDIO_TYPES, AUDIO_EXT_MAP, MAX_AUDIOS_PER_UPLOAD
+from app.config import (
+    ALLOWED_AUDIO_EXTENSIONS,
+    ALLOWED_AUDIO_TYPES,
+    MAX_AUDIO_UPLOAD_SIZE,
+    MAX_AUDIOS_PER_UPLOAD,
+    MAX_IMAGE_UPLOAD_SIZE,
+)
 from app.config import settings
 from app.circle_permissions import album_manager_user_ids, is_album_manager
 from app.database import get_db
@@ -33,17 +39,24 @@ from app.schemas.schemas import (
     UserRead,
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
+from app.services.attachments import (
+    ALLOWED_IMAGE_EXTENSIONS,
+    AUDIO_MIME_MAP,
+    parse_r2_audio_key_list,
+    save_uploaded_audios,
+    verify_r2_audio_keys,
+)
 from app.services.upload import stream_upload
-from app.workflow import (
-    allowed_user_mention_ids,
-    discussion_audio_file_url,
+from app.workflow_engine import ASSIGNMENT_ACTIVE_STATUSES
+from app.mentions import allowed_user_mention_ids
+from app.services.track_queries import is_track_composer, track_composer_actor_ordered_ids
+from app.track_permissions import (
     ensure_track_visibility,
     is_mastering_participant,
-    is_track_composer,
     mask_user_read_if_needed,
     peer_identity_anonymize_user_ids_for_viewer,
-    track_composer_actor_ordered_ids,
 )
+from app.track_serializers import discussion_audio_file_url
 
 router = APIRouter(tags=["discussions"])
 logger = logging.getLogger(__name__)
@@ -118,18 +131,6 @@ def _ensure_discussion_visible_to_user(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to internal discussions.")
 
 
-def _verify_r2_audio_keys(object_keys: list[str], *, expected_prefix: str) -> None:
-    from app.services.r2 import object_exists
-
-    normalized_prefix = expected_prefix.strip("/") + "/"
-    for key in object_keys:
-        normalized_key = key.strip("/")
-        if not normalized_key.startswith(normalized_prefix):
-            raise HTTPException(status_code=400, detail=f"Upload key does not match the expected target: {key}")
-        if not object_exists(normalized_key):
-            raise HTTPException(status_code=400, detail=f"Upload not found in R2: {key}")
-
-
 def _build_audio_response(audio: TrackDiscussionAudio, resolve: str | None):
     if audio.storage_backend == "r2":
         from app.services.r2 import public_url
@@ -146,15 +147,7 @@ def _build_audio_response(audio: TrackDiscussionAudio, resolve: str | None):
     if not file_path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file missing from disk.")
 
-    mime_map = {
-        ".mp3": "audio/mpeg",
-        ".wav": "audio/wav",
-        ".flac": "audio/flac",
-        ".ogg": "audio/ogg",
-        ".aac": "audio/aac",
-        ".m4a": "audio/mp4",
-    }
-    media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
+    media_type = AUDIO_MIME_MAP.get(file_path.suffix.lower(), "audio/octet-stream")
     return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)
 
 
@@ -238,9 +231,6 @@ def request_discussion_audio_upload(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> PresignedCommentAudioResponse:
-    from app.config import MAX_AUDIO_UPLOAD_SIZE
-    from app.routers.tracks import ALLOWED_AUDIO_EXTENSIONS
-
     if not settings.R2_ENABLED:
         raise HTTPException(status_code=501, detail="R2 storage is not enabled.")
 
@@ -303,13 +293,7 @@ async def create_discussion(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> DiscussionRead:
-    r2_audio_keys: list[str] = []
-    r2_audio_names: list[str] = []
-    if audio_object_keys:
-        r2_audio_keys = [key.strip() for key in audio_object_keys.split("\n") if key.strip()]
-        r2_audio_names = [name.strip() for name in (audio_original_filenames or "").split("\n")]
-        while len(r2_audio_names) < len(r2_audio_keys):
-            r2_audio_names.append(Path(r2_audio_keys[len(r2_audio_names)]).name)
+    r2_audio_keys, r2_audio_names = parse_r2_audio_key_list(audio_object_keys, audio_original_filenames)
 
     if not content.strip() and not images and not audios and not r2_audio_keys:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Content or attachments required.")
@@ -324,7 +308,7 @@ async def create_discussion(
     if r2_audio_keys and phase != "mastering":
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Audio uploads are only allowed in mastering discussions.")
     if r2_audio_keys:
-        _verify_r2_audio_keys(r2_audio_keys, expected_prefix=f"discussions/{track_id}/0")
+        verify_r2_audio_keys(r2_audio_keys, expected_prefix=f"discussions/{track_id}/0")
     anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
 
     discussion = TrackDiscussion(
@@ -337,9 +321,6 @@ async def create_discussion(
     db.flush()
 
     if images:
-        from app.config import MAX_IMAGE_UPLOAD_SIZE
-
-        allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
         upload_dir = settings.get_upload_path() / "discussion_images"
         upload_dir.mkdir(parents=True, exist_ok=True)
         for img_file in images:
@@ -349,7 +330,7 @@ async def create_discussion(
                     detail=f"File must be an image, got: {img_file.content_type}",
                 )
             ext = (Path(img_file.filename or "image.png").suffix or ".png").lower()
-            if ext not in allowed_extensions:
+            if ext not in ALLOWED_IMAGE_EXTENSIONS:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"Unsupported image extension: {ext}",
@@ -365,35 +346,28 @@ async def create_discussion(
             )
 
     if (audios or r2_audio_keys) and phase == "mastering":
-        from app.config import MAX_AUDIO_UPLOAD_SIZE
         from app.services.audio import extract_audio_metadata
 
         audio_uploads = audios or []
         total_audio_count = len(audio_uploads) + len(r2_audio_keys)
         if total_audio_count > MAX_AUDIOS_PER_UPLOAD:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Maximum {MAX_AUDIOS_PER_UPLOAD} audio files per discussion.")
-        audio_dir = settings.get_upload_path() / "discussion_audios"
-        audio_dir.mkdir(parents=True, exist_ok=True)
         for audio_file in audio_uploads:
             if not audio_file.content_type or audio_file.content_type not in ALLOWED_AUDIO_TYPES:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"Unsupported audio type: {audio_file.content_type}",
                 )
-            ext = AUDIO_EXT_MAP.get(audio_file.content_type, ".mp3")
-            filename = f"{uuid.uuid4().hex}{ext}"
-            dest = audio_dir / filename
-            await stream_upload(audio_file, dest, MAX_AUDIO_UPLOAD_SIZE)
-            duration = extract_audio_metadata(dest).duration
-            db.add(
-                TrackDiscussionAudio(
-                    discussion_id=discussion.id,
-                    file_path=f"discussion_audios/{filename}",
-                    storage_backend="local",
-                    original_filename=audio_file.filename or filename,
-                    duration=duration,
-                )
-            )
+        await save_uploaded_audios(
+            db,
+            audio_uploads,
+            subdir="discussion_audios",
+            row_factory=lambda **kw: TrackDiscussionAudio(
+                discussion_id=discussion.id,
+                storage_backend="local",
+                **kw,
+            ),
+        )
         if r2_audio_keys:
             from app.services.r2 import download_to_temp
 
@@ -427,7 +401,7 @@ async def create_discussion(
             db.scalars(
                 select(StageAssignment.user_id).where(
                     StageAssignment.track_id == track.id,
-                    StageAssignment.status.in_(["pending", "completed"]),
+                    StageAssignment.status.in_(ASSIGNMENT_ACTIVE_STATUSES),
                 )
             ).all()
         )

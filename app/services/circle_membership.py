@@ -1,13 +1,13 @@
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from app.models.album import Album
 from app.models.album_member import AlbumMember
-from app.models.invitation import Invitation
-from app.models.stage_assignment import StageAssignment
+from app.models.invitation import Invitation, InvitationStatus
+from app.models.stage_assignment import StageAssignment, StageAssignmentStatus
 from app.models.track import Track
+from app.services.track_queries import engaged_assignment_status_clause
 
-ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED = "revision_requested"
 ASSIGNMENT_CANCEL_REASON_CIRCLE_MEMBERSHIP_REVOKED = "circle_membership_revoked"
 
 
@@ -43,19 +43,10 @@ def revoke_circle_member_resource_access(db: Session, circle_id: int, user_id: i
         .where(
             StageAssignment.track_id.in_(track_ids),
             StageAssignment.user_id == user_id,
-            or_(
-                StageAssignment.status.in_(["pending", "completed"]),
-                (
-                    (StageAssignment.status == "cancelled")
-                    & (
-                        StageAssignment.cancellation_reason
-                        == ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED
-                    )
-                ),
-            ),
+            engaged_assignment_status_clause(),
         )
         .values(
-            status="cancelled",
+            status=StageAssignmentStatus.CANCELLED.value,
             cancellation_reason=ASSIGNMENT_CANCEL_REASON_CIRCLE_MEMBERSHIP_REVOKED,
         )
     )
@@ -63,6 +54,6 @@ def revoke_circle_member_resource_access(db: Session, circle_id: int, user_id: i
         delete(Invitation).where(
             Invitation.album_id.in_(album_ids),
             Invitation.user_id == user_id,
-            Invitation.status == "pending",
+            Invitation.status == InvitationStatus.PENDING.value,
         )
     )

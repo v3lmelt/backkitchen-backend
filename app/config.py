@@ -24,6 +24,7 @@ AUDIO_EXT_MAP = {
     "audio/aac": ".aac",
     "audio/ogg": ".ogg",
 }
+ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a", ".wma"}
 
 
 class Settings(BaseSettings):

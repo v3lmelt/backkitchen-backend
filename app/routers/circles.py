@@ -33,6 +33,7 @@ from app.schemas.schemas import (
     UserRead,
 )
 from app.security import get_current_user, require_producer
+from app.services.attachments import ALLOWED_IMAGE_EXTENSIONS
 from app.services.circle_membership import revoke_circle_member_resource_access
 from app.services.upload import stream_upload
 
@@ -230,12 +231,11 @@ async def upload_logo(
 
     from app.config import MAX_IMAGE_UPLOAD_SIZE
 
-    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
     ext = (Path(file.filename or "logo.jpg").suffix or ".jpg").lower()
-    if ext not in allowed_extensions:
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported image extension: {ext}")
     filename = f"{uuid.uuid4()}{ext}"
     logo_dir = settings.get_upload_path() / "logos"

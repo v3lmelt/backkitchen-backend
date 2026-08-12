@@ -17,6 +17,26 @@ TOKEN_KIND = "access"
 _bearer = HTTPBearer(auto_error=False)
 
 
+def current_session_version(user: User) -> int:
+    """Return the user's effective session version (minimum 1)."""
+    return max(int(user.session_version or 1), 1)
+
+
+def bump_session_version(user: User) -> int:
+    """Increment the user's session version, revoking all existing tokens."""
+    user.session_version = current_session_version(user) + 1
+    return user.session_version
+
+
+def is_session_version_current(user: User, session_version: object) -> bool:
+    """Return True when a token's ``sv`` claim matches the user's current version."""
+    try:
+        token_version = int(session_version)
+    except (TypeError, ValueError):
+        return False
+    return token_version == current_session_version(user)
+
+
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
     iterations = 100_000
@@ -60,7 +80,7 @@ def create_access_token(user: User) -> str:
     payload = {
         "sub": user.id,
         "type": TOKEN_KIND,
-        "sv": max(int(user.session_version or 1), 1),
+        "sv": current_session_version(user),
         "exp": int(
             (
                 datetime.now(timezone.utc)
@@ -125,7 +145,7 @@ def _resolve_bearer_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Account suspended.",
         )
-    if int(payload.get("sv", 0)) != max(int(user.session_version or 1), 1):
+    if not is_session_version_current(user, payload.get("sv", 0)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication token revoked.",
@@ -178,7 +198,32 @@ def get_user_from_token_param(
         user is None
         or user.deleted_at is not None
         or user.suspended_at is not None
-        or int(payload.get("sv", 0)) != max(int(user.session_version or 1), 1)
+        or not is_session_version_current(user, payload.get("sv", 0))
     ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found.")
     return user
+
+
+def _resolve_websocket_user(db, payload: dict) -> tuple[int | None, User | None, str | None]:
+    """Validate a decoded WebSocket token payload against the user table.
+
+    Returns ``(user_id, user, None)`` on success, or
+    ``(user_id, None, reason)`` describing why the token was rejected.
+    """
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        return None, None, "invalid_subject"
+
+    user = db.get(User, user_id)
+    if user is None or user.deleted_at is not None:
+        return user_id, None, "missing_user"
+    if user.suspended_at is not None:
+        return user_id, None, "suspended_user"
+    try:
+        token_session_version = int(payload.get("sv", 0))
+    except (TypeError, ValueError):
+        return user_id, None, "invalid_session_version"
+    if not is_session_version_current(user, token_session_version):
+        return user_id, None, "revoked_token"
+    return user_id, user, None

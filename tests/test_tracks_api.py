@@ -128,6 +128,84 @@ def test_co_producer_can_execute_producer_workflow_transition(client, db_session
     assert response["status"] == "producer_gate"
 
 
+def test_reviewer_candidates_for_circle_bound_album(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    producer = factory.user(username="album-producer", role="producer")
+    circle_member = factory.user(username="circle-member")
+    submitter = factory.user(username="submitter")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Candidate Circle", "description": "desc"},
+    )
+    assert create_response.status_code == 201, create_response.text
+    circle_id = create_response.json()["id"]
+    db_session.add_all([
+        CircleMember(circle_id=circle_id, user_id=circle_member.id, role="member"),
+        CircleMember(circle_id=circle_id, user_id=submitter.id, role="member"),
+    ])
+    # The album producer is NOT a circle member: they must not appear as a
+    # reviewer candidate, matching assign-reviewer validation.
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter], checklist_enabled=False)
+    album.circle_id = circle_id
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+    db_session.commit()
+
+    response = client.get(
+        f"/api/tracks/{track.id}/reviewer-candidates",
+        headers=auth_headers(owner),
+    )
+    assert response.status_code == 200, response.text
+    candidates = response.json()
+    candidate_ids = {item["user_id"] for item in candidates}
+    assert owner.id in candidate_ids
+    assert circle_member.id in candidate_ids
+    assert producer.id not in candidate_ids
+    # Track composers are never eligible as reviewers.
+    assert submitter.id not in candidate_ids
+    assert all(item["user"]["id"] == item["user_id"] for item in candidates)
+
+
+def test_reviewer_candidates_for_standalone_album(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    member = factory.user(username="member")
+    submitter = factory.user(username="submitter")
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[member, submitter],
+        checklist_enabled=False,
+    )
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+    db_session.commit()
+
+    response = client.get(
+        f"/api/tracks/{track.id}/reviewer-candidates",
+        headers=auth_headers(producer),
+    )
+    assert response.status_code == 200, response.text
+    candidate_ids = {item["user_id"] for item in response.json()}
+    assert candidate_ids == {producer.id, mastering.id, member.id}
+
+
+def test_reviewer_candidates_requires_album_manager(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    outsider = factory.user(username="outsider")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter], checklist_enabled=False)
+    track = factory.track(album=album, submitter=submitter, status="peer_review")
+    db_session.commit()
+
+    response = client.get(
+        f"/api/tracks/{track.id}/reviewer-candidates",
+        headers=auth_headers(outsider),
+    )
+    assert response.status_code == 403
+
+
 def _create_progress_circle_album(client, db_session, factory, auth_headers, *, actor_role: str = "owner", workflow_config: dict | None = None, track_status: str = "intake"):
     owner = factory.user(role="producer")
     actor = owner if actor_role == "owner" else factory.user(username=f"{actor_role}-actor")

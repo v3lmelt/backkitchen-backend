@@ -21,8 +21,8 @@ from app.models.album import Album
 from app.models.album_member import AlbumMember
 from app.models.circle import Circle, CircleInviteCode, CircleMember
 from app.models.issue import Issue, IssueStatus
-from app.models.reopen_request import ReopenRequest
-from app.models.stage_assignment import StageAssignment
+from app.models.reopen_request import ReopenRequest, ReopenRequestStatus
+from app.models.stage_assignment import StageAssignment, StageAssignmentStatus
 from app.models.track import RejectionMode, Track, TrackStatus
 from app.models.track_composer import TrackComposer
 from app.models.user import User
@@ -52,8 +52,10 @@ from app.schemas.schemas import (
 )
 from app.services.cleanup import cleanup_files, collect_track_files
 from app.services.track_progress import force_track_status
-from app.workflow import build_track_read, log_track_event, track_composer_ids_for_notify
-from app.workflow_engine import ASSIGNMENT_CANCEL_REASON_REASSIGNED, _cancel_active_review_assignments
+from app.security import bump_session_version
+from app.services.track_queries import log_track_event, track_composer_ids_for_notify
+from app.track_serializers import build_track_read
+from app.workflow_engine import ASSIGNMENT_CANCEL_REASON_REASSIGNED, cancel_active_review_assignments, execute_reopen
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -393,7 +395,7 @@ def _transfer_user_ownership(
         db.scalars(
             select(StageAssignment).where(
                 StageAssignment.user_id == source_user.id,
-                StageAssignment.status == "pending",
+                StageAssignment.status == StageAssignmentStatus.PENDING.value,
             )
         ).all()
     )
@@ -485,7 +487,7 @@ def suspend_user(
     before = _user_snapshot(user)
     user.suspended_at = datetime.now(timezone.utc)
     user.suspension_reason = payload.reason
-    user.session_version = max(int(user.session_version or 1), 1) + 1
+    bump_session_version(user)
 
     record_admin_audit(
         db,
@@ -520,7 +522,7 @@ def restore_user(
     user.deleted_at = None
     user.suspended_at = None
     user.suspension_reason = None
-    user.session_version = max(int(user.session_version or 1), 1) + 1
+    bump_session_version(user)
 
     record_admin_audit(
         db,
@@ -552,7 +554,7 @@ def revoke_user_sessions(
     _ensure_target_user_mutable(admin, user)
 
     before = _user_snapshot(user)
-    user.session_version = max(int(user.session_version or 1), 1) + 1
+    bump_session_version(user)
     record_admin_audit(
         db,
         actor=admin,
@@ -627,7 +629,7 @@ def delete_user(
     user.deleted_at = now
     user.suspended_at = now
     user.suspension_reason = reason
-    user.session_version = max(int(user.session_version or 1), 1) + 1
+    bump_session_version(user)
 
     record_admin_audit(
         db,
@@ -810,7 +812,7 @@ def admin_dashboard(
         select(func.count(Issue.id)).where(Issue.status == IssueStatus.OPEN)
     ) or 0
     pending_reopen_requests = db.scalar(
-        select(func.count(ReopenRequest.id)).where(ReopenRequest.status == "pending")
+        select(func.count(ReopenRequest.id)).where(ReopenRequest.status == ReopenRequestStatus.PENDING.value)
     ) or 0
     failed_webhook_deliveries = db.scalar(
         select(func.count(WebhookDelivery.id)).where(WebhookDelivery.success.is_(False))
@@ -1061,7 +1063,7 @@ def admin_reassign(
     old_reviewer_id = track.peer_reviewer_id
     track.peer_reviewer_id = payload.user_ids[0]
 
-    _cancel_active_review_assignments(
+    cancel_active_review_assignments(
         db,
         track.id,
         track.status,
@@ -1073,7 +1075,7 @@ def admin_reassign(
                 track_id=track.id,
                 stage_id=track.status,
                 user_id=user.id,
-                status="pending",
+                status=StageAssignmentStatus.PENDING.value,
             )
         )
 
@@ -1116,8 +1118,6 @@ def admin_reopen_track(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin(ADMIN_ROLE_OPERATOR)),
 ) -> TrackRead:
-    from app.workflow_engine import execute_reopen
-
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
@@ -1156,12 +1156,11 @@ def admin_decide_reopen_request(
     admin: User = Depends(require_admin(ADMIN_ROLE_OPERATOR)),
 ) -> AdminReopenRequestEntry:
     from app.notifications import notify
-    from app.workflow_engine import execute_reopen
 
     request_obj = db.get(ReopenRequest, request_id)
     if request_obj is None:
         raise HTTPException(status_code=404, detail="Reopen request not found.")
-    if request_obj.status != "pending":
+    if request_obj.status != ReopenRequestStatus.PENDING:
         raise HTTPException(status_code=409, detail="Request already decided.")
 
     track = db.get(Track, request_obj.track_id)
@@ -1175,7 +1174,7 @@ def admin_decide_reopen_request(
         "request_status": request_obj.status,
         "track": _track_snapshot(track),
     }
-    request_obj.status = "approved" if payload.decision == "approve" else "rejected"
+    request_obj.status = ReopenRequestStatus.APPROVED if payload.decision == "approve" else ReopenRequestStatus.REJECTED
     request_obj.decided_by_id = admin.id
     request_obj.decided_at = datetime.now(timezone.utc)
 

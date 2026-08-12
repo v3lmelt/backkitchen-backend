@@ -36,9 +36,18 @@ from app.models.workflow_template import WorkflowTemplate
 from app.notifications import notify
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema, WorkflowEventRead
 from app.security import get_current_user
+from app.services.attachments import ALLOWED_IMAGE_EXTENSIONS, ALLOWED_IMAGE_TYPES
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
-from app.workflow import build_event_read, build_track_read, current_master_delivery, ensure_album_manager, ensure_album_visibility, get_album_member_ids, get_all_album_member_ids, is_album_completed, peer_identity_anonymize_user_ids_for_viewer
+from app.services.track_queries import (
+    current_master_delivery,
+    get_album_member_ids,
+    get_all_album_member_ids,
+    is_album_completed,
+)
+from app.track_permissions import ensure_album_manager, ensure_album_visibility, peer_identity_anonymize_user_ids_for_viewer
+from app.track_serializers import annotate_workflow_step_metadata, build_event_read, build_track_read
+from app.workflow_engine import migrate_tracks_on_workflow_change, parse_workflow_config
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 from app.workflow_user_scope import validate_circle_workflow_user_scope
 
@@ -59,7 +68,9 @@ def _workflow_config_to_schema(album: Album) -> WorkflowConfigSchema | None:
     if not album.workflow_config:
         return None
     try:
-        return WorkflowConfigSchema(**json.loads(album.workflow_config))
+        return annotate_workflow_step_metadata(
+            WorkflowConfigSchema(**json.loads(album.workflow_config))
+        )
     except Exception:
         logger.warning(
             "Album %d has an invalid workflow_config and will be read without it.",
@@ -697,16 +708,14 @@ async def upload_album_cover(
 ) -> AlbumRead:
     album = ensure_album_manager(album_id, current_user, db)
 
-    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
-    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-    if file.content_type not in allowed_types:
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only JPEG, PNG, WebP, and GIF images are allowed.",
         )
 
     ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
-    if ext not in allowed_extensions:
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported image extension: {ext}",
@@ -953,7 +962,9 @@ def get_workflow_config(
     if album is None:
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
-    return WorkflowConfigSchema(**json.loads(album.workflow_config))
+    return annotate_workflow_step_metadata(
+        WorkflowConfigSchema(**json.loads(album.workflow_config))
+    )
 
 
 @router.put("/{album_id}/workflow", response_model=dict)
@@ -964,8 +975,6 @@ def update_workflow_config(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    from app.workflow_engine import migrate_tracks_on_workflow_change, parse_workflow_config
-
     album = ensure_album_manager(album_id, current_user, db)
 
     old_config = parse_workflow_config(album)
