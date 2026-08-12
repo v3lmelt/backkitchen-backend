@@ -552,6 +552,43 @@ def test_create_issue_returns_protected_audio_urls_for_local_uploads(client, fac
     assert download.headers["content-type"].startswith("audio/wav")
 
 
+def test_create_issue_accepts_m4a_and_wma_audio_types(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+
+    # Browsers send these MIME types for .m4a/.wma files; the direct-upload
+    # path validates against ALLOWED_AUDIO_TYPES (the extension check alone is
+    # not enough, so issue audio for these formats previously 422'd).
+    for index, (filename, content_type) in enumerate([
+        ("note.m4a", "audio/mp4"),
+        ("note-2.m4a", "audio/x-m4a"),
+        ("note.wma", "audio/x-ms-wma"),
+    ]):
+        response = client.post(
+            f"/api/tracks/{track.id}/issues",
+            headers=auth_headers(reviewer),
+            data={
+                "title": f"Clicks {index}",
+                "description": "See attached example",
+                "phase": "peer",
+                "severity": "major",
+                "markers_json": "[]",
+            },
+            files=[("audios", (filename, BytesIO(b"audiodata"), content_type))],
+        )
+        assert response.status_code == 201, (content_type, response.text)
+        assert len(response.json()["audios"]) == 1
+
+
 def test_create_issue_rejects_r2_audio_key_from_another_track(
     client, db_session, factory, auth_headers, monkeypatch
 ):

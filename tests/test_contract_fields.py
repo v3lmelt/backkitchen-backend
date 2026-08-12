@@ -88,6 +88,33 @@ def test_masked_peer_identity_uses_canonical_token(client, db_session, factory, 
     assert author["anon_token"] == reviewer_token
 
 
+def test_anonymous_view_nulls_raw_identity_ids(client, db_session, factory, auth_headers):
+    _, _, _, reviewer, viewer, _, track = _make_track_with_viewer(factory)
+    track.is_public = True
+    db_session.commit()
+    factory.issue(track=track, author=reviewer, phase=IssuePhase.PEER)
+
+    payload = client.get(f"/api/tracks/{track.id}", headers=auth_headers(viewer)).json()["track"]
+
+    # Raw numeric IDs are as sensitive as the masked identity objects: an
+    # anonymous viewer must not be able to enumerate users by pairing IDs with
+    # the deterministic FNV anon tokens.
+    assert payload["submitter_id"] is None
+    assert payload["composer_ids"] is None
+    assert payload["peer_reviewer_id"] is None
+    assert payload["proxy_uploader_id"] is None
+
+
+def test_privileged_view_keeps_raw_identity_ids(client, db_session, factory, auth_headers):
+    producer, _, submitter, reviewer, _, _, track = _make_track_with_viewer(factory)
+
+    payload = client.get(f"/api/tracks/{track.id}", headers=auth_headers(producer)).json()["track"]
+
+    assert payload["submitter_id"] == submitter.id
+    assert payload["composer_ids"] == [submitter.id]
+    assert payload["peer_reviewer_id"] == reviewer.id
+
+
 # ---------------------------------------------------------------------------
 # Viewer-context flags
 # ---------------------------------------------------------------------------

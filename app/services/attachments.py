@@ -37,6 +37,7 @@ AUDIO_MIME_MAP = {
     ".ogg": "audio/ogg",
     ".aac": "audio/aac",
     ".m4a": "audio/mp4",
+    ".wma": "audio/x-ms-wma",
 }
 
 

@@ -132,6 +132,8 @@ class TrackReviewStateRead(BaseModel):
 class TrackRead(TrackBase):
     # artist overrides TrackBase — None when the track is shown anonymised to the viewer
     artist: str | None = None
+    # composer_ids overrides TrackBase — None when the track is shown anonymised to the viewer
+    composer_ids: list[int] | None = None
     id: int
     album_checklist_enabled: bool | None = None
     track_number: int | None = None
