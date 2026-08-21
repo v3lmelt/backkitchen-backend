@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from app.models.admin_audit_log import AdminAuditLog
+from app.models.album_member import AlbumMember
 from app.models.circle import Circle, CircleMember
 from app.models.reopen_request import ReopenRequest
 from app.models.stage_assignment import StageAssignment
@@ -169,11 +170,79 @@ def test_transfer_ownership_allows_soft_delete_after_active_assets(client, db_se
     assert transfer.json()["albums"] == 1
     assert transfer.json()["circles"] == 1
 
+    db_session.expire_all()
+    assert db_session.get(Circle, circle.id).created_by == target.id
+    assert db_session.scalar(
+        select(CircleMember.role).where(
+            CircleMember.circle_id == circle.id,
+            CircleMember.user_id == source.id,
+        )
+    ) == "member"
+    assert db_session.scalar(
+        select(CircleMember.role).where(
+            CircleMember.circle_id == circle.id,
+            CircleMember.user_id == target.id,
+        )
+    ) == "owner"
+    assert db_session.query(AlbumMember).filter_by(
+        album_id=album.id,
+        user_id=target.id,
+    ).count() == 1
+
     delete_after = client.delete(
         f"/api/admin/users/{source.id}",
         headers=auth_headers(admin_user),
     )
     assert delete_after.status_code == 204
+
+
+def test_transfer_ownership_deduplicates_overlapping_album_memberships(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    admin_user = factory.user(username="admin", admin_role="superadmin", is_admin=True)
+    source = factory.user(username="source", role="producer")
+    target = factory.user(username="target", role="producer")
+
+    new_membership_album = factory.album(
+        producer=source,
+        mastering_engineer=source,
+        members=[source],
+        title="New Target Membership",
+    )
+    factory.track(album=new_membership_album, submitter=source, status="intake")
+    factory.track(album=new_membership_album, submitter=source, status="peer_review")
+
+    existing_membership_album = factory.album(
+        producer=source,
+        mastering_engineer=source,
+        members=[source, target],
+        title="Existing Target Membership",
+    )
+    factory.track(album=existing_membership_album, submitter=source, status="intake")
+
+    response = client.post(
+        f"/api/admin/users/{source.id}/transfer-ownership",
+        headers=auth_headers(admin_user),
+        json={"target_user_id": target.id, "reason": "Owner left"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["albums"] == 2
+    assert response.json()["mastering_albums"] == 2
+    assert response.json()["active_tracks"] == 3
+
+    db_session.expire_all()
+    for album in [new_membership_album, existing_membership_album]:
+        refreshed_album = db_session.get(type(album), album.id)
+        assert refreshed_album.producer_id == target.id
+        assert refreshed_album.mastering_engineer_id == target.id
+        assert db_session.query(AlbumMember).filter_by(
+            album_id=album.id,
+            user_id=target.id,
+        ).count() == 1
 
 
 def test_admin_audit_log_returns_user_governance_actions(client, factory, auth_headers):

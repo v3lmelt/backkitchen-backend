@@ -33,6 +33,8 @@ from app.schemas.schemas import (
     UserRead,
 )
 from app.security import get_current_user, require_producer
+from app.services.attachments import ALLOWED_IMAGE_EXTENSIONS
+from app.services.circle_membership import revoke_circle_member_resource_access
 from app.services.upload import stream_upload
 
 router = APIRouter(prefix="/api/circles", tags=["circles"])
@@ -67,7 +69,7 @@ def _circle_to_read(circle: Circle) -> CircleRead:
     )
 
 
-def _circle_to_summary(circle: Circle) -> CircleSummary:
+def _circle_to_summary(circle: Circle, *, viewer_can_create_album: bool = False) -> CircleSummary:
     return CircleSummary(
         id=circle.id,
         name=circle.name,
@@ -76,6 +78,7 @@ def _circle_to_summary(circle: Circle) -> CircleSummary:
         default_checklist_enabled=circle.default_checklist_enabled,
         created_by=circle.created_by,
         member_count=len(circle.members),
+        viewer_can_create_album=viewer_can_create_album,
     )
 
 
@@ -85,13 +88,29 @@ def list_circles(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.is_admin:
-        all_circles = list(db.scalars(select(Circle)).all())
-        return [_circle_to_summary(c) for c in all_circles]
-
     memberships = db.execute(
         select(CircleMember).where(CircleMember.user_id == current_user.id)
     ).scalars().all()
+    membership_role_by_circle_id = {
+        membership.circle_id: membership.role for membership in memberships
+    }
+
+    if current_user.is_admin:
+        all_circles = list(db.scalars(select(Circle)).all())
+        can_create_any = has_admin_role(current_user, "operator") or current_user.role == "producer"
+        return [
+            _circle_to_summary(
+                circle,
+                viewer_can_create_album=(
+                    can_create_any
+                    or circle.created_by == current_user.id
+                    or membership_role_by_circle_id.get(circle.id)
+                    in {CIRCLE_ROLE_OWNER, CIRCLE_ROLE_CO_PRODUCER}
+                ),
+            )
+            for circle in all_circles
+        ]
+
     created = db.execute(
         select(Circle).where(Circle.created_by == current_user.id)
     ).scalars().all()
@@ -107,7 +126,19 @@ def list_circles(
             seen_ids.add(m.circle_id)
             if m.circle:
                 circles.append(m.circle)
-    return [_circle_to_summary(c) for c in circles]
+    can_create_any = has_admin_role(current_user, "operator") or current_user.role == "producer"
+    return [
+        _circle_to_summary(
+            c,
+            viewer_can_create_album=(
+                can_create_any
+                or c.created_by == current_user.id
+                or membership_role_by_circle_id.get(c.id)
+                in {CIRCLE_ROLE_OWNER, CIRCLE_ROLE_CO_PRODUCER}
+            ),
+        )
+        for c in circles
+    ]
 
 
 # ── create circle (producer only) ────────────────────────────────────────────
@@ -200,12 +231,11 @@ async def upload_logo(
 
     from app.config import MAX_IMAGE_UPLOAD_SIZE
 
-    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
     ext = (Path(file.filename or "logo.jpg").suffix or ".jpg").lower()
-    if ext not in allowed_extensions:
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported image extension: {ext}")
     filename = f"{uuid.uuid4()}{ext}"
     logo_dir = settings.get_upload_path() / "logos"
@@ -339,7 +369,15 @@ def join_circle(
 
     circle = db.get(Circle, invite.circle_id)
     db.refresh(circle)
-    return _circle_to_summary(circle)
+    return _circle_to_summary(
+        circle,
+        viewer_can_create_album=(
+            has_admin_role(current_user, "operator")
+            or current_user.role == "producer"
+            or circle.created_by == current_user.id
+            or member.role in {CIRCLE_ROLE_OWNER, CIRCLE_ROLE_CO_PRODUCER}
+        ),
+    )
 
 
 # ── remove member from circle ─────────────────────────────────────────────────
@@ -410,6 +448,7 @@ def remove_member(
     ):
         raise HTTPException(status_code=403, detail="Only the circle owner can remove a co-producer.")
 
+    revoke_circle_member_resource_access(db, circle_id, user_id)
     db.delete(member)
     db.commit()
 
@@ -438,6 +477,7 @@ def leave_circle(
     if not member:
         raise HTTPException(status_code=404, detail="You are not a member of this circle")
 
+    revoke_circle_member_resource_access(db, circle_id, current_user.id)
     db.delete(member)
     db.commit()
 

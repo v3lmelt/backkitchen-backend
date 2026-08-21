@@ -2,6 +2,7 @@ import ipaddress
 import logging
 import socket
 from datetime import datetime, timezone
+from typing import TypedDict
 from urllib.parse import urlparse
 
 import httpx
@@ -10,6 +11,26 @@ from sqlalchemy.orm import Session
 from app.services.webhook_adapters import adapt_payload
 
 logger = logging.getLogger(__name__)
+
+
+class NotificationContext(TypedDict, total=False):
+    """Shared shape of the ``webhook_context`` passed to ``notify()``.
+
+    Producers (routers, workflow engine) fill in the actor/step fields;
+    consumers (notification dispatch, webhook payload builders) enrich it
+    with album/track metadata before it is embedded in the webhook payload.
+    """
+
+    actor_id: int
+    actor_name: str
+    from_step: str
+    to_step: str
+    composer_email_event: str
+    album_title: str
+    track_title: str
+    track_url: str
+    issue_title: str
+    action_required_by: str
 
 _BLOCKED_NETWORKS = [
     ipaddress.ip_network("10.0.0.0/8"),
@@ -172,7 +193,7 @@ def build_webhook_payload(
     track_id: int | None = None,
     album_id: int | None = None,
     issue_id: int | None = None,
-    context: dict | None = None,
+    context: NotificationContext | None = None,
 ) -> dict:
     payload: dict = {
         "event": event,

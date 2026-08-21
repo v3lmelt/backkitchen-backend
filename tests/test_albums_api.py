@@ -1,7 +1,10 @@
 import copy
 import json
+import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
+from app.models.album import Album
 from app.models.circle import CircleMember
 from app.routers import albums as albums_router
 from app.models.issue import IssuePhase, IssueStatus
@@ -10,27 +13,76 @@ from app.models.workflow_event import WorkflowEvent
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 
-def test_create_album(client, factory, auth_headers):
+def test_create_album_requires_circle(client, db_session, factory, auth_headers):
     user = factory.user(role="producer")
     response = client.post(
         "/api/albums",
         headers=auth_headers(user),
         json={"title": "My Album", "description": "desc"},
     )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Circle is required when creating an album."
+    assert db_session.query(Album).count() == 0
+
+
+def test_create_album(client, factory, auth_headers):
+    user = factory.user(role="producer")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(user),
+        json={"name": "Back Kitchen", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(user),
+        json={"title": "My Album", "description": "desc", "circle_id": circle_response.json()["id"]},
+    )
     assert response.status_code == 201
     body = response.json()
     assert body["title"] == "My Album"
+    assert body["circle_id"] == circle_response.json()["id"]
     assert body["producer_id"] == user.id
     assert body["checklist_enabled"] is False
     assert any(m["user_id"] == user.id for m in body["members"])
 
 
+def test_create_album_rejects_inaccessible_circle(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    outsider = factory.user(role="producer", username="outsider")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Private Circle", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+
+    response = client.post(
+        "/api/albums",
+        headers=auth_headers(outsider),
+        json={"title": "Blocked Album", "circle_id": circle_response.json()["id"]},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Not a member of this circle."
+    assert db_session.query(Album).count() == 0
+
+
 def test_create_album_accepts_explicit_checklist_override(client, factory, auth_headers):
     user = factory.user(role="producer")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(user),
+        json={"name": "Checklist Circle", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
+
     response = client.post(
         "/api/albums",
         headers=auth_headers(user),
-        json={"title": "Checklist Album", "checklist_enabled": True},
+        json={"title": "Checklist Album", "circle_id": circle_response.json()["id"], "checklist_enabled": True},
     )
 
     assert response.status_code == 201
@@ -380,7 +432,13 @@ def test_co_producer_can_manage_circle_album_team(client, db_session, factory, a
     )
 
     assert response.status_code == 200
-    assert response.json()["mastering_engineer_id"] == mastering.id
+    body = response.json()
+    assert body["mastering_engineer_id"] == mastering.id
+    assert body["viewer_is_album_manager"] is True
+
+    detail_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(co_producer))
+    assert detail_response.status_code == 200
+    assert detail_response.json()["viewer_is_album_manager"] is True
 
 
 def test_co_producer_does_not_manage_unlinked_album(client, db_session, factory, auth_headers):
@@ -394,16 +452,88 @@ def test_co_producer_does_not_manage_unlinked_album(client, db_session, factory,
     )
     circle_id = create_response.json()["id"]
     db_session.add(CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"))
-    album = factory.album(producer=owner, mastering_engineer=mastering)
+    inaccessible_album = factory.album(producer=owner, mastering_engineer=mastering)
+    visible_unlinked_album = factory.album(
+        producer=owner,
+        mastering_engineer=mastering,
+        members=[co_producer],
+    )
     db_session.commit()
 
-    response = client.patch(
-        f"/api/albums/{album.id}/metadata",
+    inaccessible_response = client.get(
+        f"/api/albums/{inaccessible_album.id}",
+        headers=auth_headers(co_producer),
+    )
+    assert inaccessible_response.status_code == 403
+
+    detail_response = client.get(
+        f"/api/albums/{visible_unlinked_album.id}",
+        headers=auth_headers(co_producer),
+    )
+    assert detail_response.status_code == 200
+    assert detail_response.json()["viewer_is_album_manager"] is False
+
+    manager_response = client.patch(
+        f"/api/albums/{visible_unlinked_album.id}/metadata",
         headers=auth_headers(co_producer),
         json={"title": "Should Not Update"},
     )
 
-    assert response.status_code == 403
+    assert manager_response.status_code == 403
+
+
+def test_album_read_exposes_viewer_circle_role(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    co_producer = factory.user(username="co")
+    member = factory.user(username="member")
+    admin = factory.user(username="admin", admin_role="operator", is_admin=True)
+    mastering = factory.user(role="mastering_engineer")
+    create_response = client.post(
+        "/api/circles",
+        headers=auth_headers(owner),
+        json={"name": "Circle One", "description": "desc"},
+    )
+    circle_id = create_response.json()["id"]
+    db_session.add_all([
+        CircleMember(circle_id=circle_id, user_id=co_producer.id, role="co_producer"),
+        CircleMember(circle_id=circle_id, user_id=member.id, role="member"),
+    ])
+    album = factory.album(producer=owner, mastering_engineer=mastering, members=[member])
+    album.circle_id = circle_id
+    db_session.commit()
+
+    owner_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(owner))
+    assert owner_response.status_code == 200
+    assert owner_response.json()["viewer_circle_role"] == "owner"
+
+    co_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(co_producer))
+    assert co_response.status_code == 200
+    assert co_response.json()["viewer_circle_role"] == "co_producer"
+
+    member_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(member))
+    assert member_response.status_code == 200
+    assert member_response.json()["viewer_circle_role"] == "member"
+
+    admin_response = client.get(f"/api/albums/{album.id}", headers=auth_headers(admin))
+    assert admin_response.status_code == 200
+    admin_body = admin_response.json()
+    assert admin_body["viewer_is_album_manager"] is True
+    assert admin_body["viewer_circle_role"] is None
+
+    list_response = client.get("/api/albums", headers=auth_headers(co_producer))
+    assert list_response.status_code == 200
+    listed = {item["id"]: item for item in list_response.json()}
+    assert listed[album.id]["viewer_circle_role"] == "co_producer"
+
+
+def test_album_read_viewer_circle_role_is_none_without_circle(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+
+    response = client.get(f"/api/albums/{album.id}", headers=auth_headers(producer))
+    assert response.status_code == 200
+    assert response.json()["viewer_circle_role"] is None
 
 
 def test_album_stats(client, factory, auth_headers):
@@ -513,11 +643,17 @@ def test_list_album_tracks_forbidden_for_outsider(client, factory, auth_headers)
 
 def test_create_album_sets_default_workflow_config(client, factory, auth_headers):
     producer = factory.user(role="producer")
+    circle_response = client.post(
+        "/api/circles",
+        headers=auth_headers(producer),
+        json={"name": "Workflow Circle", "description": "desc"},
+    )
+    assert circle_response.status_code == 201
 
     response = client.post(
         "/api/albums",
         headers=auth_headers(producer),
-        json={"title": "Workflow Album", "description": "desc"},
+        json={"title": "Workflow Album", "description": "desc", "circle_id": circle_response.json()["id"]},
     )
 
     assert response.status_code == 201
@@ -541,6 +677,8 @@ def test_create_album_sets_default_workflow_config(client, factory, auth_headers
         ]:
             if step.get(key) is None:
                 step.pop(key, None)
+        # Server-computed output metadata, not part of the stored config.
+        step.pop("is_mastering_related", None)
 
     assert normalized_response == normalized_default
 
@@ -600,3 +738,98 @@ def test_update_circle_album_workflow_rejects_non_circle_reviewer_pool(
 
     assert response.status_code == 400
     assert "not members of this circle" in response.text
+
+
+def test_export_download_id_is_bound_to_its_album(client, factory, auth_headers, tmp_path):
+    producer_a = factory.user(role="producer", username="producer-a")
+    producer_b = factory.user(role="producer", username="producer-b")
+    mastering = factory.user(role="mastering_engineer")
+    album_a = factory.album(producer=producer_a, mastering_engineer=mastering, title="Album A")
+    album_b = factory.album(producer=producer_b, mastering_engineer=mastering, title="Album B")
+    export_path = tmp_path / "album-a.zip"
+    export_path.write_bytes(b"album-a-export")
+    download_id = "album-a-download"
+    artifact = albums_router.ExportArtifact(
+        album_id=album_a.id,
+        file_path=str(export_path),
+        created_at=time.time(),
+    )
+    with albums_router._export_temp_store_lock:
+        albums_router._export_temp_store[download_id] = artifact
+
+    wrong_album_response = client.get(
+        f"/api/albums/{album_b.id}/export/download/{download_id}",
+        headers=auth_headers(producer_b),
+    )
+
+    assert wrong_album_response.status_code == 404
+    assert export_path.exists() is True
+    with albums_router._export_temp_store_lock:
+        assert albums_router._export_temp_store.get(download_id) == artifact
+
+    correct_response = client.get(
+        f"/api/albums/{album_a.id}/export/download/{download_id}",
+        headers=auth_headers(producer_a),
+    )
+
+    assert correct_response.status_code == 200
+    assert correct_response.content == b"album-a-export"
+    assert export_path.exists() is False
+    with albums_router._export_temp_store_lock:
+        assert download_id not in albums_router._export_temp_store
+
+    repeat_response = client.get(
+        f"/api/albums/{album_a.id}/export/download/{download_id}",
+        headers=auth_headers(producer_a),
+    )
+    assert repeat_response.status_code == 404
+
+
+def test_unauthorized_export_download_does_not_consume_artifact(client, factory, auth_headers, tmp_path):
+    producer = factory.user(role="producer", username="producer")
+    outsider = factory.user(role="producer", username="outsider")
+    mastering = factory.user(role="mastering_engineer")
+    album = factory.album(producer=producer, mastering_engineer=mastering)
+    export_path = tmp_path / "album.zip"
+    export_path.write_bytes(b"album-export")
+    download_id = "protected-download"
+    artifact = albums_router.ExportArtifact(
+        album_id=album.id,
+        file_path=str(export_path),
+        created_at=time.time(),
+    )
+    with albums_router._export_temp_store_lock:
+        albums_router._export_temp_store[download_id] = artifact
+
+    response = client.get(
+        f"/api/albums/{album.id}/export/download/{download_id}",
+        headers=auth_headers(outsider),
+    )
+
+    assert response.status_code == 403
+    assert export_path.exists() is True
+    with albums_router._export_temp_store_lock:
+        assert albums_router._export_temp_store.get(download_id) == artifact
+
+    with albums_router._export_temp_store_lock:
+        albums_router._export_temp_store.pop(download_id, None)
+    Path(export_path).unlink(missing_ok=True)
+
+
+def test_cleanup_expired_exports_uses_album_bound_artifacts(tmp_path, monkeypatch):
+    export_path = tmp_path / "expired.zip"
+    export_path.write_bytes(b"expired")
+    download_id = "expired-download"
+    with albums_router._export_temp_store_lock:
+        albums_router._export_temp_store[download_id] = albums_router.ExportArtifact(
+            album_id=123,
+            file_path=str(export_path),
+            created_at=100.0,
+        )
+    monkeypatch.setattr(albums_router.time, "time", lambda: 100.0 + albums_router._EXPORT_TTL_SECONDS + 1)
+
+    albums_router._cleanup_expired_exports()
+
+    assert export_path.exists() is False
+    with albums_router._export_temp_store_lock:
+        assert download_id not in albums_router._export_temp_store

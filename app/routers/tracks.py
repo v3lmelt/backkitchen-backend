@@ -7,20 +7,20 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from sqlalchemy import func, func as sqlfunc, select, update
+from sqlalchemy import func, func as sqlfunc, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.admin_permissions import has_admin_role
-from app.circle_permissions import album_manager_user_ids, is_album_manager
-from app.config import settings
+from app.circle_permissions import album_manager_user_ids, is_album_manager, require_circle_bound_album_manager
+from app.config import ALLOWED_AUDIO_EXTENSIONS, settings
 from app.database import get_db
 from app.models.album import Album
 from app.models.comment import Comment
 from app.models.issue import Issue, IssueStatus
 from app.models.master_delivery import MasterDelivery
-from app.models.reopen_request import ReopenRequest
-from app.models.source_followup_request import SourceFollowupRequest
-from app.models.stage_assignment import StageAssignment
+from app.models.reopen_request import ReopenRequest, ReopenRequestStatus
+from app.models.source_followup_request import SourceFollowupRequest, SourceFollowupRequestStatus
+from app.models.stage_assignment import StageAssignment, StageAssignmentStatus
 from app.models.track import RejectionMode, Track, TrackStatus, WorkflowVariant
 from app.models.track_composer import TrackComposer, TrackExternalComposer
 from app.models.track_playback_preference import TrackPlaybackPreference
@@ -44,51 +44,73 @@ from app.schemas.schemas import (
     ReopenRequestRead,
     RequestTrackUploadParams,
     RequestUploadParams,
+    ReviewerCandidateRead,
     SetPublicRequest,
     SourceExternalLinkSubmission,
     SourceFollowupDecisionRequest,
     StageAssignmentRead,
     TrackDetailResponse,
+    TrackForceStatusRequest,
     TrackListItem,
     TrackMetadataUpdate,
     TrackComposerUpdate,
     TrackRead,
+    UserRead,
     WorkflowTransitionRequest,
 )
 from app.workflow_engine import (
     ASSIGNMENT_ACTIVE_STATUSES,
+    ASSIGNMENT_CANCEL_REASON_REASSIGNED,
+    assign_peer_reviewer_for_step,
+    cancel_active_review_assignments,
     compute_reopen_resets,
-    prepare_review_assignments_for_stage_entry,
-    execute_transition as engine_execute_transition,
-    execute_revision_upload as engine_revision_upload,
-    execute_delivery_upload as engine_delivery_upload,
+    dedupe_user_ids,
+    execute_delivery_confirm,
+    execute_reopen,
     get_initial_track_status,
+    get_step_by_id,
+    get_steps,
+    should_new_cycle,
+    execute_transition as engine_execute_transition,
     get_current_step as engine_get_current_step,
     parse_workflow_config as engine_parse_workflow_config,
+    require_can_act as engine_require_can_act,
     resolve_assignee as engine_resolve_assignee,
+    target_is_mastering_related,
 )
 from app.notifications import notify
 from app.realtime import broadcast_track_updated
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.audio import extract_audio_metadata
+from app.services.attachments import AUDIO_MIME_MAP
 from app.services.track_delete import prepare_track_hard_delete
+from app.services.track_progress import force_track_status as apply_force_track_status
+from app.services.source_followup import (
+    apply_source_followup_request,
+    create_source_followup_request as _create_source_followup_request,
+    delete_source_followup_draft,
+    ensure_source_followup_decider,
+    ensure_source_followup_request_allowed,
+)
+from app.services.track_uploads import create_source_version, finalize_source_version_upload, handle_delivery_status
 from app.services.upload import stream_upload_sync
-from app.workflow import (
-    build_track_detail,
-    build_track_read,
+from app.services.track_queries import (
     current_master_delivery,
     current_source_version,
-    ensure_album_visibility,
-    ensure_track_visibility,
     get_all_album_member_ids,
     is_track_composer_actor,
     log_track_event,
-    mask_user_read_if_needed,
-    peer_identity_anonymize_user_ids_for_viewer,
-    should_anonymize_track,
     track_composer_actor_ids_for_notify,
     track_composer_ids,
 )
+from app.track_permissions import (
+    ensure_album_visibility,
+    ensure_track_visibility,
+    mask_user_read_if_needed,
+    peer_identity_anonymize_user_ids_for_viewer,
+    should_anonymize_track,
+)
+from app.track_serializers import build_track_detail, build_track_read
 from app.workflow_user_scope import album_reviewer_scope_user_ids, circle_workflow_user_ids
 
 router = APIRouter(prefix="/api/tracks", tags=["tracks"])
@@ -126,9 +148,6 @@ def sanitize_filename(name: str) -> str:
     return s[:200] or 'untitled'
 
 
-ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a", ".wma"}
-
-
 def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float | None]:
     from app.config import MAX_AUDIO_UPLOAD_SIZE
 
@@ -144,29 +163,6 @@ def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float 
     stream_upload_sync(file, dest, MAX_AUDIO_UPLOAD_SIZE)
     meta = extract_audio_metadata(dest)
     return str(dest), meta.duration
-
-
-def _source_version_create(
-    track: Track,
-    user: User,
-    file_path: str | None,
-    duration: float | None,
-    *,
-    revision_notes: str | None = None,
-    storage_backend: str = "local",
-    source_kind: str = "file",
-) -> TrackSourceVersion:
-    return TrackSourceVersion(
-        track_id=track.id,
-        workflow_cycle=track.workflow_cycle,
-        version_number=track.version,
-        file_path=file_path,
-        storage_backend=storage_backend,
-        source_kind=source_kind,
-        duration=duration,
-        uploaded_by_id=user.id,
-        revision_notes=revision_notes,
-    )
 
 
 def _normalize_external_composer_names(
@@ -196,214 +192,6 @@ def _normalize_external_composer_names(
     return names
 
 
-def _dedupe_ints(values: list[int]) -> list[int]:
-    return list(dict.fromkeys(values))
-
-
-def _status_note_visibility_for_resolution(status_value: IssueStatus) -> str:
-    if status_value in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}:
-        return "internal"
-    return "public"
-
-
-def _resolve_issues_for_revision_upload(
-    db: Session,
-    *,
-    track: Track,
-    actor: User,
-    issue_ids: list[int],
-    issue_cycle: int,
-    resolution_note: str | None,
-) -> list[int]:
-    deduped_issue_ids = _dedupe_ints(issue_ids)
-    if not deduped_issue_ids:
-        return []
-
-    issues = list(
-        db.scalars(
-            select(Issue)
-            .where(Issue.track_id == track.id, Issue.id.in_(deduped_issue_ids))
-            .order_by(Issue.id)
-        ).all()
-    )
-    issue_map = {issue.id: issue for issue in issues}
-    missing_ids = [issue_id for issue_id in deduped_issue_ids if issue_id not in issue_map]
-    if missing_ids:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Resolved issues do not belong to this track: {missing_ids}",
-        )
-
-    wrong_cycle_ids = [
-        issue.id for issue in issues
-        if issue.workflow_cycle != issue_cycle
-    ]
-    if wrong_cycle_ids:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Resolved issues must belong to workflow cycle {issue_cycle}: {wrong_cycle_ids}",
-        )
-
-    note = (resolution_note or "").strip()
-    resolved_ids: list[int] = []
-    for issue_id in deduped_issue_ids:
-        issue = issue_map[issue_id]
-        previous_status = issue.status
-        if previous_status != IssueStatus.RESOLVED:
-            issue.status = IssueStatus.RESOLVED
-        if note and previous_status != IssueStatus.RESOLVED:
-            db.add(
-                Comment(
-                    issue_id=issue.id,
-                    author_id=actor.id,
-                    content=note,
-                    visibility=_status_note_visibility_for_resolution(previous_status),
-                    is_status_note=True,
-                    old_status=previous_status.value,
-                    new_status=IssueStatus.RESOLVED.value,
-                )
-            )
-        resolved_ids.append(issue.id)
-
-    return resolved_ids
-
-
-def _finalize_source_version_upload(
-    db: Session,
-    *,
-    album: Album,
-    track: Track,
-    current_user: User,
-    background_tasks: BackgroundTasks,
-    file_path: str | None,
-    storage_backend: str,
-    duration: float | None,
-    revision_notes: str | None,
-    resolved_issue_ids: list[int],
-    resolution_note: str | None,
-    source_kind: str = "file",
-    replace_current_audio: bool = True,
-) -> None:
-    issue_cycle = track.workflow_cycle
-
-    # Resolve the next step *before* mutating rejection_mode so that the
-    # engine can recognise a resubmit on a rejected+resubmittable track.
-    next_status = engine_revision_upload(album, track)
-
-    resolved_ids = _resolve_issues_for_revision_upload(
-        db,
-        track=track,
-        actor=current_user,
-        issue_ids=resolved_issue_ids,
-        issue_cycle=issue_cycle,
-        resolution_note=resolution_note,
-    )
-
-    # Resubmit path: rejected+resubmittable tracks re-enter the workflow from
-    # the first step with a fresh cycle and no reviewer assignment.
-    if (
-        track.status == TrackStatus.REJECTED
-        and track.rejection_mode == RejectionMode.RESUBMITTABLE
-    ):
-        track.workflow_cycle += 1
-        track.peer_reviewer_id = None
-        track.rejection_mode = None
-        track.workflow_variant = WorkflowVariant.STANDARD.value
-
-    previous_status = track.status
-    track.version += 1
-    if replace_current_audio:
-        if file_path is None:
-            raise HTTPException(status_code=500, detail="File source upload produced no audio file.")
-        track.file_path = file_path
-        track.storage_backend = storage_backend
-        track.duration = duration
-    track.status = next_status
-    track.requested_revision_type = None  # Clear after upload
-    prepare_review_assignments_for_stage_entry(
-        db,
-        album,
-        track,
-        next_status,
-        background_tasks,
-    )
-    db.add(
-        _source_version_create(
-            track,
-            current_user,
-            file_path,
-            duration,
-            revision_notes=revision_notes or None,
-            storage_backend=storage_backend,
-            source_kind=source_kind,
-        )
-    )
-
-    event_payload: dict[str, object] = {"version": track.version, "workflow_cycle": track.workflow_cycle}
-    if source_kind != "file":
-        event_payload["source_kind"] = source_kind
-    if resolved_ids:
-        event_payload["resolved_issue_ids"] = resolved_ids
-    if resolution_note:
-        event_payload["resolution_note"] = resolution_note
-
-    log_track_event(
-        db,
-        track,
-        current_user,
-        "source_version_uploaded",
-        from_status=previous_status,
-        to_status=next_status,
-        payload=event_payload,
-    )
-
-
-def _handle_delivery_status(
-    db: Session,
-    album: Album,
-    track: Track,
-    current_user: User,
-    delivery_number: int,
-    background_tasks: BackgroundTasks,
-) -> None:
-    """Advance track status after a master delivery submission.
-
-    When the current step has ``require_confirmation=True`` the track stays
-    put until the mastering engineer explicitly confirms the delivery.
-    Otherwise it advances via the workflow engine.
-    """
-    previous_status = track.status
-    next_status = engine_delivery_upload(album, track)
-    if next_status is None:
-        log_track_event(
-            db, track, current_user, "master_delivery_uploaded",
-            from_status=previous_status, to_status=track.status,
-            payload={"delivery_number": delivery_number, "awaiting_confirmation": True},
-        )
-        # Notify mastering engineer that delivery needs confirmation
-        notify(db, [album.mastering_engineer_id], "delivery_awaiting_confirmation",
-               "母带交付待确认",
-               f"「{track.title}」的母带交付已提交，请确认后继续流程",
-               related_track_id=track.id,
-               background_tasks=background_tasks, album_id=track.album_id,
-               webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
-        return
-    track.status = next_status
-    log_track_event(
-        db, track, current_user, "master_delivery_uploaded",
-        from_status=previous_status, to_status=track.status,
-        payload={"delivery_number": delivery_number},
-    )
-    notify_targets = [
-        *album_manager_user_ids(db, album),
-        *track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id),
-    ]
-    notify(db, notify_targets, "track_status_changed", "母带交付已提交",
-           f"「{track.title}」母带交付已提交，等待审核", related_track_id=track.id,
-           background_tasks=background_tasks, album_id=track.album_id,
-           webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
-
-
 def _track_list_item(
     track: Track,
     user: User,
@@ -424,23 +212,13 @@ def _track_list_item(
     )
 
 
-def _dedupe_user_ids(user_ids: list[int]) -> list[int]:
-    deduped: list[int] = []
-    seen: set[int] = set()
-    for uid in user_ids:
-        if uid in seen:
-            continue
-        seen.add(uid)
-        deduped.append(uid)
-    return deduped
-
 def _validated_composer_ids(
     db: Session,
     *,
     album: Album,
     composer_ids: list[int] | None,
 ) -> list[int]:
-    ordered = _dedupe_user_ids(composer_ids or [])
+    ordered = dedupe_user_ids(composer_ids or [])
     if not ordered:
         return []
     active_ids = set(
@@ -607,10 +385,9 @@ def _is_mastering_revision_step(config: object, step: object) -> bool:
     return_to = getattr(step, "return_to", None)
     if not return_to:
         return False
-    from app.workflow_engine import get_step_by_id, get_steps
 
     return_step = get_step_by_id(get_steps(config), return_to)
-    return bool(return_step and _target_is_mastering_related(return_step))
+    return bool(return_step and target_is_mastering_related(return_step))
 
 
 def _ensure_file_upload_allowed_for_revision_type(config: object, step: object, track: Track) -> None:
@@ -701,233 +478,6 @@ def _ensure_delivery_upload_permission(track: Track, album: Album, current_user:
         raise HTTPException(status_code=403, detail="Only the album mastering engineer can upload this delivery.")
 
 
-def _pending_source_followup_request(db: Session, track_id: int) -> SourceFollowupRequest | None:
-    return db.scalar(
-        select(SourceFollowupRequest)
-        .where(
-            SourceFollowupRequest.track_id == track_id,
-            SourceFollowupRequest.status == "pending",
-        )
-        .order_by(SourceFollowupRequest.created_at.desc())
-    )
-
-
-def _ensure_source_followup_request_allowed(
-    db: Session,
-    *,
-    track: Track,
-    album: Album,
-    current_user: User,
-) -> None:
-    if not album.quick_followup_enabled:
-        raise HTTPException(status_code=403, detail="Quick follow-up is not enabled for this album.")
-    if track.archived_at is not None:
-        raise HTTPException(status_code=409, detail="Archived tracks cannot request a source follow-up.")
-    if not is_track_composer_actor(track, album, current_user.id, db):
-        raise HTTPException(status_code=403, detail="Only a track composer can request a source follow-up.")
-    if track.status == TrackStatus.REJECTED.value:
-        raise HTTPException(status_code=409, detail="Rejected tracks must use the resubmit flow.")
-    if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
-        raise HTTPException(status_code=409, detail="A source follow-up request is already pending.")
-
-    step = engine_get_current_step(engine_parse_workflow_config(album), track)
-    if step is not None and step.type == "revision":
-        raise HTTPException(status_code=409, detail="Revision stages already allow source uploads.")
-
-    pending_reopen = db.scalar(
-        select(ReopenRequest.id).where(
-            ReopenRequest.track_id == track.id,
-            ReopenRequest.status == "pending",
-        )
-    )
-    if pending_reopen is not None:
-        raise HTTPException(status_code=409, detail="A reopen request is already pending.")
-    if _pending_source_followup_request(db, track.id) is not None:
-        raise HTTPException(status_code=409, detail="A source follow-up request is already pending.")
-
-
-def _delete_source_followup_draft(req: SourceFollowupRequest) -> None:
-    try:
-        if req.staged_storage_backend == "r2":
-            from app.services.r2 import delete_object
-
-            delete_object(req.staged_file_path)
-        else:
-            Path(req.staged_file_path).unlink(missing_ok=True)
-    except OSError:
-        logger.warning("Failed to delete source follow-up draft %s", req.staged_file_path, exc_info=True)
-
-
-def _create_source_followup_request(
-    db: Session,
-    *,
-    album: Album,
-    track: Track,
-    current_user: User,
-    background_tasks: BackgroundTasks,
-    reason: str,
-    file_path: str,
-    storage_backend: str,
-    duration: float | None,
-) -> TrackRead:
-    clean_reason = reason.strip()
-    if not clean_reason:
-        raise HTTPException(status_code=422, detail="A source follow-up reason is required.")
-
-    _ensure_source_followup_request_allowed(
-        db,
-        track=track,
-        album=album,
-        current_user=current_user,
-    )
-
-    previous_status = track.status
-    req = SourceFollowupRequest(
-        track_id=track.id,
-        requested_by_id=current_user.id,
-        previous_status=previous_status,
-        reason=clean_reason,
-        staged_file_path=file_path,
-        staged_storage_backend=storage_backend,
-        staged_duration=duration,
-    )
-    track.status = TrackStatus.SOURCE_FOLLOWUP_PENDING.value
-    db.add(req)
-    db.flush()
-
-    log_track_event(
-        db,
-        track,
-        current_user,
-        "source_followup_requested",
-        from_status=previous_status,
-        to_status=track.status,
-        payload={"request_id": req.id},
-    )
-    notify_targets = album_manager_user_ids(db, album)
-    if album.mastering_engineer_id:
-        notify_targets.add(album.mastering_engineer_id)
-    notify_targets.discard(None)
-    notify_targets.discard(current_user.id)
-    if notify_targets:
-        notify(
-            db,
-            list(notify_targets),
-            "source_followup_request",
-            "源音频补交申请",
-            f"{current_user.display_name} 请求为「{track.title}」补交新的源音频。",
-            related_track_id=track.id,
-            background_tasks=background_tasks,
-            album_id=track.album_id,
-            webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name},
-        )
-    db.commit()
-    db.refresh(track)
-    broadcast_track_updated(background_tasks, track.id)
-    return build_track_read(track, current_user, album, db=db)
-
-
-def _target_is_mastering_related(step: object) -> bool:
-    step_id = getattr(step, "id", "")
-    ui_variant = getattr(step, "ui_variant", None)
-    return (
-        getattr(step, "type", None) == "delivery"
-        or ui_variant == "mastering"
-        or "master" in step_id
-        or "mastering" in step_id
-    )
-
-
-def _validate_source_followup_target(album: Album, target_stage_id: str):
-    from app.workflow_engine import get_step_by_id, get_steps, should_new_cycle
-
-    config = engine_parse_workflow_config(album)
-    steps = get_steps(config)
-    target_step = get_step_by_id(steps, target_stage_id)
-    if target_step is None:
-        raise HTTPException(status_code=400, detail="Target stage is not part of this album workflow.")
-    if target_step.type == "revision":
-        raise HTTPException(status_code=400, detail="Source follow-up cannot target a revision stage.")
-    if not should_new_cycle(steps, target_step):
-        raise HTTPException(status_code=400, detail="Source follow-up must return before or at the first delivery stage.")
-    return target_step
-
-
-def _ensure_source_followup_decider(
-    *,
-    album: Album,
-    current_user: User,
-    target_step: object | None = None,
-) -> None:
-    db = Session.object_session(album)
-    if db is not None and is_album_manager(album, current_user, db):
-        return
-    if (
-        target_step is not None
-        and album.mastering_engineer_id == current_user.id
-        and _target_is_mastering_related(target_step)
-    ):
-        return
-    if target_step is None and album.mastering_engineer_id == current_user.id:
-        return
-    raise HTTPException(status_code=403, detail="Only the producer or relevant mastering engineer can decide this request.")
-
-
-def _apply_source_followup_request(
-    db: Session,
-    *,
-    album: Album,
-    track: Track,
-    req: SourceFollowupRequest,
-    actor: User,
-    target_stage_id: str,
-    background_tasks: BackgroundTasks,
-) -> None:
-    from app.workflow_engine import execute_reopen
-
-    target_step = _validate_source_followup_target(album, target_stage_id)
-    _ensure_source_followup_decider(album=album, current_user=actor, target_step=target_step)
-
-    execute_reopen(db, album, track, actor, target_stage_id, background_tasks)
-    track.version += 1
-    track.file_path = req.staged_file_path
-    track.storage_backend = req.staged_storage_backend
-    track.duration = req.staged_duration
-
-    requester = db.get(User, req.requested_by_id) or actor
-    source_version = _source_version_create(
-        track,
-        requester,
-        req.staged_file_path,
-        req.staged_duration,
-        revision_notes=req.reason,
-        storage_backend=req.staged_storage_backend,
-    )
-    db.add(source_version)
-    db.flush()
-
-    req.status = "applied"
-    req.target_stage_id = target_stage_id
-    req.decided_by_id = actor.id
-    req.decided_at = datetime.now(timezone.utc)
-    req.applied_source_version_id = source_version.id
-
-    log_track_event(
-        db,
-        track,
-        actor,
-        "source_followup_applied",
-        from_status=TrackStatus.SOURCE_FOLLOWUP_PENDING.value,
-        to_status=track.status,
-        payload={
-            "request_id": req.id,
-            "target_stage": target_stage_id,
-            "version": track.version,
-            "workflow_cycle": track.workflow_cycle,
-        },
-    )
-
-
 def _ensure_delivery_confirm_permission(track: Track, album: Album, current_user: User) -> None:
     config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
@@ -959,15 +509,7 @@ def _serve_path(path_str: str, filename_prefix: str, *, immutable: bool = False)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     if not file_path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file missing from disk.")
-    mime_map = {
-        ".mp3": "audio/mpeg",
-        ".wav": "audio/wav",
-        ".flac": "audio/flac",
-        ".ogg": "audio/ogg",
-        ".aac": "audio/aac",
-        ".m4a": "audio/mp4",
-    }
-    media_type = mime_map.get(file_path.suffix.lower(), "audio/octet-stream")
+    media_type = AUDIO_MIME_MAP.get(file_path.suffix.lower(), "audio/octet-stream")
 
     # Build a stable ETag from file path + size + mtime so browsers can cache.
     stat = file_path.stat()
@@ -1080,7 +622,7 @@ def create_track(
     db.flush()
     _replace_track_composer_links(db, track, platform_composer_ids)
     _replace_track_external_composer_links(db, track, external_names)
-    db.add(_source_version_create(track, current_user, file_path, duration))
+    db.add(create_source_version(track, current_user, file_path, duration))
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
 
     # Notify the album producer about the new submission
@@ -1382,7 +924,7 @@ def confirm_source_version_upload(
     if params.duration is not None and duration is None:
         duration = params.duration
 
-    _finalize_source_version_upload(
+    finalize_source_version_upload(
         db,
         album=album,
         track=track,
@@ -1423,7 +965,7 @@ def request_source_followup_upload(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    _ensure_source_followup_request_allowed(db, track=track, album=album, current_user=current_user)
+    ensure_source_followup_request_allowed(db, track=track, album=album, current_user=current_user)
 
     from app.services.r2 import make_object_key
 
@@ -1445,7 +987,7 @@ def confirm_source_followup_upload(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    _ensure_source_followup_request_allowed(db, track=track, album=album, current_user=current_user)
+    ensure_source_followup_request_allowed(db, track=track, album=album, current_user=current_user)
     _validate_r2_object_key(
         params.object_key,
         expected_prefix=f"tracks/{track_id}/source-followups/{current_user.id}",
@@ -1533,7 +1075,7 @@ def confirm_master_delivery_upload(
         uploaded_by_id=current_user.id,
     )
     db.add(delivery)
-    _handle_delivery_status(db, album, track, current_user, delivery_number, background_tasks)
+    handle_delivery_status(db, album, track, current_user, delivery_number, background_tasks)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
@@ -1548,8 +1090,6 @@ def confirm_delivery(
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
     """Mastering engineer confirms a submitted delivery after reviewing it."""
-    from app.workflow_engine import execute_delivery_confirm
-
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
@@ -1560,6 +1100,20 @@ def confirm_delivery(
         raise HTTPException(status_code=404, detail="Delivery not found.")
     if delivery.confirmed_at is not None:
         raise HTTPException(status_code=409, detail="Delivery already confirmed.")
+    # Only the latest delivery in the current workflow cycle may be confirmed.
+    # Confirming a stale delivery would let the mastering engineer advance the
+    # track from an outdated upload.
+    latest_in_cycle = db.scalar(
+        select(MasterDelivery)
+        .where(
+            MasterDelivery.track_id == track_id,
+            MasterDelivery.workflow_cycle == track.workflow_cycle,
+        )
+        .order_by(MasterDelivery.delivery_number.desc(), MasterDelivery.id.desc())
+        .limit(1)
+    )
+    if latest_in_cycle is None or latest_in_cycle.id != delivery.id:
+        raise HTTPException(status_code=409, detail="Only the latest master delivery can be confirmed.")
     _ensure_delivery_confirm_permission(track, album, current_user)
 
     delivery.confirmed_at = datetime.now(timezone.utc)
@@ -1660,7 +1214,7 @@ def list_tracks(
             select(StageAssignment.track_id).where(
                 StageAssignment.track_id.in_(track_ids),
                 StageAssignment.user_id == current_user.id,
-                StageAssignment.status.in_(["pending", "completed"]),
+                StageAssignment.status.in_(ASSIGNMENT_ACTIVE_STATUSES),
             )
         ).all()
     ) if track_ids else set()
@@ -1905,6 +1459,13 @@ def workflow_transition(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
+    # Unified permission pre-check. execute_transition re-runs the same gate as
+    # defence-in-depth; keeping it here means the endpoint rejects unauthorised
+    # actors before any state is mutated.
+    engine_require_can_act(
+        engine_parse_workflow_config(album), track, current_user, album,
+        payload.decision, db=db,
+    )
     engine_execute_transition(
         db, album, track, current_user, payload.decision, background_tasks,
         revision_type=payload.revision_type
@@ -1914,8 +1475,83 @@ def workflow_transition(
     broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
 
+@router.post("/{track_id}/force-status", response_model=TrackRead)
+def force_track_progress_status(
+    track_id: int,
+    payload: TrackForceStatusRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    require_circle_bound_album_manager(album, current_user, db)
+    if album.archived_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Archived albums cannot have track progress adjusted.")
+    if track.archived_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Archived tracks cannot have progress adjusted.")
+
+    apply_force_track_status(
+        db,
+        album,
+        track,
+        current_user,
+        payload.new_status,
+        payload.reason,
+        background_tasks,
+        allowed_terminal_statuses={TrackStatus.COMPLETED.value},
+        event_type="track_force_status",
+    )
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track_id)
+    return build_track_read(track, current_user, album, db=db)
+
 
 # ── Stage assignment endpoints ──────────────────────────────────────────────
+
+
+@router.get("/{track_id}/reviewer-candidates", response_model=list[ReviewerCandidateRead])
+def list_reviewer_candidates(
+    track_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[ReviewerCandidateRead]:
+    """Users the album manager may assign as reviewers for this track.
+
+    Scope matches the server-side validation in ``assign_reviewer``: circle
+    members (plus the circle owner) for circle-bound albums, album members
+    plus producer/mastering engineer otherwise. Track composers and inactive
+    users are excluded.
+    """
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if not is_album_manager(album, current_user, db):
+        raise HTTPException(status_code=403, detail="Only the album manager can view reviewer candidates.")
+
+    candidate_ids = album_reviewer_scope_user_ids(db, album) - track_composer_ids(track, db)
+    candidate_ids.discard(None)
+    if not candidate_ids:
+        return []
+
+    users = list(
+        db.scalars(
+            select(User).where(
+                User.id.in_(candidate_ids),
+                User.deleted_at.is_(None),
+                User.suspended_at.is_(None),
+            )
+        ).all()
+    )
+    users.sort(key=lambda u: ((u.display_name or u.username or "").lower(), u.id))
+    return [
+        ReviewerCandidateRead(user_id=user.id, user=UserRead.model_validate(user))
+        for user in users
+    ]
 
 
 @router.post("/{track_id}/assign-reviewer", response_model=list[StageAssignmentRead])
@@ -1934,13 +1570,12 @@ def assign_reviewer(
     if not is_album_manager(album, current_user, db):
         raise HTTPException(status_code=403, detail="Only the album producer can assign reviewers.")
 
-    from app.workflow_engine import get_current_step, parse_workflow_config
-    config = parse_workflow_config(album)
-    step = get_current_step(config, track)
+    config = engine_parse_workflow_config(album)
+    step = engine_get_current_step(config, track)
     if step is None or step.type != "review":
         raise HTTPException(status_code=409, detail="Track is not in a review stage.")
 
-    selected_user_ids = _dedupe_user_ids(payload.user_ids)
+    selected_user_ids = dedupe_user_ids(payload.user_ids)
     reviewer_limit = max(1, step.required_reviewer_count or 1)
     _validate_manual_reviewer_selection(
         user_ids=selected_user_ids,
@@ -1970,7 +1605,7 @@ def assign_reviewer(
             track_id=track_id,
             stage_id=step.id,
             user_id=uid,
-            status="pending",
+            status=StageAssignmentStatus.PENDING.value,
             cancellation_reason=None,
             assigned_at=now,
         )
@@ -2039,8 +1674,6 @@ def reassign_reviewer(
     either assigns the specified user (if payload.user_id is set) or
     re-runs the normal assignment logic for the current stage.
     """
-    from app.workflow_engine import assign_peer_reviewer_for_step, get_current_step, parse_workflow_config
-
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
@@ -2048,8 +1681,8 @@ def reassign_reviewer(
     if not is_album_manager(album, current_user, db):
         raise HTTPException(status_code=403, detail="Only the album producer can reassign reviewers.")
 
-    config = parse_workflow_config(album)
-    step = get_current_step(config, track)
+    config = engine_parse_workflow_config(album)
+    step = engine_get_current_step(config, track)
     if step is None or step.type != "review":
         raise HTTPException(status_code=409, detail="Track is not in a review stage.")
 
@@ -2059,7 +1692,7 @@ def reassign_reviewer(
     elif payload.user_id is not None:
         requested_user_ids = [payload.user_id]
 
-    deduped_user_ids = _dedupe_user_ids(requested_user_ids)
+    deduped_user_ids = dedupe_user_ids(requested_user_ids)
     reviewer_limit = max(1, step.required_reviewer_count or 1)
 
     if deduped_user_ids:
@@ -2076,7 +1709,7 @@ def reassign_reviewer(
         select(StageAssignment.user_id).where(
             StageAssignment.track_id == track_id,
             StageAssignment.stage_id == step.id,
-            StageAssignment.status == "pending",
+            StageAssignment.status == StageAssignmentStatus.PENDING.value,
         )
     ).all())
 
@@ -2085,14 +1718,11 @@ def reassign_reviewer(
     if deduped_user_ids:
         # Cancel ALL existing assignments for this step (pending + completed)
         # so reassignment always starts from a clean slate.
-        db.execute(
-            update(StageAssignment)
-            .where(
-                StageAssignment.track_id == track_id,
-                StageAssignment.stage_id == step.id,
-                StageAssignment.status.in_(["pending", "completed"]),
-            )
-            .values(status="cancelled", cancellation_reason="reassigned")
+        cancel_active_review_assignments(
+            db,
+            track_id,
+            step.id,
+            reason=ASSIGNMENT_CANCEL_REASON_REASSIGNED,
         )
 
         now = datetime.now(timezone.utc)
@@ -2103,7 +1733,7 @@ def reassign_reviewer(
                 track_id=track_id,
                 stage_id=step.id,
                 user_id=uid,
-                status="pending",
+                status=StageAssignmentStatus.PENDING.value,
                 cancellation_reason=None,
                 assigned_at=now,
             ))
@@ -2156,7 +1786,7 @@ def create_reopen_request(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if track.status != "completed":
+    if track.status != TrackStatus.COMPLETED:
         raise HTTPException(status_code=409, detail="Only completed tracks can be reopened.")
     if not is_track_composer_actor(track, album, current_user.id, db):
         raise HTTPException(status_code=403, detail="Only a track composer can request a reopen.")
@@ -2165,7 +1795,7 @@ def create_reopen_request(
     existing = db.scalar(
         select(ReopenRequest).where(
             ReopenRequest.track_id == track_id,
-            ReopenRequest.status == "pending",
+            ReopenRequest.status == ReopenRequestStatus.PENDING.value,
         )
     )
     if existing:
@@ -2177,7 +1807,7 @@ def create_reopen_request(
         target_stage_id=payload.target_stage_id,
         reason=payload.reason,
         mastering_notes=payload.mastering_notes or None,
-        status="pending",
+        status=ReopenRequestStatus.PENDING.value,
     )
     db.add(req)
     notify(db, list(album_manager_user_ids(db, album)), "reopen_request", "请求重新开启曲目",
@@ -2201,13 +1831,11 @@ def preview_reopen(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if track.status != "completed":
+    if track.status != TrackStatus.COMPLETED:
         raise HTTPException(status_code=409, detail="Only completed tracks can be previewed for reopen.")
 
-    from app.workflow_engine import get_step_by_id, get_steps, parse_workflow_config, should_new_cycle
-
     resets = compute_reopen_resets(db, album, track, target_stage_id)
-    config = parse_workflow_config(album)
+    config = engine_parse_workflow_config(album)
     steps = get_steps(config)
     target_step = get_step_by_id(steps, target_stage_id)
     cycle_incremented = target_step is not None and should_new_cycle(steps, target_step)
@@ -2223,27 +1851,21 @@ def reopen_track(
     current_user: User = Depends(get_current_user),
 ) -> TrackRead:
     """Producer or mastering engineer directly reopens a completed track."""
-    from app.workflow_engine import execute_reopen, get_step_by_id, get_steps, parse_workflow_config
-
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if track.status != "completed":
+    if track.status != TrackStatus.COMPLETED:
         raise HTTPException(status_code=409, detail="Only completed tracks can be reopened.")
     if current_user.id != album.mastering_engineer_id and not is_album_manager(album, current_user, db):
         raise HTTPException(status_code=403, detail="Only the producer or mastering engineer can directly reopen.")
 
-    config = parse_workflow_config(album)
+    config = engine_parse_workflow_config(album)
     target_step = get_step_by_id(get_steps(config), payload.target_stage_id)
     if (
         payload.mastering_notes is not None
         and target_step is not None
-        and (
-            target_step.ui_variant == "mastering"
-            or "master" in target_step.id
-            or "mastering" in target_step.id
-        )
+        and target_is_mastering_related(target_step)
     ):
         track.mastering_notes = payload.mastering_notes.strip() or None
 
@@ -2262,12 +1884,10 @@ def decide_reopen_request(
     current_user: User = Depends(get_current_user),
 ) -> ReopenRequestRead:
     """Producer approves or rejects a reopen request."""
-    from app.workflow_engine import execute_reopen
-
     req = db.get(ReopenRequest, request_id)
     if req is None:
         raise HTTPException(status_code=404, detail="Reopen request not found.")
-    if req.status != "pending":
+    if req.status != ReopenRequestStatus.PENDING:
         raise HTTPException(status_code=409, detail="Request already decided.")
 
     track = db.get(Track, req.track_id)
@@ -2277,7 +1897,7 @@ def decide_reopen_request(
     if not is_album_manager(album, current_user, db):
         raise HTTPException(status_code=403, detail="Only the album producer can decide reopen requests.")
 
-    req.status = "approved" if payload.decision == "approve" else "rejected"
+    req.status = ReopenRequestStatus.APPROVED if payload.decision == "approve" else ReopenRequestStatus.REJECTED
     req.decided_by_id = current_user.id
     req.decided_at = datetime.now(timezone.utc)
 
@@ -2313,7 +1933,7 @@ def create_source_followup_request(
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    _ensure_source_followup_request_allowed(db, track=track, album=album, current_user=current_user)
+    ensure_source_followup_request_allowed(db, track=track, album=album, current_user=current_user)
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_followup_{uuid.uuid4().hex[:8]}")
     return _create_source_followup_request(
@@ -2344,13 +1964,13 @@ def decide_source_followup_request(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if req.status != "pending":
+    if req.status != SourceFollowupRequestStatus.PENDING:
         raise HTTPException(status_code=409, detail="This source follow-up request is not pending.")
 
     if payload.decision == "approve":
         if not payload.target_stage_id:
             raise HTTPException(status_code=422, detail="A target stage is required to approve source follow-up.")
-        _apply_source_followup_request(
+        apply_source_followup_request(
             db,
             album=album,
             track=track,
@@ -2371,14 +1991,14 @@ def decide_source_followup_request(
             webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name},
         )
     else:
-        _ensure_source_followup_decider(album=album, current_user=current_user)
+        ensure_source_followup_decider(album=album, current_user=current_user)
         previous_status = track.status
         if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
             track.status = req.previous_status
-        req.status = "rejected"
+        req.status = SourceFollowupRequestStatus.REJECTED
         req.decided_by_id = current_user.id
         req.decided_at = datetime.now(timezone.utc)
-        _delete_source_followup_draft(req)
+        delete_source_followup_draft(req)
         log_track_event(
             db,
             track,
@@ -2420,7 +2040,7 @@ def cancel_source_followup_request(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if req.status != "pending":
+    if req.status != SourceFollowupRequestStatus.PENDING:
         raise HTTPException(status_code=409, detail="This source follow-up request is not pending.")
     if not is_track_composer_actor(track, album, current_user.id, db):
         raise HTTPException(status_code=403, detail="Only a track composer can cancel this source follow-up.")
@@ -2428,9 +2048,9 @@ def cancel_source_followup_request(
     previous_status = track.status
     if track.status == TrackStatus.SOURCE_FOLLOWUP_PENDING.value:
         track.status = req.previous_status
-    req.status = "cancelled"
+    req.status = SourceFollowupRequestStatus.CANCELLED
     req.decided_at = datetime.now(timezone.utc)
-    _delete_source_followup_draft(req)
+    delete_source_followup_draft(req)
     log_track_event(
         db,
         track,
@@ -2464,7 +2084,7 @@ def upload_source_version(
     _ensure_revision_upload_permission(db, track, album, current_user)
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_v{track.version + 1}")
-    _finalize_source_version_upload(
+    finalize_source_version_upload(
         db,
         album=album,
         track=track,
@@ -2504,7 +2124,7 @@ def submit_source_external_link(
     _ensure_external_source_link_permission(db, track, album, current_user)
 
     preserved_storage_backend = track.storage_backend
-    _finalize_source_version_upload(
+    finalize_source_version_upload(
         db,
         album=album,
         track=track,
@@ -2567,7 +2187,7 @@ def upload_master_delivery(
         uploaded_by_id=current_user.id,
     )
     db.add(delivery)
-    _handle_delivery_status(db, album, track, current_user, delivery_number, background_tasks)
+    handle_delivery_status(db, album, track, current_user, delivery_number, background_tasks)
     db.commit()
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
@@ -2584,7 +2204,11 @@ def approve_final_review(
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found.")
     album = ensure_track_visibility(track, current_user, db)
-    if track.status != TrackStatus.FINAL_REVIEW or (
+    current_step = engine_get_current_step(engine_parse_workflow_config(album), track)
+    if (
+        current_step is None
+        or not (current_step.ui_variant == "final_review" or current_step.id == "final_review")
+    ) or (
         not is_album_manager(album, current_user, db) and not is_track_composer_actor(track, album, current_user.id, db)
     ):
         raise HTTPException(status_code=403, detail="Only the producer or a track composer can approve final review.")
@@ -2657,9 +2281,8 @@ def request_return_in_final_review(
         raise HTTPException(status_code=403, detail="Only a non-producer track composer can request a return.")
 
     # Verify track is in a final_review step
-    from app.workflow_engine import get_current_step
-    config = album.workflow_config or {}
-    step = get_current_step(config, track)
+    config = engine_parse_workflow_config(album)
+    step = engine_get_current_step(config, track)
     if step is None or not (step.ui_variant == "final_review" or step.id == "final_review"):
         raise HTTPException(status_code=409, detail="Track is not in a final review step.")
 

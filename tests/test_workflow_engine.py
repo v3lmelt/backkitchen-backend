@@ -19,6 +19,7 @@ from app.workflow_engine import (
     StepDef,
     assign_peer_reviewer_for_step,
     assign_reviewers,
+    can_act,
     compute_reopen_resets,
     execute_delivery_confirm,
     execute_delivery_upload,
@@ -1138,3 +1139,86 @@ def test_execute_reopen_to_final_review_keeps_cycle_and_only_clears_approvals(
     assert delivery.submitter_approved_at is None
     assert db_session.get(MasterDelivery, delivery.id) is not None
     assert db_session.get(type(checklist), checklist.id) is not None
+
+
+def test_can_act_allows_delivery_deliver_for_step_actor(factory):
+    """can_act permits the delivery step actor to issue the ``deliver`` action
+    even though it is excluded from the action-bar allowlist (the router raises
+    a 409 pointing at the upload flow)."""
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status="mastering")
+    config = parse_workflow_config(album)
+
+    assert can_act(config, track, mastering, album, "deliver", db=factory.session) is True
+    assert can_act(config, track, submitter, album, "deliver", db=factory.session) is False
+    # Non-delivery decisions are unaffected.
+    assert can_act(config, track, submitter, album, "request_revision", db=factory.session) is False
+
+
+def test_notify_transition_to_review_step_notifies_all_assigned_reviewers(monkeypatch, db_session, factory):
+    """_notify_transition must notify every reviewer assigned to a review
+    target stage, not just the legacy single peer_reviewer_id column."""
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewer_a = factory.user(username="reviewer_a")
+    reviewer_b = factory.user(username="reviewer_b")
+    workflow_config = {
+        "version": 2,
+        "steps": [
+            {
+                "id": "intake",
+                "label": "Intake",
+                "type": "approval",
+                "ui_variant": "intake",
+                "assignee_role": "producer",
+                "order": 0,
+                "transitions": {"accept": "custom_review"},
+            },
+            {
+                "id": "custom_review",
+                "label": "Custom Review",
+                "type": "review",
+                "ui_variant": "generic",
+                "assignee_role": "peer_reviewer",
+                "order": 1,
+                "transitions": {"pass": "__completed"},
+                "assignment_mode": "fixed",
+                "reviewer_pool": [reviewer_a.id, reviewer_b.id],
+                "required_reviewer_count": 2,
+            },
+        ],
+    }
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, reviewer_a, reviewer_b],
+        workflow_config=workflow_config,
+        checklist_enabled=False,
+    )
+    track = factory.track(album=album, submitter=submitter, status="intake")
+
+    notifications: list[dict] = []
+
+    def capture_notify(_db, recipients, event_type, title, body, *_args, **kwargs):
+        notifications.append({"recipients": list(recipients), "event_type": event_type})
+
+    monkeypatch.setattr("app.workflow_engine.notify", capture_notify)
+
+    execute_transition(db_session, album, track, producer, "accept", BackgroundTasks())
+    db_session.commit()
+
+    assert track.status == "custom_review"
+    status_notifications = [
+        notification for notification in notifications
+        if notification["event_type"] == "track_status_changed"
+    ]
+    assert status_notifications, "expected a track_status_changed notification"
+    recipients: set[int] = set()
+    for notification in status_notifications:
+        recipients.update(notification["recipients"])
+    assert reviewer_a.id in recipients
+    assert reviewer_b.id in recipients

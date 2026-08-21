@@ -25,7 +25,8 @@ from app.schemas.schemas import (
     UserRead,
     UserUpdateProfile,
 )
-from app.security import create_access_token, get_current_user, hash_password, verify_password
+from app.security import bump_session_version, create_access_token, get_current_user, hash_password, verify_password
+from app.services.attachments import ALLOWED_IMAGE_EXTENSIONS, ALLOWED_IMAGE_TYPES
 from app.services.email import send_password_reset_email, send_verification_email
 
 logger = logging.getLogger(__name__)
@@ -235,7 +236,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
     user.password = hash_password(payload.new_password)
-    user.session_version = max(int(user.session_version or 1), 1) + 1
+    bump_session_version(user)
     record.used = True
     db.commit()
     db.refresh(user)
@@ -291,17 +292,14 @@ async def upload_avatar(
     from app.config import MAX_IMAGE_UPLOAD_SIZE, settings
     from app.services.upload import stream_upload
 
-    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
-    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-
-    if file.content_type and file.content_type not in allowed_types:
+    if file.content_type and file.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only JPEG, PNG, WebP, and GIF images are allowed.",
         )
 
     ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
-    if ext not in allowed_extensions:
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported image extension: {ext}",
@@ -351,7 +349,7 @@ def change_password(
     if not verify_password(payload.current_password, current_user.password or ""):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect.")
     current_user.password = hash_password(payload.new_password)
-    current_user.session_version = max(int(current_user.session_version or 1), 1) + 1
+    bump_session_version(current_user)
     db.commit()
 
 
@@ -452,7 +450,7 @@ def delete_account(
         current_user.username = f"{current_user.username}{suffix}"
     if current_user.email:
         current_user.email = f"{current_user.email}{suffix}"
-    current_user.session_version = max(int(current_user.session_version or 1), 1) + 1
+    bump_session_version(current_user)
     # Invalidate any outstanding password reset tokens tied to the original email
     if original_email:
         db.execute(

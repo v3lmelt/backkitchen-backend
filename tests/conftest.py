@@ -29,7 +29,7 @@ from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
 from app.models.invitation import Invitation
 from app.models.notification import Notification
-from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users, workflow_templates
+from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users, workflow, workflow_templates
 from app.security import create_access_token
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
@@ -110,6 +110,7 @@ def client(
     app.include_router(circles.router)
     app.include_router(discussions.router)
     app.include_router(workflow_templates.router)
+    app.include_router(workflow.router)
     app.dependency_overrides[get_db] = override_get_db
     app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
 

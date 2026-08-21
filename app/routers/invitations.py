@@ -1,11 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import exists, insert, literal, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.album import Album
 from app.models.album_member import AlbumMember
-from app.models.invitation import Invitation
+from app.models.circle import Circle, CircleMember
+from app.models.invitation import Invitation, InvitationStatus
 from app.models.user import User
 from app.schemas.schemas import (
     AlbumSummary,
@@ -15,7 +17,8 @@ from app.schemas.schemas import (
 )
 from app.security import get_current_user
 from app.notifications import notify
-from app.workflow import ensure_album_producer, ensure_album_visibility, get_album_member_ids
+from app.services.track_queries import get_album_member_ids
+from app.track_permissions import ensure_album_manager, ensure_album_visibility
 from app.workflow_user_scope import circle_workflow_user_ids
 
 router = APIRouter(tags=["invitations"])
@@ -44,7 +47,7 @@ def create_invitation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> InvitationRead:
-    album = ensure_album_producer(album_id, current_user, db)
+    album = ensure_album_manager(album_id, current_user, db)
 
     invited_user = db.get(User, payload.user_id)
     if invited_user is None:
@@ -67,7 +70,7 @@ def create_invitation(
         select(Invitation).where(
             Invitation.album_id == album_id,
             Invitation.user_id == payload.user_id,
-            Invitation.status == "pending",
+            Invitation.status == InvitationStatus.PENDING.value,
         )
     ).first()
     if existing:
@@ -80,7 +83,7 @@ def create_invitation(
         album_id=album_id,
         user_id=payload.user_id,
         invited_by_user_id=current_user.id,
-        status="pending",
+        status=InvitationStatus.PENDING.value,
     )
     db.add(invitation)
     db.commit()
@@ -94,12 +97,12 @@ def list_album_invitations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[InvitationRead]:
-    ensure_album_producer(album_id, current_user, db)
+    ensure_album_manager(album_id, current_user, db)
 
     invitations = list(
         db.scalars(
             select(Invitation)
-            .where(Invitation.album_id == album_id, Invitation.status == "pending")
+            .where(Invitation.album_id == album_id, Invitation.status == InvitationStatus.PENDING.value)
             .order_by(Invitation.created_at.desc())
         ).all()
     )
@@ -114,7 +117,7 @@ def list_my_invitations(
     invitations = list(
         db.scalars(
             select(Invitation)
-            .where(Invitation.user_id == current_user.id, Invitation.status == "pending")
+            .where(Invitation.user_id == current_user.id, Invitation.status == InvitationStatus.PENDING.value)
             .order_by(Invitation.created_at.desc())
         ).all()
     )
@@ -135,19 +138,59 @@ def accept_invitation(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not the invited user.",
         )
-    if invitation.status != "pending":
+    if invitation.status != InvitationStatus.PENDING:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This invitation is no longer pending.",
         )
 
-    db.add(AlbumMember(album_id=invitation.album_id, user_id=current_user.id))
-    invitation.status = "accepted"
-
     album = db.get(Album, invitation.album_id)
-    album_title = album.title if album else "未知专辑"
+    if album is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
+
+    member_insert = insert(AlbumMember)
+    if album.circle_id is not None:
+        has_current_circle_access = or_(
+            exists(
+                select(CircleMember.id).where(
+                    CircleMember.circle_id == album.circle_id,
+                    CircleMember.user_id == current_user.id,
+                )
+            ),
+            exists(
+                select(Circle.id).where(
+                    Circle.id == album.circle_id,
+                    Circle.created_by == current_user.id,
+                )
+            ),
+        )
+        member_insert = member_insert.from_select(
+            ["album_id", "user_id"],
+            select(literal(album.id), literal(current_user.id)).where(has_current_circle_access),
+        )
+    else:
+        member_insert = member_insert.values(album_id=album.id, user_id=current_user.id)
+
+    try:
+        result = db.execute(member_insert)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User is already a member of this album.",
+        ) from exc
+
+    if album.circle_id is not None and result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This invitation is no longer valid because you are not a member of the circle.",
+        )
+
+    invitation.status = InvitationStatus.ACCEPTED
+
     notify(db, [invitation.invited_by_user_id], "invitation_accepted", "邀请已被接受",
-           f"{current_user.display_name or current_user.username} 已接受加入「{album_title}」的邀请")
+           f"{current_user.display_name or current_user.username} 已接受加入「{album.title}」的邀请")
 
     db.commit()
     db.refresh(invitation)
@@ -168,13 +211,13 @@ def decline_invitation(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not the invited user.",
         )
-    if invitation.status != "pending":
+    if invitation.status != InvitationStatus.PENDING:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This invitation is no longer pending.",
         )
 
-    invitation.status = "declined"
+    invitation.status = InvitationStatus.DECLINED
 
     album = db.get(Album, invitation.album_id)
     album_title = album.title if album else "未知专辑"
@@ -195,7 +238,7 @@ def cancel_invitation(
     invitation = db.get(Invitation, invitation_id)
     if invitation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invitation not found.")
-    ensure_album_producer(invitation.album_id, current_user, db)
+    ensure_album_manager(invitation.album_id, current_user, db)
 
     db.delete(invitation)
     db.commit()

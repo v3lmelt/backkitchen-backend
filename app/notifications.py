@@ -11,7 +11,8 @@ from app.realtime import broadcast_notifications_updated
 from app.models.album import Album
 from app.models.notification import Notification
 from app.services.email import send_composer_notification_email
-from app.services.webhook import build_webhook_payload, post_webhook
+from app.services.track_queries import track_composer_ordered_ids
+from app.services.webhook import NotificationContext, build_webhook_payload, post_webhook
 
 COMPOSER_EMAIL_EVENTS = {"new_issue", "new_comment", "revision_requested"}
 
@@ -79,7 +80,7 @@ def notify(
     *,
     background_tasks: BackgroundTasks | None = None,
     album_id: int | None = None,
-    webhook_context: dict | None = None,
+    webhook_context: NotificationContext | None = None,
 ) -> None:
     """Create in-app notifications and optionally dispatch webhook."""
     seen: set[int] = set()
@@ -114,7 +115,7 @@ def notify(
         )
 
 
-def _composer_email_event_type(event_type: str, webhook_context: dict | None = None) -> str | None:
+def _composer_email_event_type(event_type: str, webhook_context: NotificationContext | None = None) -> str | None:
     context_event = (webhook_context or {}).get("composer_email_event")
     if context_event in COMPOSER_EMAIL_EVENTS:
         return context_event
@@ -141,7 +142,7 @@ def _try_dispatch_composer_email(
     body: str,
     track_id: int | None,
     issue_id: int | None,
-    webhook_context: dict | None = None,
+    webhook_context: NotificationContext | None = None,
 ) -> None:
     album = db.get(Album, album_id)
     if not album or not album.webhook_config:
@@ -176,7 +177,6 @@ def _try_dispatch_composer_email(
 
     from app.models.track import Track
     from app.models.user import User
-    from app.workflow import track_composer_ordered_ids
 
     track = db.get(Track, resolved_track_id)
     if track is None or track.album_id != album_id:
@@ -247,7 +247,7 @@ def _try_dispatch_webhook(
     track_id: int | None,
     issue_id: int | None,
     notified_user_ids: list[int] | None = None,
-    webhook_context: dict | None = None,
+    webhook_context: NotificationContext | None = None,
 ) -> None:
     album = db.get(Album, album_id)
     if not album or not album.webhook_config:
@@ -264,7 +264,7 @@ def _try_dispatch_webhook(
         return
 
     # Build the set of *involved* users (notified + actor) for filter checks
-    ctx = dict(webhook_context) if webhook_context else {}
+    ctx: NotificationContext = dict(webhook_context) if webhook_context else {}
     involved_ids: set[int] = set(notified_user_ids or [])
     actor_id = ctx.get("actor_id")
     if actor_id:

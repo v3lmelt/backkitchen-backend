@@ -3,15 +3,76 @@ import sys
 from io import BytesIO
 from types import SimpleNamespace
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import func, select
 
 from app.models.comment import Comment
 from app.models.issue import Issue, IssuePhase, IssueStatus
 from app.models.issue_audio import IssueAudio
+from app.models.notification import Notification
 from app.models.stage_assignment import StageAssignment
 from app.models.track import TrackStatus
 from app.models.track_source_version import TrackSourceVersion
+from app.models.workflow_event import WorkflowEvent
 from app.security import create_access_token
+
+
+INTERNAL_VISIBILITY_ERROR = "visibility='internal' is only allowed during multi-review steps."
+
+
+def _setup_review_track(
+    db_session,
+    factory,
+    *,
+    reviewer_count: int,
+    required_reviewer_count: int | None = None,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user(username="submitter")
+    reviewers = [factory.user(username=f"reviewer_{index}") for index in range(reviewer_count)]
+    album = factory.album(
+        producer=producer,
+        mastering_engineer=mastering,
+        members=[submitter, *reviewers],
+    )
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewers[0],
+    )
+    album.workflow_config = json.dumps(
+        {
+            "version": 2,
+            "steps": [
+                {
+                    "id": "peer_review",
+                    "label": "Peer Review",
+                    "type": "review",
+                    "ui_variant": "peer_review",
+                    "assignee_role": "peer_reviewer",
+                    "order": 0,
+                    "transitions": {"pass": "__completed"},
+                    "assignment_mode": "manual",
+                    "required_reviewer_count": required_reviewer_count or reviewer_count,
+                },
+            ],
+        }
+    )
+    db_session.add_all(
+        [
+            StageAssignment(
+                track_id=track.id,
+                stage_id="peer_review",
+                user_id=reviewer.id,
+                status="pending",
+            )
+            for reviewer in reviewers
+        ]
+    )
+    db_session.commit()
+    return track, submitter, reviewers
 
 
 def test_create_peer_issue_binds_to_current_source_version(client, db_session, factory, auth_headers):
@@ -103,6 +164,156 @@ def test_create_general_issue_no_markers(client, factory, auth_headers):
 
     assert response.status_code == 201
     assert response.json()["markers"] == []
+
+
+@pytest.mark.parametrize(
+    ("track_status", "phase"),
+    [
+        ("producer_gate", "producer"),
+        (TrackStatus.FINAL_REVIEW, "final_review"),
+    ],
+)
+def test_create_approval_issue_rejects_internal_before_any_side_effect(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+    upload_dir,
+    track_status,
+    phase,
+):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter])
+    track = factory.track(album=album, submitter=submitter, status=track_status)
+    counts_before = (
+        db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id)),
+        db_session.scalar(select(func.count(WorkflowEvent.id)).where(WorkflowEvent.track_id == track.id)),
+        db_session.scalar(select(func.count(Notification.id)).where(Notification.related_track_id == track.id)),
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(producer),
+        data={
+            "title": "Internal approval note",
+            "description": "Must not be silently published.",
+            "phase": phase,
+            "severity": "major",
+            "visibility": "internal",
+            "markers_json": "[]",
+        },
+        files={"images": ("approval.png", BytesIO(b"pngdata"), "image/png")},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": INTERNAL_VISIBILITY_ERROR}
+    assert (
+        db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id)),
+        db_session.scalar(select(func.count(WorkflowEvent.id)).where(WorkflowEvent.track_id == track.id)),
+        db_session.scalar(select(func.count(Notification.id)).where(Notification.related_track_id == track.id)),
+    ) == counts_before
+    assert not (upload_dir / "issue_images").exists()
+
+
+def test_create_single_reviewer_issue_rejects_explicit_internal_json(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    track, _submitter, reviewers = _setup_review_track(db_session, factory, reviewer_count=1)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewers[0]),
+        json={
+            "title": "Reviewer-only note",
+            "description": "Single-review issues cannot be internal.",
+            "phase": "peer",
+            "severity": "major",
+            "visibility": "internal",
+            "markers": [],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": INTERNAL_VISIBILITY_ERROR}
+    assert db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id)) == 0
+
+
+def test_create_multi_reviewer_internal_issue_stays_pending_and_hidden(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    track, submitter, reviewers = _setup_review_track(
+        db_session,
+        factory,
+        reviewer_count=2,
+        required_reviewer_count=1,
+    )
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewers[0]),
+        data={
+            "title": "Needs reviewer discussion",
+            "description": "Keep this between reviewers for now.",
+            "phase": "peer",
+            "severity": "major",
+            "visibility": "internal",
+            "markers_json": "[]",
+        },
+        files={"images": ("internal.png", BytesIO(b"pngdata"), "image/png")},
+    )
+
+    assert response.status_code == 201
+    issue_id = response.json()["id"]
+    assert response.json()["status"] == IssueStatus.PENDING_DISCUSSION.value
+    assert client.get(f"/api/issues/{issue_id}", headers=auth_headers(submitter)).status_code == 404
+    submitter_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
+    assert submitter_list.status_code == 200
+    assert all(issue["id"] != issue_id for issue in submitter_list.json())
+    assert db_session.scalar(
+        select(func.count(Notification.id)).where(Notification.related_track_id == track.id)
+    ) == 0
+
+
+def test_create_multi_reviewer_public_issue_stays_open_and_visible(
+    client,
+    db_session,
+    factory,
+    auth_headers,
+):
+    track, submitter, reviewers = _setup_review_track(db_session, factory, reviewer_count=2)
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewers[0]),
+        data={
+            "title": "Public review issue",
+            "description": "The submitter should see this immediately.",
+            "phase": "peer",
+            "severity": "major",
+            "visibility": "public",
+            "markers_json": "[]",
+        },
+        files={"images": ("public.png", BytesIO(b"pngdata"), "image/png")},
+    )
+
+    assert response.status_code == 201
+    issue_id = response.json()["id"]
+    assert response.json()["status"] == IssueStatus.OPEN.value
+    assert client.get(f"/api/issues/{issue_id}", headers=auth_headers(submitter)).status_code == 200
+    submitter_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
+    assert submitter_list.status_code == 200
+    assert any(issue["id"] == issue_id for issue in submitter_list.json())
+    assert db_session.scalar(
+        select(func.count(Notification.id)).where(Notification.related_track_id == track.id)
+    ) >= 1
 
 
 def test_create_multi_marker_issue(client, factory, auth_headers):
@@ -339,6 +550,145 @@ def test_create_issue_returns_protected_audio_urls_for_local_uploads(client, fac
     assert download.status_code == 200
     assert download.content == b"RIFFissue"
     assert download.headers["content-type"].startswith("audio/wav")
+
+
+def test_create_issue_accepts_m4a_and_wma_audio_types(client, factory, auth_headers):
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+
+    # Browsers send these MIME types for .m4a/.wma files; the direct-upload
+    # path validates against ALLOWED_AUDIO_TYPES (the extension check alone is
+    # not enough, so issue audio for these formats previously 422'd).
+    for index, (filename, content_type) in enumerate([
+        ("note.m4a", "audio/mp4"),
+        ("note-2.m4a", "audio/x-m4a"),
+        ("note.wma", "audio/x-ms-wma"),
+    ]):
+        response = client.post(
+            f"/api/tracks/{track.id}/issues",
+            headers=auth_headers(reviewer),
+            data={
+                "title": f"Clicks {index}",
+                "description": "See attached example",
+                "phase": "peer",
+                "severity": "major",
+                "markers_json": "[]",
+            },
+            files=[("audios", (filename, BytesIO(b"audiodata"), content_type))],
+        )
+        assert response.status_code == 201, (content_type, response.text)
+        assert len(response.json()["audios"]) == 1
+
+
+def test_create_issue_rejects_r2_audio_key_from_another_track(
+    client, db_session, factory, auth_headers, monkeypatch
+):
+    monkeypatch.setattr("app.routers.issues.settings.R2_ENABLED", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.r2",
+        SimpleNamespace(object_exists=lambda key: True),
+    )
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    other_track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    issues_before = db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id))
+
+    # The key belongs to a *different* track's namespace (shared R2 bucket,
+    # predictable key layout) — must be rejected to prevent cross-album leaks.
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        data={
+            "title": "Cross-album audio attempt",
+            "description": "Must be rejected before any side effect.",
+            "phase": "peer",
+            "severity": "major",
+            "markers_json": "[]",
+            "audio_object_keys": f"tracks/{other_track.id}/source/leak.wav",
+            "audio_original_filenames": "leak.wav",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "does not match the expected target" in response.json()["detail"]
+    after = db_session.scalar(select(func.count(Issue.id)).where(Issue.track_id == track.id))
+    assert after == issues_before
+
+
+def test_create_issue_accepts_r2_audio_key_scoped_to_own_track(
+    client, db_session, factory, auth_headers, monkeypatch
+):
+    monkeypatch.setattr("app.routers.issues.settings.R2_ENABLED", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.r2",
+        SimpleNamespace(
+            object_exists=lambda key: True,
+            download_to_temp=lambda key: __import__("pathlib").Path(factory._audio_file(stem="issue-r2", ext=".wav")),
+            public_url=lambda key: f"https://cdn.example.com/{key}",
+        ),
+    )
+    producer = factory.user(role="producer")
+    mastering = factory.user(role="mastering_engineer")
+    submitter = factory.user()
+    reviewer = factory.user(username="reviewer")
+    album = factory.album(producer=producer, mastering_engineer=mastering, members=[submitter, reviewer])
+    track = factory.track(
+        album=album,
+        submitter=submitter,
+        status="peer_review",
+        peer_reviewer=reviewer,
+    )
+    latest_version = db_session.scalars(
+        select(TrackSourceVersion).where(TrackSourceVersion.track_id == track.id)
+    ).first()
+
+    response = client.post(
+        f"/api/tracks/{track.id}/issues",
+        headers=auth_headers(reviewer),
+        data={
+            "title": "R2 audio note",
+            "description": "Attached from this track's own namespace.",
+            "phase": "peer",
+            "severity": "major",
+            "markers_json": "[]",
+            "audio_object_keys": f"tracks/{track.id}/issues/0/note.wav",
+            "audio_original_filenames": "note.wav",
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["source_version_id"] == latest_version.id
+    stored_audio = db_session.scalars(
+        select(IssueAudio).where(IssueAudio.issue_id == body["id"])
+    ).one()
+    assert stored_audio.storage_backend == "r2"
+    assert stored_audio.file_path == f"tracks/{track.id}/issues/0/note.wav"
 
 
 def test_add_comment_returns_protected_audio_urls_for_local_uploads(client, factory, auth_headers):

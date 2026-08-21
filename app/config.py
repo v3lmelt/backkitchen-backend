@@ -14,7 +14,7 @@ MAX_ALBUM_COVER_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB for album covers
 
 # Audio upload constants (shared by issues and discussions routers)
 MAX_AUDIOS_PER_UPLOAD = 3
-ALLOWED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/flac", "audio/aac", "audio/ogg", "audio/x-flac", "audio/x-wav"}
+ALLOWED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/flac", "audio/aac", "audio/ogg", "audio/x-flac", "audio/x-wav", "audio/mp4", "audio/x-m4a", "audio/x-ms-wma"}
 AUDIO_EXT_MAP = {
     "audio/mpeg": ".mp3",
     "audio/wav": ".wav",
@@ -23,7 +23,11 @@ AUDIO_EXT_MAP = {
     "audio/x-flac": ".flac",
     "audio/aac": ".aac",
     "audio/ogg": ".ogg",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/x-ms-wma": ".wma",
 }
+ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a", ".wma"}
 
 
 class Settings(BaseSettings):
