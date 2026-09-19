@@ -1,3 +1,4 @@
+import json
 import hashlib
 import logging
 import re
@@ -5,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, func as sqlfunc, select
 from sqlalchemy.orm import Session, selectinload
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.admin_permissions import has_admin_role
 from app.circle_permissions import album_manager_user_ids, is_album_manager, require_circle_bound_album_manager
 from app.config import ALLOWED_AUDIO_EXTENSIONS, settings
-from app.database import get_db
+from app.database import engine as application_engine, get_db
 from app.models.album import Album
 from app.models.comment import Comment
 from app.models.issue import Issue, IssueStatus
@@ -26,6 +27,7 @@ from app.models.track_composer import TrackComposer, TrackExternalComposer
 from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
+from app.schemas.workflow import ManageReviewRequest
 from app.schemas.schemas import (
     AssignReviewerRequest,
     AuthorNotesUpdate,
@@ -60,6 +62,12 @@ from app.schemas.schemas import (
 )
 from app.workflow_engine import (
     ASSIGNMENT_ACTIVE_STATUSES,
+    flexible_review_rosters,
+    flexible_review_decisions,
+    finalize_flexible_review,
+    review_state_version,
+    review_active_assignments,
+    lock_review_track,
     ASSIGNMENT_CANCEL_REASON_REASSIGNED,
     assign_peer_reviewer_for_step,
     cancel_active_review_assignments,
@@ -103,6 +111,8 @@ from app.services.track_queries import (
     track_composer_actor_ids_for_notify,
     track_composer_ids,
 )
+from app.schemas.audio_analysis import AudioSpecs
+from app.services.audio_analysis import enqueue_audio_analysis
 from app.track_permissions import (
     ensure_album_visibility,
     ensure_track_visibility,
@@ -122,6 +132,26 @@ _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
 
 # Used only for truly immutable URLs (source-version snapshots addressed by numeric ID).
 _AUDIO_CACHE_MAX_AGE = 86400
+
+
+def _schedule_audio_analysis(
+    background_tasks: BackgroundTasks,
+    db: Session,
+    kind: str,
+    record_id: int,
+    prepared_path: str | Path | None = None,
+) -> None:
+    """Queue analysis only for records stored in the application database.
+
+    API tests and embedded callers may override the request session with a
+    separate engine. A process-global worker cannot safely reopen those
+    short-lived databases after the request ends.
+    """
+    if db.get_bind() is not application_engine:
+        if prepared_path is not None:
+            Path(prepared_path).unlink(missing_ok=True)
+        return
+    background_tasks.add_task(enqueue_audio_analysis, kind, record_id, prepared_path)
 
 
 def _validate_playback_scope(scope: str) -> str:
@@ -622,7 +652,9 @@ def create_track(
     db.flush()
     _replace_track_composer_links(db, track, platform_composer_ids)
     _replace_track_external_composer_links(db, track, external_names)
-    db.add(create_source_version(track, current_user, file_path, duration))
+    source_version = create_source_version(track, current_user, file_path, duration)
+    db.add(source_version)
+    db.flush()
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
 
     # Notify the album producer about the new submission
@@ -636,6 +668,7 @@ def create_track(
                webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "source", source_version.id)
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
 
@@ -813,6 +846,7 @@ def confirm_track_upload(
         uploaded_by_id=current_user.id,
     )
     db.add(sv)
+    db.flush()
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
 
 
@@ -834,8 +868,31 @@ def confirm_track_upload(
                webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "source", sv.id)
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
+
+
+@router.patch("/{track_id}/audio-specs", response_model=TrackRead)
+def update_track_audio_specs(
+    track_id: int,
+    background_tasks: BackgroundTasks,
+    payload: AudioSpecs,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if current_user.id != album.mastering_engineer_id and not is_album_manager(album, current_user, db):
+        raise HTTPException(status_code=403, detail="Only the mastering engineer or album managers can edit audio specifications.")
+    track.audio_spec_overrides = payload.model_dump_json()
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track_id)
+    return build_track_read(track, current_user, album, db=db)
+
 
 @router.patch("/{track_id}/composers", response_model=TrackRead)
 def update_track_composers(
@@ -924,7 +981,7 @@ def confirm_source_version_upload(
     if params.duration is not None and duration is None:
         duration = params.duration
 
-    finalize_source_version_upload(
+    source_version = finalize_source_version_upload(
         db,
         album=album,
         track=track,
@@ -945,6 +1002,7 @@ def confirm_source_version_upload(
         len(params.resolved_issue_ids),
     )
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "source", source_version.id)
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
@@ -1075,8 +1133,10 @@ def confirm_master_delivery_upload(
         uploaded_by_id=current_user.id,
     )
     db.add(delivery)
+    db.flush()
     handle_delivery_status(db, album, track, current_user, delivery_number, background_tasks)
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "delivery", delivery.id)
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
 
@@ -1513,6 +1573,78 @@ def force_track_progress_status(
 # ── Stage assignment endpoints ──────────────────────────────────────────────
 
 
+@router.put("/{track_id}/review-management", response_model=TrackRead)
+def manage_review(
+    track_id: int,
+    payload: ManageReviewRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if not is_album_manager(album, current_user, db):
+        raise HTTPException(status_code=403, detail="Only the album manager can manage reviews.")
+    if track.archived_at is not None or album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot be reviewed.")
+    config = engine_parse_workflow_config(album)
+    step = engine_get_current_step(config, track)
+    if step is None or step.id != payload.stage_id or flexible_review_decisions(config, step) is None:
+        raise HTTPException(status_code=409, detail="This stage does not support flexible review.")
+    assignments = review_active_assignments(db, track.id, step.id)
+    if payload.state_version != review_state_version(track, album, assignments):
+        raise HTTPException(status_code=409, detail="Review state changed. Refresh and try again.")
+    lock_review_track(db, track)
+    db.refresh(album)
+    if track.archived_at is not None or album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot be reviewed.")
+    if not is_album_manager(album, current_user, db):
+        raise HTTPException(status_code=403, detail="Only the album manager can manage reviews.")
+    assignments = review_active_assignments(db, track.id, step.id)
+    if payload.state_version != review_state_version(track, album, assignments, revision=track.review_revision - 1):
+        raise HTTPException(status_code=409, detail="Review state changed. Refresh and try again.")
+    user_ids = dedupe_user_ids(payload.user_ids)
+    _validate_manual_reviewer_selection(user_ids=user_ids, track=track, album=album, db=db,
+                                       reviewer_limit=len(user_ids))
+    previous_ids = {a.user_id for a in assignments}
+    desired_ids = set(user_ids)
+    removed = sorted(previous_ids - desired_ids)
+    added = sorted(desired_ids - previous_ids)
+    for assignment in assignments:
+        if assignment.user_id in removed:
+            assignment.status = StageAssignmentStatus.CANCELLED
+            assignment.cancellation_reason = "flexible_removed"
+    db.flush()
+    for uid in added:
+        db.add(StageAssignment(track_id=track.id, stage_id=step.id, user_id=uid,
+                               status="pending", assigned_at=datetime.now(timezone.utc)))
+    rosters = flexible_review_rosters(track)
+    enabled_now = step.id not in rosters
+    rosters[step.id] = user_ids
+    track.flexible_review_stages = json.dumps(rosters)
+    track.peer_reviewer_id = user_ids[0]
+    db.flush()
+    log_track_event(db, track, current_user, "review_roster_updated", payload={
+        "step": step.id, "added_user_ids": added, "removed_user_ids": removed,
+        "user_ids": user_ids, "flexible_enabled": enabled_now,
+    })
+    for recipients, kind, title, message in [
+        (added, "reviewer_assigned", "你被指派为评审人", f"你已被指派评审「{track.title}」"),
+        (removed, "reviewer_reassigned", "评审任务已移除", f"你不再负责评审「{track.title}」"),
+    ]:
+        if recipients:
+            notify(db, recipients, kind, title, message, related_track_id=track.id,
+                   background_tasks=background_tasks, album_id=album.id,
+                   webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
+    finalize_flexible_review(db, album, track, current_user, background_tasks)
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track.id)
+    return build_track_read(track, current_user, album, db=db)
+
+
 @router.get("/{track_id}/reviewer-candidates", response_model=list[ReviewerCandidateRead])
 def list_reviewer_candidates(
     track_id: int,
@@ -1570,6 +1702,11 @@ def assign_reviewer(
     if not is_album_manager(album, current_user, db):
         raise HTTPException(status_code=403, detail="Only the album producer can assign reviewers.")
 
+    lock_review_track(db, track)
+    if track.archived_at is not None or album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot be reviewed.")
+    if track.status in flexible_review_rosters(track):
+        raise HTTPException(status_code=409, detail="Use review management to edit a flexible review roster.")
     config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
     if step is None or step.type != "review":
@@ -1681,6 +1818,11 @@ def reassign_reviewer(
     if not is_album_manager(album, current_user, db):
         raise HTTPException(status_code=403, detail="Only the album producer can reassign reviewers.")
 
+    lock_review_track(db, track)
+    if track.archived_at is not None or album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot be reviewed.")
+    if track.status in flexible_review_rosters(track):
+        raise HTTPException(status_code=409, detail="Use review management to edit a flexible review roster.")
     config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
     if step is None or step.type != "review":
@@ -2021,6 +2163,8 @@ def decide_source_followup_request(
         )
 
     db.commit()
+    if req.applied_source_version_id is not None:
+        _schedule_audio_analysis(background_tasks, db, "source", req.applied_source_version_id)
     db.refresh(track)
     broadcast_track_updated(background_tasks, track.id)
     return build_track_read(track, current_user, album, db=db)
@@ -2084,7 +2228,7 @@ def upload_source_version(
     _ensure_revision_upload_permission(db, track, album, current_user)
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_v{track.version + 1}")
-    finalize_source_version_upload(
+    source_version = finalize_source_version_upload(
         db,
         album=album,
         track=track,
@@ -2105,6 +2249,7 @@ def upload_source_version(
         len(resolved_issue_ids),
     )
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "source", source_version.id)
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
@@ -2187,8 +2332,10 @@ def upload_master_delivery(
         uploaded_by_id=current_user.id,
     )
     db.add(delivery)
+    db.flush()
     handle_delivery_status(db, album, track, current_user, delivery_number, background_tasks)
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "delivery", delivery.id)
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
 

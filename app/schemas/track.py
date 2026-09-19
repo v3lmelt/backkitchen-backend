@@ -8,6 +8,7 @@ from app.schemas.checklist import ChecklistItemRead
 from app.schemas.discussion import DiscussionRead, MentionCandidatesRead
 from app.schemas.issue import IssueRead
 from app.schemas.user import UserRead
+from app.schemas.audio_analysis import AudioAnalysisRead, AudioSpecs, AudioSpecCheck
 from app.schemas.workflow import (
     WorkflowConfigSchema,
     WorkflowEventRead,
@@ -17,15 +18,19 @@ from app.schemas.workflow import (
 
 
 
+
+
 class TrackSourceVersionRead(BaseModel):
     id: int
     workflow_cycle: int
     version_number: int
     file_path: str | None = None
     source_kind: str = "file"
+    purpose: str = "source"
     duration: float | None = None
     uploaded_by_id: int | None = None
     revision_notes: str | None = None
+    audio_analysis: AudioAnalysisRead
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -38,6 +43,7 @@ class MasterDeliveryRead(BaseModel):
     file_path: str | None = None
     delivery_kind: str = "file"
     delivery_message: str | None = None
+    audio_analysis: AudioAnalysisRead
     uploaded_by_id: int | None = None
     confirmed_at: datetime | None = None
     producer_approved_at: datetime | None = None
@@ -126,6 +132,9 @@ class TrackReviewStateRead(BaseModel):
     active_assignment_count: int
     completed_review_count: int
     quorum_reached: bool
+    flexible: bool = False
+    flexible_available: bool = False
+    state_version: str = ""
     requires_group_finalization: bool
 
 
@@ -150,6 +159,8 @@ class TrackRead(TrackBase):
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
     viewer_is_album_manager: bool = False
+    viewer_can_force_track_status: bool = False
+    viewer_can_manage_review: bool = False
     # Server-computed viewer-context flags (replace client-side re-derivation).
     viewer_is_composer_actor: bool = False
     viewer_is_mastering_participant: bool = False
@@ -161,6 +172,10 @@ class TrackRead(TrackBase):
     author_notes: str | None = None
     mastering_notes: str | None = None
     requested_revision_type: str | None = None
+    audio_spec_overrides: AudioSpecs = Field(default_factory=AudioSpecs)
+    effective_audio_specs: AudioSpecs = Field(default_factory=AudioSpecs)
+    source_spec_check: AudioSpecCheck = Field(default_factory=lambda: AudioSpecCheck(status="unknown"))
+    master_spec_check: AudioSpecCheck = Field(default_factory=lambda: AudioSpecCheck(status="unknown"))
     is_public: bool = False
     created_at: datetime
     updated_at: datetime

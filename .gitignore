@@ -31,6 +31,7 @@ uploads/
 .coverage.*
 htmlcov/
 .pytest_cache/
+.pytest-tmp-*/
 
 # Dev run logs / stray pip output
 dev-backend.log

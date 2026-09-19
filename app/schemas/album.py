@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.user import UserRead
 from app.schemas.workflow import WorkflowConfigSchema, WorkflowEventRead
+from app.schemas.audio_analysis import AudioSpecs
 
 
 
@@ -104,11 +105,13 @@ class AlbumRead(AlbumBase):
     deadline: datetime | None = None
     phase_deadlines: dict[str, str] | None = None
     workflow_config: "WorkflowConfigSchema | None" = None
+    audio_specs: AudioSpecs = Field(default_factory=AudioSpecs)
     workflow_template_id: int | None = None
     workflow_template_name: str | None = None
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None = None
+    is_completed: bool = False
     track_count: int = 0
     total_tracks: int = 0
     by_status: dict[str, int] = Field(default_factory=dict)
@@ -123,6 +126,7 @@ class AlbumRead(AlbumBase):
 
 
 class AlbumStats(BaseModel):
+    is_completed: bool = False
     total_tracks: int
     by_status: dict[str, int]
     open_issues: int

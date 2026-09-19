@@ -75,6 +75,11 @@ def get_all_album_member_ids(db: Session, album_id: int | None = None) -> dict[i
     return result
 
 
+def album_tracks_completed(total: int, completed: int) -> bool:
+    """Evaluate completion using counts of non-archived, non-rejected tracks."""
+    return total > 0 and total == completed
+
+
 def is_album_completed(db: Session, album_id: int) -> bool:
     """True when every active (non-archived, non-rejected) track is completed."""
     total, completed = db.execute(
@@ -87,7 +92,7 @@ def is_album_completed(db: Session, album_id: int) -> bool:
             Track.status != TrackStatus.REJECTED,
         )
     ).one()
-    return total > 0 and total == completed
+    return album_tracks_completed(total, completed)
 
 
 def track_composer_ordered_ids(track: Track, db: Session | None = None) -> list[int]:

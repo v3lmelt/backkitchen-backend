@@ -309,6 +309,13 @@ class AssignReviewerRequest(BaseModel):
     user_ids: list[int] = Field(..., min_length=1)
 
 
+class ManageReviewRequest(BaseModel):
+    stage_id: str = Field(..., min_length=1, max_length=50)
+    flexible: Literal[True] = True
+    user_ids: list[int] = Field(..., min_length=1)
+    state_version: str = Field(..., min_length=1, max_length=64)
+
+
 class ReassignReviewerRequest(BaseModel):
     user_ids: list[int] | None = None
     user_id: int | None = None

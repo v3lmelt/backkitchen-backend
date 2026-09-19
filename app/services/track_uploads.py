@@ -33,6 +33,7 @@ def create_source_version(
     revision_notes: str | None = None,
     storage_backend: str = "local",
     source_kind: str = "file",
+    purpose: str = "source",
 ) -> TrackSourceVersion:
     return TrackSourceVersion(
         track_id=track.id,
@@ -41,6 +42,8 @@ def create_source_version(
         file_path=file_path,
         storage_backend=storage_backend,
         source_kind=source_kind,
+        purpose=purpose,
+        audio_analysis_status="pending" if source_kind == "file" else "not_applicable",
         duration=duration,
         uploaded_by_id=user.id,
         revision_notes=revision_notes,
@@ -134,7 +137,7 @@ def finalize_source_version_upload(
     resolution_note: str | None,
     source_kind: str = "file",
     replace_current_audio: bool = True,
-) -> None:
+) -> TrackSourceVersion:
     issue_cycle = track.workflow_cycle
 
     # Resolve the next step *before* mutating rejection_mode so that the
@@ -178,17 +181,17 @@ def finalize_source_version_upload(
         next_status,
         background_tasks,
     )
-    db.add(
-        create_source_version(
-            track,
-            current_user,
-            file_path,
-            duration,
-            revision_notes=revision_notes or None,
-            storage_backend=storage_backend,
-            source_kind=source_kind,
-        )
+    source_version = create_source_version(
+        track,
+        current_user,
+        file_path,
+        duration,
+        revision_notes=revision_notes or None,
+        storage_backend=storage_backend,
+        source_kind=source_kind,
     )
+    db.add(source_version)
+    db.flush()
 
     event_payload: dict[str, object] = {"version": track.version, "workflow_cycle": track.workflow_cycle}
     if source_kind != "file":
@@ -207,6 +210,7 @@ def finalize_source_version_upload(
         to_status=next_status,
         payload=event_payload,
     )
+    return source_version
 
 
 def handle_delivery_status(

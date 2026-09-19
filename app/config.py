@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     # Auto-cleanup: days to keep old source versions after track completion
     OLD_VERSION_RETENTION_DAYS: int = 7
 
+    # Audio analysis
+    FFMPEG_PATH: str = "ffmpeg"
+    FFPROBE_PATH: str = "ffprobe"
+    AUDIO_ANALYSIS_CONCURRENCY: int = 1
+    AUDIO_ANALYSIS_TIMEOUT_SECONDS: int = 900
+
     model_config = {"env_prefix": "AUDIO_MGMT_", "env_file": ".env", "env_file_encoding": "utf-8"}
 
     @model_validator(mode="after")

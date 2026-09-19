@@ -160,6 +160,12 @@ from app.schemas.upload import (
     AppConfigResponse,
 )
 
+from app.schemas.audio_analysis import (
+    AudioAnalysis,
+    AudioAnalysisRead,
+    PremasterSpec,
+)
+
 __all__ = [
     "UserBase",
     "UserCreate",
@@ -283,4 +289,7 @@ __all__ = [
     "RequestCommentAudioUploadParams",
     "PresignedCommentAudioResponse",
     "AppConfigResponse",
+    "AudioAnalysis",
+    "AudioAnalysisRead",
+    "PremasterSpec",
 ]

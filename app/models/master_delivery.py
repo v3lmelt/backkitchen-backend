@@ -19,6 +19,14 @@ class MasterDelivery(Base):
     storage_backend: Mapped[str] = mapped_column(String(10), nullable=False, default="local")
     delivery_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="file")
     delivery_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_analysis_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="pending"
+    )
+    audio_analysis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_analysis_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_analysis_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    audio_analysis_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    audio_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     uploaded_by_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("users.id"), nullable=True, index=True
     )
