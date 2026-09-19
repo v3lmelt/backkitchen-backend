@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import AsyncGenerator, Literal
+from typing import AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,6 @@ from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
 from app.models.album_member import AlbumMember
 from app.models.circle import Circle, CircleMember
 from app.models.issue import Issue, IssueStatus
-from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus
 from app.models.track_composer import TrackComposer
 from app.models.user import User
@@ -38,6 +37,7 @@ from app.notifications import notify
 from app.realtime import broadcast_track_updated
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema, WorkflowEventRead
 from app.security import get_current_user
+from app.services.album_scope import AlbumScope, album_scope_condition
 from app.services.attachments import ALLOWED_IMAGE_EXTENSIONS, ALLOWED_IMAGE_TYPES
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
@@ -532,11 +532,13 @@ def list_albums(
     include_archived: bool = Query(False),
     archived_only: bool = Query(False),
     search: str | None = Query(default=None),
-    scope: Literal["all", "managed", "participating"] = Query("all"),
+    scope: AlbumScope = Query("all"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[AlbumRead]:
     stmt = select(Album).order_by(Album.id)
+    if scope != "all":
+        stmt = stmt.where(album_scope_condition(scope, current_user.id))
     if archived_only:
         stmt = stmt.where(Album.archived_at.isnot(None))
     elif not include_archived:
@@ -560,27 +562,6 @@ def list_albums(
             if current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids or viewer_is_manager:
                 visible_albums.append(album)
                 viewer_manager_by_album_id[album.id] = viewer_is_manager
-    if scope != "all":
-        managed_ids = {
-            album.id for album in visible_albums
-            if album.producer_id == current_user.id
-            or album_viewer_circle_role(album, current_user, db) in {"owner", "co_producer"}
-        }
-        related_ids = set(managed_ids)
-        if scope == "participating":
-            related_ids.update(db.scalars(select(AlbumMember.album_id).where(AlbumMember.user_id == current_user.id)))
-            related_ids.update(album.id for album in visible_albums if album.mastering_engineer_id == current_user.id)
-            related_ids.update(db.scalars(select(Track.album_id).where(
-                (Track.submitter_id == current_user.id)
-                | Track.id.in_(select(TrackComposer.track_id).where(TrackComposer.user_id == current_user.id))
-                | Track.id.in_(select(StageAssignment.track_id).join(Track, Track.id == StageAssignment.track_id).where(
-                    StageAssignment.user_id == current_user.id,
-                    StageAssignment.stage_id == Track.status,
-                    StageAssignment.status.in_(("pending", "completed")),
-                    Track.archived_at.is_(None),
-                ))
-            )))
-        visible_albums = [album for album in visible_albums if album.id in related_ids]
     summaries = _build_album_stats_summary_map(visible_albums, db, current_user)
     return [
         _album_to_read(
