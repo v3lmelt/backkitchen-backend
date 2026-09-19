@@ -16,6 +16,7 @@ fi
 git diff --quiet && git diff --cached --quiet || { echo 'Tracked local changes require attention.' >&2; exit 1; }
 command -v ffmpeg >/dev/null
 command -v ffprobe >/dev/null
+[[ -w /opt/backkitchen/backups/automatic ]] || { echo 'The automatic backup directory must be writable by the deployment user.' >&2; exit 1; }
 git fetch origin master
 target=$(git rev-parse origin/master)
 if [[ -n "$expected" && "$expected" != "$target" ]]; then
@@ -33,7 +34,7 @@ git merge --ff-only "$target"
 
 # SQLite's backup API gives a consistent snapshot while the existing API runs.
 # Keep the current service available if preparation or migration fails.
-trap 'echo "Deployment failed at line $LINENO. Inspect journalctl -u webhook -u backkitchen; database backups are in /opt/backkitchen/backups." >&2' ERR
+trap 'echo "Deployment failed at line $LINENO. Inspect journalctl -u webhook -u backkitchen; database backups are in /opt/backkitchen/backups/automatic." >&2' ERR
 .venv/bin/python - <<'PY'
 import sqlite3
 from datetime import datetime, timezone
@@ -47,7 +48,7 @@ if url.get_backend_name() != 'sqlite':
 database = Path(url.database).resolve()
 if not database.is_file():
     raise RuntimeError('Expected an existing production SQLite database.')
-directory = Path('/opt/backkitchen/backups')
+directory = Path('/opt/backkitchen/backups/automatic')
 directory.mkdir(exist_ok=True)
 backup = directory / ('before-deploy-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '.db')
 with sqlite3.connect(database) as source, sqlite3.connect(backup) as destination:
