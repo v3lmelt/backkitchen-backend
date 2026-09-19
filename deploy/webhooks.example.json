@@ -1,0 +1,16 @@
+[
+  {
+    "id": "deploy-backend",
+    "execute-command": "/opt/backkitchen/deploy.sh",
+    "command-working-directory": "/opt/backkitchen/backend",
+    "pass-arguments-to-command": [{ "source": "payload", "name": "after" }],
+    "trigger-rule": {
+      "and": [
+        { "match": { "type": "payload-hmac-sha256", "secret": "REPLACE_WITH_A_RANDOM_SECRET", "parameter": { "source": "header", "name": "X-Hub-Signature-256" } } },
+        { "match": { "type": "value", "value": "push", "parameter": { "source": "header", "name": "X-GitHub-Event" } } },
+        { "match": { "type": "value", "value": "v3lmelt/backkitchen-backend", "parameter": { "source": "payload", "name": "repository.full_name" } } },
+        { "match": { "type": "value", "value": "refs/heads/master", "parameter": { "source": "payload", "name": "ref" } } }
+      ]
+    }
+  }
+]

@@ -75,6 +75,8 @@ class Track(Base):
         default=WorkflowVariant.STANDARD.value,
         server_default=WorkflowVariant.STANDARD.value,
     )
+    flexible_review_stages: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     workflow_cycle: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
@@ -90,6 +92,8 @@ class Track(Base):
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     author_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     mastering_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_spec_overrides: Mapped[str | None] = mapped_column(Text, nullable=True)
+    premaster_spec_override: Mapped[str | None] = mapped_column(Text, nullable=True)
     requested_revision_type: Mapped[str | None] = mapped_column(String(20), nullable=True, default=None)
 
     composer_links: Mapped[list["TrackComposer"]] = relationship(  # noqa: F821
@@ -157,6 +161,12 @@ class Track(Base):
         "SourceFollowupRequest",
         back_populates="track",
         cascade="all, delete-orphan",
+    )
+    premaster_handoffs: Mapped[list["PremasterHandoff"]] = relationship(  # noqa: F821
+        "PremasterHandoff",
+        back_populates="track",
+        cascade="all, delete-orphan",
+        order_by="PremasterHandoff.created_at, PremasterHandoff.id",
     )
     playback_preferences: Mapped[list["TrackPlaybackPreference"]] = relationship(  # noqa: F821
         "TrackPlaybackPreference",

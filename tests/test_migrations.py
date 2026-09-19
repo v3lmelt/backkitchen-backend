@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import subprocess
 import sys
@@ -12,7 +13,36 @@ PRE_ADMIN_GOVERNANCE_REVISION = "f3a2b1c4d5e6"
 PRE_AUDIT_LOG_REVISION = "f4b5c6d7e8f9"
 PRE_TRACK_DELETE_INTEGRITY_REVISION = "n1o2p3q4r5s6"
 PRE_ASSIGNMENT_DEDUPE_REVISION = "p2q3r4s5t6u7"
-HEAD_REVISION = "x0y1z2a3b4c5"
+HEAD_REVISION = "merge20260919"
+
+
+def test_advisory_spec_migration_preserves_legacy_workflow_data(tmp_path):
+    path = tmp_path / "legacy-handoff.db"
+    spec = json.dumps({"enabled": True, "allowed_containers": ["wav"], "allowed_sample_rates_hz": [48000], "allowed_sample_formats": ["pcm_s24"]})
+    with sqlite3.connect(path) as conn:
+        conn.executescript("""
+            CREATE TABLE alembic_version(version_num VARCHAR(32));
+            INSERT INTO alembic_version VALUES ('y1z2a3b4c5d6');
+            CREATE TABLE albums(id INTEGER PRIMARY KEY, premaster_spec TEXT);
+            CREATE TABLE tracks(id INTEGER PRIMARY KEY, premaster_spec_override TEXT, status TEXT, workflow_cycle INTEGER);
+            CREATE TABLE premaster_handoffs(id INTEGER PRIMARY KEY, status TEXT, source_version_id INTEGER);
+            INSERT INTO premaster_handoffs VALUES (1, 'pending', 7);
+            CREATE TABLE track_source_versions(id INTEGER PRIMARY KEY, file_path TEXT, purpose TEXT);
+            INSERT INTO track_source_versions VALUES (7, '/keep/source.wav', 'premaster');
+            CREATE TABLE master_deliveries(id INTEGER PRIMARY KEY, file_path TEXT);
+            INSERT INTO master_deliveries VALUES (8, '/keep/master.wav');
+        """)
+        conn.execute("INSERT INTO albums VALUES (1, ?)", (spec,))
+        conn.execute("INSERT INTO tracks VALUES (1, ?, 'mastering_revision', 3)", (spec,))
+    result = _run_upgrade(path)
+    assert result.returncode == 0, result.stderr
+    with sqlite3.connect(path) as conn:
+        assert json.loads(conn.execute("SELECT audio_specs FROM albums").fetchone()[0]) == {"source": json.loads(spec), "master": None}
+        assert json.loads(conn.execute("SELECT audio_spec_overrides FROM tracks").fetchone()[0]) == {"source": json.loads(spec), "master": None}
+        assert conn.execute("SELECT status, workflow_cycle FROM tracks").fetchone() == ('mastering_revision', 3)
+        assert conn.execute("SELECT * FROM premaster_handoffs").fetchone() == (1, 'pending', 7)
+        assert conn.execute("SELECT * FROM track_source_versions").fetchone() == (7, '/keep/source.wav', 'premaster')
+        assert conn.execute("SELECT * FROM master_deliveries").fetchone() == (8, '/keep/master.wav')
 
 
 def _sqlite_url(db_path: Path) -> str:
@@ -405,7 +435,33 @@ def _assert_upgrade_succeeded(db_path: Path) -> None:
         }
         assert "checklist_enabled" in album_columns
         assert "quick_followup_enabled" in album_columns
+        assert "premaster_spec" in album_columns
         assert "default_checklist_enabled" in circle_columns
+        track_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(tracks)").fetchall()
+        }
+        assert "premaster_spec_override" in track_columns
+        source_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(track_source_versions)").fetchall()
+        }
+        delivery_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(master_deliveries)").fetchall()
+        }
+        analysis_columns = {
+            "audio_analysis_status",
+            "audio_analysis",
+            "audio_analysis_error",
+            "audio_analysis_attempts",
+            "audio_analysis_started_at",
+            "audio_analyzed_at",
+        }
+        assert {"purpose", *analysis_columns}.issubset(source_columns)
+        if delivery_columns:
+            assert analysis_columns.issubset(delivery_columns)
+        premaster_handoff_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'premaster_handoffs'"
+        ).fetchone()
+        assert premaster_handoff_table == ("premaster_handoffs",)
         source_followup_table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'source_followup_requests'"
         ).fetchone()

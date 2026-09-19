@@ -11,11 +11,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Literal
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
@@ -28,23 +28,29 @@ from app.models.album import ALBUM_ARCHIVE_RETENTION_DAYS, Album
 from app.models.album_member import AlbumMember
 from app.models.circle import Circle, CircleMember
 from app.models.issue import Issue, IssueStatus
+from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus
 from app.models.track_composer import TrackComposer
 from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.models.workflow_template import WorkflowTemplate
 from app.notifications import notify
+from app.realtime import broadcast_track_updated
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema, WorkflowEventRead
 from app.security import get_current_user
 from app.services.attachments import ALLOWED_IMAGE_EXTENSIONS, ALLOWED_IMAGE_TYPES
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
 from app.services.track_queries import (
+    album_tracks_completed,
     current_master_delivery,
     get_album_member_ids,
     get_all_album_member_ids,
     is_album_completed,
+    track_composer_actor_ids_for_notify,
 )
+from app.services.audio_specs import read_specs
+from app.schemas.audio_analysis import AudioSpecs
 from app.track_permissions import ensure_album_manager, ensure_album_visibility, peer_identity_anonymize_user_ids_for_viewer
 from app.track_serializers import annotate_workflow_step_metadata, build_event_read, build_track_read
 from app.workflow_engine import migrate_tracks_on_workflow_change, parse_workflow_config
@@ -254,6 +260,11 @@ def _build_album_stats_summary_map(
         stats.by_status[track_status] = count
         stats.total_tracks += count
 
+    for stats in stats_by_id.values():
+        stats.is_completed = album_tracks_completed(
+            stats.total_tracks, stats.by_status.get(TrackStatus.COMPLETED, 0)
+        )
+
     open_issue_rows = db.execute(
         select(Track.album_id, sqlfunc.count(Issue.id))
         .join(Issue, Issue.track_id == Track.id)
@@ -434,11 +445,13 @@ def _album_to_read(
         deadline=album.deadline,
         phase_deadlines=phase_deadlines,
         workflow_config=workflow_config,
+        audio_specs=read_specs(album.audio_specs),
         workflow_template_id=album.workflow_template_id,
         workflow_template_name=template_name,
         created_at=album.created_at,
         updated_at=album.updated_at,
         archived_at=album.archived_at,
+        is_completed=summary.is_completed if summary is not None else is_album_completed(db, album.id),
         track_count=track_count,
         total_tracks=summary.total_tracks if summary is not None else track_count,
         by_status=summary.by_status if summary is not None else {},
@@ -519,6 +532,7 @@ def list_albums(
     include_archived: bool = Query(False),
     archived_only: bool = Query(False),
     search: str | None = Query(default=None),
+    scope: Literal["all", "managed", "participating"] = Query("all"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[AlbumRead]:
@@ -546,6 +560,27 @@ def list_albums(
             if current_user.id in {album.producer_id, album.mastering_engineer_id} | member_ids or viewer_is_manager:
                 visible_albums.append(album)
                 viewer_manager_by_album_id[album.id] = viewer_is_manager
+    if scope != "all":
+        managed_ids = {
+            album.id for album in visible_albums
+            if album.producer_id == current_user.id
+            or album_viewer_circle_role(album, current_user, db) in {"owner", "co_producer"}
+        }
+        related_ids = set(managed_ids)
+        if scope == "participating":
+            related_ids.update(db.scalars(select(AlbumMember.album_id).where(AlbumMember.user_id == current_user.id)))
+            related_ids.update(album.id for album in visible_albums if album.mastering_engineer_id == current_user.id)
+            related_ids.update(db.scalars(select(Track.album_id).where(
+                (Track.submitter_id == current_user.id)
+                | Track.id.in_(select(TrackComposer.track_id).where(TrackComposer.user_id == current_user.id))
+                | Track.id.in_(select(StageAssignment.track_id).join(Track, Track.id == StageAssignment.track_id).where(
+                    StageAssignment.user_id == current_user.id,
+                    StageAssignment.stage_id == Track.status,
+                    StageAssignment.status.in_(("pending", "completed")),
+                    Track.archived_at.is_(None),
+                ))
+            )))
+        visible_albums = [album for album in visible_albums if album.id in related_ids]
     summaries = _build_album_stats_summary_map(visible_albums, db, current_user)
     return [
         _album_to_read(
@@ -569,6 +604,30 @@ def get_album(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
+    return _read_album_with_summary(album, db, current_user)
+
+
+@router.patch("/{album_id}/audio-specs", response_model=AlbumRead)
+def update_album_audio_specs(
+    album_id: int,
+    background_tasks: BackgroundTasks,
+    payload: AudioSpecs,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AlbumRead:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    if current_user.id != album.mastering_engineer_id and not is_album_manager(album, current_user, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the assigned mastering engineer or an album manager can edit audio specifications.",
+        )
+    album.audio_specs = payload.model_dump_json()
+    db.commit()
+    db.refresh(album)
+    for track in album.tracks:
+        broadcast_track_updated(background_tasks, track.id)
     return _read_album_with_summary(album, db, current_user)
 
 

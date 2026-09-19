@@ -46,6 +46,7 @@ from app.routers import admin as admin_router
 from app.routers import albums, auth, checklists, circles, discussions, issues, invitations, notifications, tracks, users, workflow, workflow_templates
 from app.security import _decode_token, _resolve_websocket_user
 from app.services.maintenance import _backfill_workflow_data, _periodic_cleanup, _seed_demo_data
+from app.services.audio_analysis import enqueue_audio_analysis_backfill, set_audio_analysis_event_loop
 from app.track_permissions import ensure_track_visibility
 
 logger = logging.getLogger(__name__)
@@ -162,6 +163,8 @@ def _run_alembic_upgrade() -> None:
 async def lifespan(app: FastAPI):
     _run_alembic_upgrade()
     _backfill_workflow_data()
+    set_audio_analysis_event_loop(asyncio.get_running_loop())
+    enqueue_audio_analysis_backfill()
     upload_path = settings.get_upload_path()
     (upload_path / "comment_images").mkdir(parents=True, exist_ok=True)
     (upload_path / "covers").mkdir(parents=True, exist_ok=True)
