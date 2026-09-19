@@ -3,6 +3,8 @@
 import json
 import logging
 
+from app.circle_permissions import is_circle_bound_album_manager
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -69,6 +71,8 @@ from app.track_permissions import (
 )
 from app.workflow_engine import (
     classify_transition,
+    flexible_review_decisions,
+    review_state_version,
     get_allowed_transitions,
     get_current_step,
     parse_workflow_config,
@@ -227,6 +231,9 @@ def build_track_read(
         required_review_count = required_reviews_for_assignments(step, review_assignments)
         review_state = TrackReviewStateRead(
             step_id=step.id,
+            flexible=step.flexible_review,
+            flexible_available=flexible_review_decisions(wf_config, step) is not None,
+            state_version=review_state_version(track, album, review_assignments),
             assignment_mode=step.assignment_mode,
             required_review_count=required_review_count,
             active_assignment_count=len(review_assignments),
@@ -260,6 +267,10 @@ def build_track_read(
         producer_id=album.producer_id,
         mastering_engineer_id=album.mastering_engineer_id,
         viewer_is_album_manager=resolved_viewer_is_album_manager,
+        viewer_can_force_track_status=(db is not None and track.archived_at is None
+                                      and album.archived_at is None and is_circle_bound_album_manager(album, user, db)),
+        viewer_can_manage_review=(resolved_viewer_is_album_manager and track.archived_at is None
+                                 and album.archived_at is None and step is not None and step.type == "review"),
         viewer_is_composer_actor=is_track_composer_actor(track, album, user.id, db),
         viewer_is_mastering_participant=is_mastering_participant(
             user, track, album, viewer_is_album_manager=resolved_viewer_is_album_manager,
@@ -500,6 +511,10 @@ def build_event_read(
     else:
         actor = None
     payload = json.loads(event.payload) if event.payload else None
+    if event.event_type == "review_roster_updated" and payload and anonymize_user_ids:
+        # Anonymous viewers may see that the roster changed, but not raw reviewer IDs.
+        payload = {key: value for key, value in payload.items()
+                   if key not in {"user_ids", "added_user_ids", "removed_user_ids"}}
     return WorkflowEventRead(
         id=event.id,
         event_type=event.event_type,

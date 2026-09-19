@@ -1,3 +1,4 @@
+import json
 import hashlib
 import logging
 import re
@@ -26,6 +27,7 @@ from app.models.track_composer import TrackComposer, TrackExternalComposer
 from app.models.track_playback_preference import TrackPlaybackPreference
 from app.models.track_source_version import TrackSourceVersion
 from app.models.user import User
+from app.schemas.workflow import ManageReviewRequest
 from app.schemas.schemas import (
     AssignReviewerRequest,
     AuthorNotesUpdate,
@@ -60,6 +62,12 @@ from app.schemas.schemas import (
 )
 from app.workflow_engine import (
     ASSIGNMENT_ACTIVE_STATUSES,
+    flexible_review_rosters,
+    flexible_review_decisions,
+    finalize_flexible_review,
+    review_state_version,
+    review_active_assignments,
+    lock_review_track,
     ASSIGNMENT_CANCEL_REASON_REASSIGNED,
     assign_peer_reviewer_for_step,
     cancel_active_review_assignments,
@@ -1513,6 +1521,78 @@ def force_track_progress_status(
 # ── Stage assignment endpoints ──────────────────────────────────────────────
 
 
+@router.put("/{track_id}/review-management", response_model=TrackRead)
+def manage_review(
+    track_id: int,
+    payload: ManageReviewRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if not is_album_manager(album, current_user, db):
+        raise HTTPException(status_code=403, detail="Only the album manager can manage reviews.")
+    if track.archived_at is not None or album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot be reviewed.")
+    config = engine_parse_workflow_config(album)
+    step = engine_get_current_step(config, track)
+    if step is None or step.id != payload.stage_id or flexible_review_decisions(config, step) is None:
+        raise HTTPException(status_code=409, detail="This stage does not support flexible review.")
+    assignments = review_active_assignments(db, track.id, step.id)
+    if payload.state_version != review_state_version(track, album, assignments):
+        raise HTTPException(status_code=409, detail="Review state changed. Refresh and try again.")
+    lock_review_track(db, track)
+    db.refresh(album)
+    if track.archived_at is not None or album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot be reviewed.")
+    if not is_album_manager(album, current_user, db):
+        raise HTTPException(status_code=403, detail="Only the album manager can manage reviews.")
+    assignments = review_active_assignments(db, track.id, step.id)
+    if payload.state_version != review_state_version(track, album, assignments, revision=track.review_revision - 1):
+        raise HTTPException(status_code=409, detail="Review state changed. Refresh and try again.")
+    user_ids = dedupe_user_ids(payload.user_ids)
+    _validate_manual_reviewer_selection(user_ids=user_ids, track=track, album=album, db=db,
+                                       reviewer_limit=len(user_ids))
+    previous_ids = {a.user_id for a in assignments}
+    desired_ids = set(user_ids)
+    removed = sorted(previous_ids - desired_ids)
+    added = sorted(desired_ids - previous_ids)
+    for assignment in assignments:
+        if assignment.user_id in removed:
+            assignment.status = StageAssignmentStatus.CANCELLED
+            assignment.cancellation_reason = "flexible_removed"
+    db.flush()
+    for uid in added:
+        db.add(StageAssignment(track_id=track.id, stage_id=step.id, user_id=uid,
+                               status="pending", assigned_at=datetime.now(timezone.utc)))
+    rosters = flexible_review_rosters(track)
+    enabled_now = step.id not in rosters
+    rosters[step.id] = user_ids
+    track.flexible_review_stages = json.dumps(rosters)
+    track.peer_reviewer_id = user_ids[0]
+    db.flush()
+    log_track_event(db, track, current_user, "review_roster_updated", payload={
+        "step": step.id, "added_user_ids": added, "removed_user_ids": removed,
+        "user_ids": user_ids, "flexible_enabled": enabled_now,
+    })
+    for recipients, kind, title, message in [
+        (added, "reviewer_assigned", "你被指派为评审人", f"你已被指派评审「{track.title}」"),
+        (removed, "reviewer_reassigned", "评审任务已移除", f"你不再负责评审「{track.title}」"),
+    ]:
+        if recipients:
+            notify(db, recipients, kind, title, message, related_track_id=track.id,
+                   background_tasks=background_tasks, album_id=album.id,
+                   webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
+    finalize_flexible_review(db, album, track, current_user, background_tasks)
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track.id)
+    return build_track_read(track, current_user, album, db=db)
+
+
 @router.get("/{track_id}/reviewer-candidates", response_model=list[ReviewerCandidateRead])
 def list_reviewer_candidates(
     track_id: int,
@@ -1570,6 +1650,11 @@ def assign_reviewer(
     if not is_album_manager(album, current_user, db):
         raise HTTPException(status_code=403, detail="Only the album producer can assign reviewers.")
 
+    lock_review_track(db, track)
+    if track.archived_at is not None or album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot be reviewed.")
+    if track.status in flexible_review_rosters(track):
+        raise HTTPException(status_code=409, detail="Use review management to edit a flexible review roster.")
     config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
     if step is None or step.type != "review":
@@ -1681,6 +1766,11 @@ def reassign_reviewer(
     if not is_album_manager(album, current_user, db):
         raise HTTPException(status_code=403, detail="Only the album producer can reassign reviewers.")
 
+    lock_review_track(db, track)
+    if track.archived_at is not None or album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot be reviewed.")
+    if track.status in flexible_review_rosters(track):
+        raise HTTPException(status_code=409, detail="Use review management to edit a flexible review roster.")
     config = engine_parse_workflow_config(album)
     step = engine_get_current_step(config, track)
     if step is None or step.type != "review":

@@ -13,6 +13,7 @@ Version 2 of the config schema introduces:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -89,7 +90,7 @@ def required_reviews_for_assignments(
     step: "StepDef",
     assignments: list["StageAssignment"] | None = None,
 ) -> int:
-    if step.assignment_mode == "fixed" and assignments is not None:
+    if (step.flexible_review or step.assignment_mode == "fixed") and assignments is not None:
         return max(1, len(assignments))
     return max(1, step.required_reviewer_count or 1)
 
@@ -98,7 +99,7 @@ def review_requires_group_finalization(
     step: "StepDef",
     assignments: list["StageAssignment"] | None = None,
 ) -> bool:
-    return step.type == "review" and required_reviews_for_assignments(step, assignments) > 1
+    return step.type == "review" and not step.flexible_review and required_reviews_for_assignments(step, assignments) > 1
 
 
 def _review_revision_target(step: "StepDef", steps: list["StepDef"]) -> str | None:
@@ -177,6 +178,7 @@ def review_active_assignments(
                 StageAssignment.status.in_(ASSIGNMENT_ACTIVE_STATUSES),
             )
             .order_by(StageAssignment.assigned_at.asc(), StageAssignment.id.asc())
+            .execution_options(populate_existing=True)
         ).all()
     )
     return _dedupe_assignments_by_user(assignments)
@@ -382,6 +384,7 @@ class StepDef:
     reviewer_pool: list[int] | None = None
     required_reviewer_count: int = 1
     revision_decision_policy: str | None = None
+    flexible_review: bool = False
     # Approval/delivery assignee override
     assignee_user_id: int | None = None
     # Delivery-specific
@@ -478,7 +481,74 @@ def infer_issue_phase_for_step(step: StepDef) -> str:
 
 def get_current_step(config: dict, track: Track) -> StepDef | None:
     steps = get_steps(config)
-    return get_step_by_id(steps, track.status)
+    step = get_step_by_id(steps, track.status)
+    if step is not None:
+        step.flexible_review = step.id in flexible_review_rosters(track)
+    return step
+
+
+def flexible_review_rosters(track: Track) -> dict[str, list[int]]:
+    return json.loads(track.flexible_review_stages or "{}")
+
+
+def lock_review_track(db: Session, track: Track) -> None:
+    revision = track.review_revision
+    expected_state = (track.status, track.version, track.workflow_cycle)
+    result = db.execute(
+        update(Track).where(Track.id == track.id, Track.review_revision == revision)
+        .values(review_revision=revision + 1),
+        execution_options={"synchronize_session": False},
+    )
+    if result.rowcount != 1:
+        raise HTTPException(status_code=409, detail="Review state changed. Refresh and try again.")
+    db.refresh(track)
+    if (track.status, track.version, track.workflow_cycle) != expected_state:
+        raise HTTPException(status_code=409, detail="Track stage changed. Refresh and try again.")
+
+
+def flexible_review_decisions(config: dict, step: StepDef) -> tuple[str, str | None] | None:
+    if step.type != "review" or not (step.ui_variant == "peer_review" or step.id == "peer_review"):
+        return None
+    steps = get_steps(config)
+    forward = [decision for decision, target in step.transitions.items()
+               if decision in REVIEW_FORWARD_DECISIONS
+               and (target == "__completed" or
+                    ((candidate := get_step_by_id(steps, target)) is not None
+                     and candidate.order > step.order and candidate.type != "revision"))]
+    revision = [decision for decision, target in step.transitions.items()
+                if (candidate := get_step_by_id(steps, target)) is not None
+                and candidate.type == "revision" and candidate.return_to == step.id
+                and not target_is_mastering_related(candidate)]
+    if len(forward) != 1 or len(revision) > 1:
+        return None
+    # Additional custom outcomes cannot be silently collapsed into pass/revise.
+    if set(step.transitions) != set(forward + revision):
+        return None
+    return forward[0], revision[0] if revision else None
+
+
+def review_state_version(track: Track, album: Album, assignments: list[StageAssignment], *, revision: int | None = None) -> str:
+    snapshot = [track.status, track.version, track.workflow_cycle, track.review_revision if revision is None else revision,
+                track.flexible_review_stages, album.workflow_config,
+                [(a.id, a.user_id, a.status, a.decision) for a in assignments]]
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
+
+
+def prepare_flexible_review_entry(db: Session, album: Album, track: Track, step: StepDef,
+                                  background_tasks: BackgroundTasks | None, actor: User | None) -> None:
+    roster = flexible_review_rosters(track)[step.id]
+    eligible = _eligible_reviewer_pool(db, album, track, roster)
+    cancel_active_review_assignments(db, track.id, step.id, reason="flexible_new_round")
+    db.flush()
+    assignments = [StageAssignment(track_id=track.id, stage_id=step.id, user_id=uid,
+                                   status="pending", assigned_at=datetime.now(timezone.utc)) for uid in eligible]
+    db.add_all(assignments)
+    track.review_revision += 1
+    _set_track_peer_reviewer_from_assignments(track, step, assignments)
+    _notify_assigned_reviewers(db, track, step, eligible, background_tasks, reopened=True, actor=actor)
+    if not eligible:
+        _notify_manual_assignment_needed(db, album, track, step, background_tasks, actor)
+    db.flush()
 
 
 def get_first_step(config: dict) -> StepDef:
@@ -697,6 +767,10 @@ def assign_peer_reviewer_for_step(
     if step.type != "review":
         return
 
+    if step.id in flexible_review_rosters(track):
+        prepare_flexible_review_entry(db, album, track, step, background_tasks, actor)
+        return
+
     cancel_active_review_assignments(
         db,
         track.id,
@@ -763,6 +837,10 @@ def prepare_review_assignments_for_stage_entry(
     config = parse_workflow_config(album)
     step = get_step_by_id(get_steps(config), stage_id)
     if step is None or step.type != "review":
+        return
+
+    if step.id in flexible_review_rosters(track):
+        prepare_flexible_review_entry(db, album, track, step, background_tasks, actor)
         return
 
     existing_assignments = db.scalars(
@@ -894,7 +972,8 @@ def get_allowed_transitions(
         revision_target = _review_revision_target(step, steps)
         revision_decision = _review_revision_decision(step, revision_target)
         can_request_direct_revision = (
-            step.revision_decision_policy == REVIEW_REVISION_POLICY_FIRST_REQUEST
+            not step.flexible_review
+            and step.revision_decision_policy == REVIEW_REVISION_POLICY_FIRST_REQUEST
             and revision_target is not None
             and revision_decision is not None
             and (
@@ -913,6 +992,10 @@ def get_allowed_transitions(
     options: list[TransitionOption] = []
     if configured_transitions_allowed:
         for decision, target in step.transitions.items():
+            if step.flexible_review:
+                supported = flexible_review_decisions(config, step)
+                if supported is None or decision not in supported:
+                    continue
             if not _is_delivery_transition_user_visible(step, decision):
                 continue
             # Hide transitions whose target step has a lower order than the
@@ -1157,6 +1240,10 @@ def execute_transition(
     Validates the decision, updates ``track.status``, logs the event,
     and sends notifications.
     """
+    lock_review_track(db, track)
+    db.refresh(album)
+    if track.archived_at is not None or album.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Archived tracks cannot be reviewed.")
     config = parse_workflow_config(album)
     step = get_current_step(config, track)
 
@@ -1270,6 +1357,19 @@ def execute_transition(
                 detail="Submit the peer review checklist before finishing the review.",
             )
 
+    if step.flexible_review:
+        if pending_assignment is None:
+            raise HTTPException(status_code=409, detail="You have already completed this review.")
+        pending_assignment.status = StageAssignmentStatus.COMPLETED
+        pending_assignment.decision = decision
+        pending_assignment.completed_at = datetime.now(timezone.utc)
+        db.flush()
+        log_track_event(db, track, user, "workflow_review_progress", from_status=track.status,
+                        to_status=track.status, payload={"step": step.id, "decision": decision,
+                        "completed_reviews": completed_reviews + 1, "required_reviews": required_reviews})
+        finalize_flexible_review(db, album, track, user, background_tasks)
+        return
+
     previous_status = track.status
     is_revision_suggestion = (
         step.type == "review"
@@ -1331,6 +1431,15 @@ def execute_transition(
         pending_assignment.completed_at = datetime.now(timezone.utc)
         db.flush()
 
+    _finish_transition(db, album, track, user, config, step, decision, target, background_tasks, revision_type)
+
+
+def _finish_transition(db: Session, album: Album, track: Track, user: User, config: dict,
+                       step: StepDef, decision: str, target: str, background_tasks: BackgroundTasks,
+                       revision_type: str | None = None) -> None:
+    steps = get_steps(config)
+    previous_status = track.status
+    is_direct_revision_request = decision == DIRECT_REVISION_REQUEST_DECISION
     if step.type == "review":
         _cancel_pending_review_assignments(
             db,
@@ -1342,7 +1451,7 @@ def execute_transition(
                 else ASSIGNMENT_CANCEL_REASON_QUORUM_MET
             ),
         )
-        if not is_direct_revision_request:
+        if not is_direct_revision_request and not step.flexible_review:
             _discard_internal_review_issues(db, track, background_tasks, user)
 
     # Producer-direct intake: skip peer review, mark variant accordingly
@@ -1421,12 +1530,6 @@ def execute_transition(
             # Clear the field when not in a revision step
             track.requested_revision_type = None
 
-    # Mark the current user's assignment when it wasn't already handled above.
-    if step.type == "review" and pending_assignment and pending_assignment.status == StageAssignmentStatus.PENDING:
-        pending_assignment.status = StageAssignmentStatus.COMPLETED
-        pending_assignment.decision = revision_decision if is_direct_revision_request else decision
-        pending_assignment.completed_at = datetime.now(timezone.utc)
-
     log_track_event(
         db, track, user,
         f"workflow_transition_{decision}",
@@ -1436,6 +1539,27 @@ def execute_transition(
     )
 
     _notify_transition(db, album, track, step, target, steps, background_tasks, actor=user)
+
+
+def finalize_flexible_review(db: Session, album: Album, track: Track, user: User,
+                             background_tasks: BackgroundTasks) -> bool:
+    config = parse_workflow_config(album)
+    step = get_current_step(config, track)
+    if step is None or not step.flexible_review:
+        return False
+    decisions = flexible_review_decisions(config, step)
+    if decisions is None:
+        raise HTTPException(status_code=409, detail="This workflow no longer supports flexible review.")
+    assignments = review_active_assignments(db, track.id, step.id)
+    if not assignments or any(a.status != "completed" for a in assignments):
+        return False
+    if any(a.decision not in decisions for a in assignments):
+        raise HTTPException(status_code=409, detail="Existing review outcomes are incompatible with flexible review.")
+    forward, revision = decisions
+    decision = revision if revision and any(a.decision == revision for a in assignments) else forward
+    _finish_transition(db, album, track, user, config, step, decision,
+                       step.transitions[decision], background_tasks)
+    return True
 
 
 def execute_revision_upload(
