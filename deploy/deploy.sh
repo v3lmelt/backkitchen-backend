@@ -31,10 +31,9 @@ fi
 git merge --ff-only "$target"
 .venv/bin/python -m pip install --quiet -r requirements.txt
 
-# Stop writes while taking the recovery snapshot and applying migrations.
-# Failures remain visible in the webhook journal; never silently reset user data.
+# SQLite's backup API gives a consistent snapshot while the existing API runs.
+# Keep the current service available if preparation or migration fails.
 trap 'echo "Deployment failed at line $LINENO. Inspect journalctl -u webhook -u backkitchen; database backups are in /opt/backkitchen/backups." >&2' ERR
-sudo -n /usr/bin/systemctl stop backkitchen
 .venv/bin/python - <<'PY'
 import sqlite3
 from datetime import datetime, timezone
@@ -56,7 +55,7 @@ with sqlite3.connect(database) as source, sqlite3.connect(backup) as destination
 print('Database backup:', backup)
 PY
 .venv/bin/python -m alembic upgrade head
-sudo -n /usr/bin/systemctl start backkitchen
+sudo -n /usr/bin/systemctl restart backkitchen
 healthy=false
 for attempt in $(seq 1 60); do
     if curl --fail --silent --max-time 2 http://127.0.0.1:8000/api/health; then
