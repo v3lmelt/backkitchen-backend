@@ -44,6 +44,8 @@ class Album(Base):
     phase_deadlines: Mapped[str | None] = mapped_column(Text, nullable=True)
     webhook_config: Mapped[str | None] = mapped_column(Text, nullable=True)
     workflow_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_specs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    premaster_spec: Mapped[str | None] = mapped_column(Text, nullable=True)
     workflow_template_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("workflow_templates.id", name="fk_album_workflow_template"),
         nullable=True

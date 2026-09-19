@@ -57,6 +57,8 @@ from app.services.track_queries import (
     track_external_composer_links,
     track_external_composer_names,
 )
+from app.services.audio_analysis import analysis_read
+from app.services.audio_specs import effective_specs, read_specs, record_spec_check
 from app.track_permissions import (
     comment_visible_to_user,
     ensure_track_visibility,
@@ -150,13 +152,38 @@ def track_composer_user_reads(
 def _source_version_read(version: TrackSourceVersion | None) -> TrackSourceVersionRead | None:
     if version is None:
         return None
-    return TrackSourceVersionRead.model_validate(version)
+    return TrackSourceVersionRead(
+        id=version.id,
+        workflow_cycle=version.workflow_cycle,
+        version_number=version.version_number,
+        file_path=version.file_path,
+        source_kind=version.source_kind,
+        purpose=version.purpose,
+        duration=version.duration,
+        uploaded_by_id=version.uploaded_by_id,
+        revision_notes=version.revision_notes,
+        audio_analysis=analysis_read(version),
+        created_at=version.created_at,
+    )
 
 
 def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead | None:
     if delivery is None:
         return None
-    return MasterDeliveryRead.model_validate(delivery)
+    return MasterDeliveryRead(
+        id=delivery.id,
+        workflow_cycle=delivery.workflow_cycle,
+        delivery_number=delivery.delivery_number,
+        file_path=delivery.file_path,
+        delivery_kind=delivery.delivery_kind,
+        delivery_message=delivery.delivery_message,
+        uploaded_by_id=delivery.uploaded_by_id,
+        confirmed_at=delivery.confirmed_at,
+        producer_approved_at=delivery.producer_approved_at,
+        submitter_approved_at=delivery.submitter_approved_at,
+        audio_analysis=analysis_read(delivery),
+        created_at=delivery.created_at,
+    )
 
 
 def build_track_read(
@@ -170,6 +197,7 @@ def build_track_read(
     viewer_is_album_manager: bool | None = None,
 ) -> TrackRead:
     current_source = current_source_version(track)
+    specs = effective_specs(album, track)
     current_master = current_master_delivery(track)
     if anonymize_user_ids is None and db is not None:
         anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, user)
@@ -314,6 +342,10 @@ def build_track_read(
         author_notes=track.author_notes,
         mastering_notes=track.mastering_notes,
         requested_revision_type=track.requested_revision_type,
+        audio_spec_overrides=read_specs(track.audio_spec_overrides),
+        effective_audio_specs=specs,
+        source_spec_check=record_spec_check(current_source, specs.source),
+        master_spec_check=record_spec_check(current_master, specs.master),
     )
 
 
@@ -685,8 +717,8 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         issues=issues,
         checklist_items=checklist_items,
         events=events,
-        source_versions=[TrackSourceVersionRead.model_validate(v) for v in track.source_versions],
-        master_deliveries=[MasterDeliveryRead.model_validate(d) for d in track.master_deliveries],
+        source_versions=[item for v in track.source_versions if (item := _source_version_read(v)) is not None],
+        master_deliveries=[item for d in track.master_deliveries if (item := _master_delivery_read(d)) is not None],
         discussions=discussions,
         workflow_config=wf_config_schema,
         mention_candidates=build_mention_candidates(

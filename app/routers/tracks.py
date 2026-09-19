@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, func as sqlfunc, select
 from sqlalchemy.orm import Session, selectinload
@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.admin_permissions import has_admin_role
 from app.circle_permissions import album_manager_user_ids, is_album_manager, require_circle_bound_album_manager
 from app.config import ALLOWED_AUDIO_EXTENSIONS, settings
-from app.database import get_db
+from app.database import engine as application_engine, get_db
 from app.models.album import Album
 from app.models.comment import Comment
 from app.models.issue import Issue, IssueStatus
@@ -111,6 +111,8 @@ from app.services.track_queries import (
     track_composer_actor_ids_for_notify,
     track_composer_ids,
 )
+from app.schemas.audio_analysis import AudioSpecs
+from app.services.audio_analysis import enqueue_audio_analysis
 from app.track_permissions import (
     ensure_album_visibility,
     ensure_track_visibility,
@@ -130,6 +132,26 @@ _UPLOAD_BASE = Path(settings.UPLOAD_DIR).resolve()
 
 # Used only for truly immutable URLs (source-version snapshots addressed by numeric ID).
 _AUDIO_CACHE_MAX_AGE = 86400
+
+
+def _schedule_audio_analysis(
+    background_tasks: BackgroundTasks,
+    db: Session,
+    kind: str,
+    record_id: int,
+    prepared_path: str | Path | None = None,
+) -> None:
+    """Queue analysis only for records stored in the application database.
+
+    API tests and embedded callers may override the request session with a
+    separate engine. A process-global worker cannot safely reopen those
+    short-lived databases after the request ends.
+    """
+    if db.get_bind() is not application_engine:
+        if prepared_path is not None:
+            Path(prepared_path).unlink(missing_ok=True)
+        return
+    background_tasks.add_task(enqueue_audio_analysis, kind, record_id, prepared_path)
 
 
 def _validate_playback_scope(scope: str) -> str:
@@ -630,7 +652,9 @@ def create_track(
     db.flush()
     _replace_track_composer_links(db, track, platform_composer_ids)
     _replace_track_external_composer_links(db, track, external_names)
-    db.add(create_source_version(track, current_user, file_path, duration))
+    source_version = create_source_version(track, current_user, file_path, duration)
+    db.add(source_version)
+    db.flush()
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
 
     # Notify the album producer about the new submission
@@ -644,6 +668,7 @@ def create_track(
                webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "source", source_version.id)
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
 
@@ -821,6 +846,7 @@ def confirm_track_upload(
         uploaded_by_id=current_user.id,
     )
     db.add(sv)
+    db.flush()
     log_track_event(db, track, current_user, "track_submitted", to_status=initial_status)
 
 
@@ -842,8 +868,31 @@ def confirm_track_upload(
                webhook_context={"actor_id": current_user.id, "actor_name": current_user.display_name})
 
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "source", sv.id)
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
+
+
+@router.patch("/{track_id}/audio-specs", response_model=TrackRead)
+def update_track_audio_specs(
+    track_id: int,
+    background_tasks: BackgroundTasks,
+    payload: AudioSpecs,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TrackRead:
+    track = db.get(Track, track_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found.")
+    album = ensure_track_visibility(track, current_user, db)
+    if current_user.id != album.mastering_engineer_id and not is_album_manager(album, current_user, db):
+        raise HTTPException(status_code=403, detail="Only the mastering engineer or album managers can edit audio specifications.")
+    track.audio_spec_overrides = payload.model_dump_json()
+    db.commit()
+    db.refresh(track)
+    broadcast_track_updated(background_tasks, track_id)
+    return build_track_read(track, current_user, album, db=db)
+
 
 @router.patch("/{track_id}/composers", response_model=TrackRead)
 def update_track_composers(
@@ -932,7 +981,7 @@ def confirm_source_version_upload(
     if params.duration is not None and duration is None:
         duration = params.duration
 
-    finalize_source_version_upload(
+    source_version = finalize_source_version_upload(
         db,
         album=album,
         track=track,
@@ -953,6 +1002,7 @@ def confirm_source_version_upload(
         len(params.resolved_issue_ids),
     )
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "source", source_version.id)
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
@@ -1083,8 +1133,10 @@ def confirm_master_delivery_upload(
         uploaded_by_id=current_user.id,
     )
     db.add(delivery)
+    db.flush()
     handle_delivery_status(db, album, track, current_user, delivery_number, background_tasks)
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "delivery", delivery.id)
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
 
@@ -2111,6 +2163,8 @@ def decide_source_followup_request(
         )
 
     db.commit()
+    if req.applied_source_version_id is not None:
+        _schedule_audio_analysis(background_tasks, db, "source", req.applied_source_version_id)
     db.refresh(track)
     broadcast_track_updated(background_tasks, track.id)
     return build_track_read(track, current_user, album, db=db)
@@ -2174,7 +2228,7 @@ def upload_source_version(
     _ensure_revision_upload_permission(db, track, album, current_user)
 
     file_path, duration = _save_upload(file, f"{sanitize_filename(track.title)}_v{track.version + 1}")
-    finalize_source_version_upload(
+    source_version = finalize_source_version_upload(
         db,
         album=album,
         track=track,
@@ -2195,6 +2249,7 @@ def upload_source_version(
         len(resolved_issue_ids),
     )
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "source", source_version.id)
     db.refresh(track)
     broadcast_track_updated(background_tasks, track_id)
     return build_track_read(track, current_user, album, db=db)
@@ -2277,8 +2332,10 @@ def upload_master_delivery(
         uploaded_by_id=current_user.id,
     )
     db.add(delivery)
+    db.flush()
     handle_delivery_status(db, album, track, current_user, delivery_number, background_tasks)
     db.commit()
+    _schedule_audio_analysis(background_tasks, db, "delivery", delivery.id)
     db.refresh(track)
     return build_track_read(track, current_user, album, db=db)
 

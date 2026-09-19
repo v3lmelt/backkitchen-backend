@@ -16,6 +16,7 @@ from app.models.issue_image import IssueImage
 from app.models.master_delivery import MasterDelivery
 from app.models.notification import Notification
 from app.models.password_reset import PasswordResetToken
+from app.models.premaster_handoff import PremasterHandoff, PremasterHandoffMode, PremasterHandoffStatus
 from app.models.reopen_request import ReopenRequest
 from app.models.source_followup_request import SourceFollowupRequest
 from app.models.stage_assignment import StageAssignment
@@ -53,6 +54,9 @@ __all__ = [
     "MasterDelivery",
     "Notification",
     "PasswordResetToken",
+    "PremasterHandoff",
+    "PremasterHandoffMode",
+    "PremasterHandoffStatus",
     "ReopenRequest",
     "RejectionMode",
     "SourceFollowupRequest",

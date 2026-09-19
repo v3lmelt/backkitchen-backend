@@ -8,6 +8,7 @@ from app.schemas.checklist import ChecklistItemRead
 from app.schemas.discussion import DiscussionRead, MentionCandidatesRead
 from app.schemas.issue import IssueRead
 from app.schemas.user import UserRead
+from app.schemas.audio_analysis import AudioAnalysisRead, AudioSpecs, AudioSpecCheck
 from app.schemas.workflow import (
     WorkflowConfigSchema,
     WorkflowEventRead,
@@ -17,15 +18,19 @@ from app.schemas.workflow import (
 
 
 
+
+
 class TrackSourceVersionRead(BaseModel):
     id: int
     workflow_cycle: int
     version_number: int
     file_path: str | None = None
     source_kind: str = "file"
+    purpose: str = "source"
     duration: float | None = None
     uploaded_by_id: int | None = None
     revision_notes: str | None = None
+    audio_analysis: AudioAnalysisRead
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -38,6 +43,7 @@ class MasterDeliveryRead(BaseModel):
     file_path: str | None = None
     delivery_kind: str = "file"
     delivery_message: str | None = None
+    audio_analysis: AudioAnalysisRead
     uploaded_by_id: int | None = None
     confirmed_at: datetime | None = None
     producer_approved_at: datetime | None = None
@@ -166,6 +172,10 @@ class TrackRead(TrackBase):
     author_notes: str | None = None
     mastering_notes: str | None = None
     requested_revision_type: str | None = None
+    audio_spec_overrides: AudioSpecs = Field(default_factory=AudioSpecs)
+    effective_audio_specs: AudioSpecs = Field(default_factory=AudioSpecs)
+    source_spec_check: AudioSpecCheck = Field(default_factory=lambda: AudioSpecCheck(status="unknown"))
+    master_spec_check: AudioSpecCheck = Field(default_factory=lambda: AudioSpecCheck(status="unknown"))
     is_public: bool = False
     created_at: datetime
     updated_at: datetime

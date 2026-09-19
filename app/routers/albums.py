@@ -15,7 +15,7 @@ from typing import AsyncGenerator, Literal
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func as sqlfunc, func, select
 from sqlalchemy.orm import Session
@@ -35,6 +35,7 @@ from app.models.user import User
 from app.models.workflow_event import WorkflowEvent
 from app.models.workflow_template import WorkflowTemplate
 from app.notifications import notify
+from app.realtime import broadcast_track_updated
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema, WorkflowEventRead
 from app.security import get_current_user
 from app.services.attachments import ALLOWED_IMAGE_EXTENSIONS, ALLOWED_IMAGE_TYPES
@@ -46,7 +47,10 @@ from app.services.track_queries import (
     get_album_member_ids,
     get_all_album_member_ids,
     is_album_completed,
+    track_composer_actor_ids_for_notify,
 )
+from app.services.audio_specs import read_specs
+from app.schemas.audio_analysis import AudioSpecs
 from app.track_permissions import ensure_album_manager, ensure_album_visibility, peer_identity_anonymize_user_ids_for_viewer
 from app.track_serializers import annotate_workflow_step_metadata, build_event_read, build_track_read
 from app.workflow_engine import migrate_tracks_on_workflow_change, parse_workflow_config
@@ -441,6 +445,7 @@ def _album_to_read(
         deadline=album.deadline,
         phase_deadlines=phase_deadlines,
         workflow_config=workflow_config,
+        audio_specs=read_specs(album.audio_specs),
         workflow_template_id=album.workflow_template_id,
         workflow_template_name=template_name,
         created_at=album.created_at,
@@ -599,6 +604,30 @@ def get_album(
     if album is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
+    return _read_album_with_summary(album, db, current_user)
+
+
+@router.patch("/{album_id}/audio-specs", response_model=AlbumRead)
+def update_album_audio_specs(
+    album_id: int,
+    background_tasks: BackgroundTasks,
+    payload: AudioSpecs,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AlbumRead:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    if current_user.id != album.mastering_engineer_id and not is_album_manager(album, current_user, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the assigned mastering engineer or an album manager can edit audio specifications.",
+        )
+    album.audio_specs = payload.model_dump_json()
+    db.commit()
+    db.refresh(album)
+    for track in album.tracks:
+        broadcast_track_updated(background_tasks, track.id)
     return _read_album_with_summary(album, db, current_user)
 
 
