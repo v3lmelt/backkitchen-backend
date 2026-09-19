@@ -40,6 +40,7 @@ from app.services.attachments import ALLOWED_IMAGE_EXTENSIONS, ALLOWED_IMAGE_TYP
 from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
 from app.services.track_queries import (
+    album_tracks_completed,
     current_master_delivery,
     get_album_member_ids,
     get_all_album_member_ids,
@@ -254,6 +255,11 @@ def _build_album_stats_summary_map(
         stats.by_status[track_status] = count
         stats.total_tracks += count
 
+    for stats in stats_by_id.values():
+        stats.is_completed = album_tracks_completed(
+            stats.total_tracks, stats.by_status.get(TrackStatus.COMPLETED, 0)
+        )
+
     open_issue_rows = db.execute(
         select(Track.album_id, sqlfunc.count(Issue.id))
         .join(Issue, Issue.track_id == Track.id)
@@ -439,6 +445,7 @@ def _album_to_read(
         created_at=album.created_at,
         updated_at=album.updated_at,
         archived_at=album.archived_at,
+        is_completed=summary.is_completed if summary is not None else is_album_completed(db, album.id),
         track_count=track_count,
         total_tracks=summary.total_tracks if summary is not None else track_count,
         by_status=summary.by_status if summary is not None else {},
