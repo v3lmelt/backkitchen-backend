@@ -89,6 +89,7 @@ from app.workflow_engine import (
 from app.notifications import notify
 from app.realtime import broadcast_track_updated
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
+from app.services.album_scope import AlbumScope, album_scope_condition
 from app.services.audio import extract_audio_metadata
 from app.services.attachments import AUDIO_MIME_MAP
 from app.services.track_delete import prepare_track_hard_delete
@@ -1206,6 +1207,7 @@ def list_tracks(
     status_filter: str | None = Query(default=None, alias="status"),
     album_id: int | None = Query(default=None),
     search: str | None = Query(default=None),
+    album_scope: AlbumScope = Query(default="all"),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -1254,6 +1256,10 @@ def list_tracks(
     )
     if status_filter != TrackStatus.REJECTED.value:
         stmt = stmt.where(Track.status != TrackStatus.REJECTED)
+    if album_scope != "all":
+        stmt = stmt.where(Track.album_id.in_(
+            select(Album.id).where(album_scope_condition(album_scope, current_user.id))
+        ))
     if status_filter is not None:
         stmt = stmt.where(Track.status == status_filter)
     if album_id is not None:
