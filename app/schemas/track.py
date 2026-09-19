@@ -126,6 +126,9 @@ class TrackReviewStateRead(BaseModel):
     active_assignment_count: int
     completed_review_count: int
     quorum_reached: bool
+    flexible: bool = False
+    flexible_available: bool = False
+    state_version: str = ""
     requires_group_finalization: bool
 
 
@@ -150,6 +153,8 @@ class TrackRead(TrackBase):
     producer_id: int | None = None
     mastering_engineer_id: int | None = None
     viewer_is_album_manager: bool = False
+    viewer_can_force_track_status: bool = False
+    viewer_can_manage_review: bool = False
     # Server-computed viewer-context flags (replace client-side re-derivation).
     viewer_is_composer_actor: bool = False
     viewer_is_mastering_participant: bool = False

@@ -75,6 +75,8 @@ class Track(Base):
         default=WorkflowVariant.STANDARD.value,
         server_default=WorkflowVariant.STANDARD.value,
     )
+    flexible_review_stages: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     workflow_cycle: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(

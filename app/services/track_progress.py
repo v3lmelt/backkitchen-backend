@@ -7,6 +7,7 @@ from app.models.user import User
 from app.services.track_queries import log_track_event
 from app.workflow_engine import (
     get_step_by_id,
+    lock_review_track,
     get_steps,
     parse_workflow_config,
     prepare_review_assignments_for_stage_entry,
@@ -25,6 +26,7 @@ def force_track_status(
     allowed_terminal_statuses: set[str],
     event_type: str,
 ) -> None:
+    lock_review_track(db, track)
     config = parse_workflow_config(album)
     valid_step_ids = {step["id"] for step in config.get("steps", [])}
     valid_statuses = valid_step_ids | allowed_terminal_statuses
