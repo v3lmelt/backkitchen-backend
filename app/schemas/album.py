@@ -109,6 +109,7 @@ class AlbumRead(AlbumBase):
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None = None
+    is_completed: bool = False
     track_count: int = 0
     total_tracks: int = 0
     by_status: dict[str, int] = Field(default_factory=dict)
@@ -123,6 +124,7 @@ class AlbumRead(AlbumBase):
 
 
 class AlbumStats(BaseModel):
+    is_completed: bool = False
     total_tracks: int
     by_status: dict[str, int]
     open_issues: int
