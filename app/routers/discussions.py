@@ -133,22 +133,28 @@ def _ensure_discussion_visible_to_user(
 
 def _build_audio_response(audio: TrackDiscussionAudio, resolve: str | None):
     if audio.storage_backend == "r2":
-        from app.services.r2 import public_url
+        from app.services.r2 import generate_download_url
 
-        url = public_url(audio.file_path)
+        url = generate_download_url(audio.file_path)
+        headers = {"Cache-Control": "private, no-store"}
         if resolve == "json":
-            return JSONResponse({"url": url})
-        return RedirectResponse(url, status_code=302)
+            return JSONResponse({"url": url}, headers=headers)
+        return RedirectResponse(url, status_code=302, headers=headers)
 
     if resolve == "json":
-        return {"url": None}
+        return JSONResponse({"url": None}, headers={"Cache-Control": "private, no-store"})
 
     file_path = settings.get_upload_path() / audio.file_path
     if not file_path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file missing from disk.")
 
     media_type = AUDIO_MIME_MAP.get(file_path.suffix.lower(), "audio/octet-stream")
-    return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)
+    return FileResponse(
+        path=str(file_path),
+        media_type=media_type,
+        filename=audio.original_filename,
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 MAX_DISCUSSION_PAGE_SIZE = 50

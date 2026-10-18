@@ -134,7 +134,7 @@ def test_create_mastering_discussion_accepts_r2_audio_and_resolve_json(client, d
         SimpleNamespace(
             object_exists=lambda key: True,
             download_to_temp=lambda key: __import__("pathlib").Path(factory._audio_file(stem="discussion-r2", ext=".wav")),
-            public_url=lambda key: f"https://cdn.example.com/{key}",
+            generate_download_url=lambda key: f"https://download.example.com/{key}?signed=test",
         ),
     )
     producer = factory.user(role="producer")
@@ -171,9 +171,11 @@ def test_create_mastering_discussion_accepts_r2_audio_and_resolve_json(client, d
     )
 
     assert json_resolve.status_code == 200
-    assert json_resolve.json() == {"url": f"https://cdn.example.com/discussions/{track.id}/0/reference.wav"}
+    assert json_resolve.json() == {"url": f"https://download.example.com/discussions/{track.id}/0/reference.wav?signed=test"}
+    assert json_resolve.headers["cache-control"] == "private, no-store"
     assert redirect_resolve.status_code == 302
-    assert redirect_resolve.headers["location"] == f"https://cdn.example.com/discussions/{track.id}/0/reference.wav"
+    assert redirect_resolve.headers["location"] == f"https://download.example.com/discussions/{track.id}/0/reference.wav?signed=test"
+    assert redirect_resolve.headers["cache-control"] == "private, no-store"
 
 
 def test_create_discussion_rejects_non_image_upload(client, factory, auth_headers):

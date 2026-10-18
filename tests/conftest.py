@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
@@ -31,6 +30,7 @@ from app.models.invitation import Invitation
 from app.models.notification import Notification
 from app.routers import admin, albums, auth, checklists, circles, discussions, invitations, issues, notifications, tracks, users, workflow, workflow_templates
 from app.security import create_access_token
+from app.services.static_uploads import PublicImageStaticFiles
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
 
 
@@ -82,6 +82,7 @@ def client(
     upload_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[TestClient]:
+    monkeypatch.setattr(tracks, "_UPLOAD_BASE", upload_dir.resolve())
     monkeypatch.setattr(
         tracks,
         "extract_audio_metadata",
@@ -112,7 +113,7 @@ def client(
     app.include_router(workflow_templates.router)
     app.include_router(workflow.router)
     app.dependency_overrides[get_db] = override_get_db
-    app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
+    app.mount("/uploads", PublicImageStaticFiles(directory=str(upload_dir)), name="uploads")
 
     with TestClient(app) as test_client:
         yield test_client

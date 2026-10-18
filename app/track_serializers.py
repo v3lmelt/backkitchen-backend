@@ -2,6 +2,8 @@
 
 import json
 import logging
+from dataclasses import dataclass
+from urllib.parse import quote
 
 from app.circle_permissions import is_circle_bound_album_manager
 
@@ -16,6 +18,7 @@ from app.models.comment import Comment
 from app.models.discussion import TrackDiscussion
 from app.models.issue import Issue
 from app.models.master_delivery import MasterDelivery
+from app.models.reopen_request import ReopenRequest, ReopenRequestStatus
 from app.models.stage_assignment import StageAssignment, StageAssignmentStatus
 from app.models.track import Track
 from app.models.track_composer import TrackExternalComposer
@@ -47,11 +50,13 @@ from app.schemas.schemas import (
     WorkflowStepDefSchema,
     WorkflowTransitionOption,
 )
+from app.schemas.audio_analysis import AudioSpecCheck
 from app.services.track_queries import (
     current_master_delivery,
     current_source_version,
     is_track_composer,
     is_track_composer_actor,
+    latest_current_cycle_master_delivery,
     pending_source_followup_request,
     track_composer_ordered_ids,
     track_external_composer_links,
@@ -60,10 +65,12 @@ from app.services.track_queries import (
 from app.services.audio_analysis import analysis_read
 from app.services.audio_specs import effective_specs, read_specs, record_spec_check
 from app.track_permissions import (
+    can_access_master_audio,
     comment_visible_to_user,
     ensure_track_visibility,
     is_mastering_participant,
     issue_unresolved,
+    issue_phase_requires_mastering_participant,
     issue_visible_to_user,
     mask_user_read_if_needed,
     peer_identity_anonymize_user_ids_for_viewer,
@@ -167,7 +174,9 @@ def _source_version_read(version: TrackSourceVersion | None) -> TrackSourceVersi
     )
 
 
-def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead | None:
+def _master_delivery_read(
+    delivery: MasterDelivery | None, *, include_delivery_message: bool = True,
+) -> MasterDeliveryRead | None:
     if delivery is None:
         return None
     return MasterDeliveryRead(
@@ -176,7 +185,7 @@ def _master_delivery_read(delivery: MasterDelivery | None) -> MasterDeliveryRead
         delivery_number=delivery.delivery_number,
         file_path=delivery.file_path,
         delivery_kind=delivery.delivery_kind,
-        delivery_message=delivery.delivery_message,
+        delivery_message=delivery.delivery_message if include_delivery_message else None,
         uploaded_by_id=delivery.uploaded_by_id,
         confirmed_at=delivery.confirmed_at,
         producer_approved_at=delivery.producer_approved_at,
@@ -198,7 +207,7 @@ def build_track_read(
 ) -> TrackRead:
     current_source = current_source_version(track)
     specs = effective_specs(album, track)
-    current_master = current_master_delivery(track)
+    spec_overrides = read_specs(track.audio_spec_overrides)
     if anonymize_user_ids is None and db is not None:
         anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, user)
     visible_issues = [issue for issue in track.issues if issue_visible_to_user(issue, track, user)]
@@ -240,6 +249,20 @@ def build_track_read(
         if viewer_is_album_manager is not None
         else is_album_manager(album, user, db) if db is not None else user.id == album.producer_id
     )
+    viewer_is_mastering_participant = is_mastering_participant(
+        user, track, album, viewer_is_album_manager=resolved_viewer_is_album_manager,
+    )
+    viewer_can_access_master_audio = can_access_master_audio(
+        user, track, album, viewer_is_mastering_participant=viewer_is_mastering_participant,
+    )
+    current_master = (
+        current_master_delivery(track)
+        if viewer_is_mastering_participant
+        else latest_current_cycle_master_delivery(track) if viewer_can_access_master_audio else None
+    )
+    if not viewer_is_mastering_participant:
+        spec_overrides.master = None
+        specs.master = None
 
     if step is None:
         viewer_is_step_assignee = None
@@ -249,6 +272,33 @@ def build_track_read(
         )
     else:
         viewer_is_step_assignee = user_matches_role(user, album, track, step)
+
+    allowed_actions = track_allowed_actions(
+        track, user, album, _wf_config=wf_config, db=db, review_assignments=review_assignments,
+    )
+    active = track.archived_at is None and album.archived_at is None
+    # Optional actions (reopen, followup, cancellation) do not create work.
+    # Delivery uploads have no action-bar transition until a file is supplied.
+    viewer_can_open_workflow = active and step is not None and (
+        bool(transitions)
+        or any(action in allowed_actions for action in (
+            "assign_reviewer", "upload_revision", "confirm_delivery", "approve_final",
+        ))
+        or (step.type == "delivery" and viewer_is_step_assignee is True)
+    )
+    pending_reopen = None
+    if db is not None and track.status == "completed" and viewer_is_mastering_participant and not anonymize:
+        pending_reopen = db.scalar(
+            select(ReopenRequest).where(
+                ReopenRequest.track_id == track.id,
+                ReopenRequest.status == ReopenRequestStatus.PENDING.value,
+            ).order_by(ReopenRequest.id.desc()).limit(1)
+        )
+    viewer_has_pending_work = active and (
+        viewer_can_open_workflow
+        or "decide_source_followup" in allowed_actions
+        or (pending_reopen is not None and resolved_viewer_is_album_manager)
+    )
 
     review_state = None
     if step is not None and step.type == "review" and review_assignments is not None:
@@ -300,9 +350,8 @@ def build_track_read(
         viewer_can_manage_review=(resolved_viewer_is_album_manager and track.archived_at is None
                                  and album.archived_at is None and step is not None and step.type == "review"),
         viewer_is_composer_actor=is_track_composer_actor(track, album, user.id, db),
-        viewer_is_mastering_participant=is_mastering_participant(
-            user, track, album, viewer_is_album_manager=resolved_viewer_is_album_manager,
-        ),
+        viewer_is_mastering_participant=viewer_is_mastering_participant,
+        viewer_can_access_master_audio=viewer_can_access_master_audio,
         viewer_is_step_assignee=viewer_is_step_assignee,
         review_state=review_state,
         external_submitter_name=None if anonymize else external_submitter_name,
@@ -329,23 +378,29 @@ def build_track_read(
             else mask_user_read_if_needed(user_read(track.peer_reviewer), anonymize_user_ids)
         ),
         current_source_version=_source_version_read(current_source),
-        current_master_delivery=_master_delivery_read(current_master),
+        current_master_delivery=_master_delivery_read(
+            current_master, include_delivery_message=viewer_is_mastering_participant,
+        ),
         pending_source_followup_request=(
             None if anonymize else pending_source_followup_request(db, track.id)
         ),
-        allowed_actions=track_allowed_actions(
-            track, user, album, _wf_config=wf_config, db=db, review_assignments=review_assignments,
-        ),
+        pending_reopen_request=pending_reopen,
+        allowed_actions=allowed_actions,
+        viewer_can_open_workflow=viewer_can_open_workflow,
+        viewer_has_pending_work=viewer_has_pending_work,
         workflow_step=workflow_step,
         workflow_transitions=workflow_transitions,
         is_public=track.is_public,
         author_notes=track.author_notes,
-        mastering_notes=track.mastering_notes,
-        requested_revision_type=track.requested_revision_type,
-        audio_spec_overrides=read_specs(track.audio_spec_overrides),
+        mastering_notes=track.mastering_notes if viewer_is_mastering_participant else None,
+        requested_revision_type=track.requested_revision_type if viewer_is_mastering_participant else None,
+        audio_spec_overrides=spec_overrides,
         effective_audio_specs=specs,
         source_spec_check=record_spec_check(current_source, specs.source),
-        master_spec_check=record_spec_check(current_master, specs.master),
+        master_spec_check=(
+            record_spec_check(current_master, specs.master)
+            if viewer_is_mastering_participant else AudioSpecCheck(status="unknown")
+        ),
     )
 
 
@@ -358,6 +413,7 @@ def build_issue_read(
     *,
     viewer_user: User | None = None,
     viewer_track: Track | None = None,
+    master_delivery_metadata: dict[int, tuple[int, int]] | None = None,
 ) -> IssueRead:
     if users_cache is not None:
         author = users_cache.get(issue.author_id) or db.get(User, issue.author_id)
@@ -370,6 +426,17 @@ def build_issue_read(
         else:
             source_version = db.get(TrackSourceVersion, issue.source_version_id)
             source_version_number = source_version.version_number if source_version else None
+    master_number = None
+    master_cycle = None
+    if issue.master_delivery_id is not None:
+        if master_delivery_metadata is not None:
+            metadata = master_delivery_metadata.get(issue.master_delivery_id)
+            if metadata is not None:
+                master_number, master_cycle = metadata
+        else:
+            delivery = db.get(MasterDelivery, issue.master_delivery_id)
+            if delivery is not None:
+                master_number, master_cycle = delivery.delivery_number, delivery.workflow_cycle
     markers = [IssueMarkerRead.model_validate(m) for m in issue.markers]
     audios = [
         IssueAudioRead(
@@ -386,7 +453,7 @@ def build_issue_read(
         IssueImageRead(
             id=image.id,
             issue_id=image.issue_id,
-            image_url=f"/uploads/{image.file_path}",
+            image_url=f"/api/issue-images/{image.id}/file?revision={quote(image.created_at.isoformat(), safe='')}",
             created_at=image.created_at,
         )
         for image in issue.images
@@ -410,6 +477,8 @@ def build_issue_read(
         source_version_id=issue.source_version_id,
         source_version_number=source_version_number,
         master_delivery_id=issue.master_delivery_id,
+        master_delivery_number=master_number,
+        master_delivery_workflow_cycle=master_cycle,
         title=issue.title,
         description=issue.description,
         severity=issue.severity,
@@ -438,7 +507,7 @@ def build_comment_read(
         CommentImageRead(
             id=image.id,
             comment_id=image.comment_id,
-            image_url=f"/uploads/{image.file_path}",
+            image_url=f"/api/comment-images/{image.id}/file?revision={quote(image.created_at.isoformat(), safe='')}",
             created_at=image.created_at,
         )
         for image in comment.images
@@ -530,14 +599,49 @@ def build_checklist_read(item: ChecklistItem) -> ChecklistItemRead:
     return ChecklistItemRead.model_validate(item)
 
 
+@dataclass(frozen=True)
+class IssueEventAudience:
+    album: Album
+    known_issue_ids: frozenset[int]
+    visible_issue_ids: frozenset[int]
+    can_see_mastering: bool
+
+
+def issue_event_visible_to_audience(
+    event_type: str,
+    payload: dict[str, object] | None,
+    audience: IssueEventAudience,
+) -> bool:
+    data = payload or {}
+    linked_id = data.get("issue_id")
+    if isinstance(linked_id, str) and linked_id.isdecimal():
+        linked_id = int(linked_id)
+    known_issue = type(linked_id) is int and linked_id in audience.known_issue_ids
+    if known_issue and linked_id not in audience.visible_issue_ids:
+        return False
+    if linked_id is not None and not known_issue and not audience.can_see_mastering:
+        # Update events can outlive their issue without retaining a phase.
+        return False
+    phase = data.get("phase")
+    if (
+        not audience.can_see_mastering
+        and (linked_id is not None or event_type.startswith("issue_"))
+        and isinstance(phase, str)
+        and issue_phase_requires_mastering_participant(phase, audience.album)
+    ):
+        # Deleted/unknown issues retain their recorded privacy boundary.
+        return False
+    return True
+
+
 def build_event_read(
     event: WorkflowEvent,
     db: Session,
     users_cache: dict[int, User] | None = None,
     anonymize_user_ids: set[int] | None = None,
 ) -> WorkflowEventRead:
-    if users_cache and event.actor_user_id and event.actor_user_id in users_cache:
-        actor = users_cache[event.actor_user_id]
+    if users_cache is not None:
+        actor = users_cache.get(event.actor_user_id) if event.actor_user_id is not None else None
     elif event.actor_user_id:
         actor = db.get(User, event.actor_user_id)
     else:
@@ -622,6 +726,10 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         users_by_id = {u.id: u for u in fetched}
 
     source_version_numbers = {version.id: version.version_number for version in track.source_versions}
+    master_delivery_metadata = {
+        delivery.id: (delivery.delivery_number, delivery.workflow_cycle)
+        for delivery in track.master_deliveries
+    }
     anonymize_user_ids = peer_identity_anonymize_user_ids_for_viewer(db, track, album, user)
     visible_issues = [issue for issue in track.issues if issue_visible_to_user(issue, track, user)]
     issues = [
@@ -633,6 +741,7 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
             anonymize_user_ids,
             viewer_user=user,
             viewer_track=track,
+            master_delivery_metadata=master_delivery_metadata,
         )
         for issue in sorted(visible_issues, key=lambda row: (row.created_at, row.id))
     ]
@@ -642,15 +751,17 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         for item in track.checklist_items
         if current_source is None or item.source_version_id == current_source.id
     ]
-    events = [
-        build_event_read(
-            event,
-            db,
-            users_by_id,
-            anonymize_user_ids,
-        )
-        for event in track.workflow_events
-    ]
+    event_audience = IssueEventAudience(
+        album=album,
+        known_issue_ids=frozenset(issue.id for issue in track.issues),
+        visible_issue_ids=frozenset(issue.id for issue in visible_issues),
+        can_see_mastering=can_see_mastering,
+    )
+    events = []
+    for event in track.workflow_events:
+        event_read = build_event_read(event, db, users_by_id, anonymize_user_ids)
+        if issue_event_visible_to_audience(event.event_type, event_read.payload, event_audience):
+            events.append(event_read)
     discussions = [
         DiscussionRead(
             id=d.id,
@@ -705,20 +816,25 @@ def build_track_detail(track: Track, user: User, db: Session) -> TrackDetailResp
         )
 
     anonymize = should_anonymize_track(track, user, album)
+    track_read = build_track_read(
+        track,
+        user,
+        album,
+        db=db,
+        anonymize=anonymize,
+        anonymize_user_ids=anonymize_user_ids,
+    )
     return TrackDetailResponse(
-        track=build_track_read(
-            track,
-            user,
-            album,
-            db=db,
-            anonymize=anonymize,
-            anonymize_user_ids=anonymize_user_ids,
-        ),
+        track=track_read,
         issues=issues,
         checklist_items=checklist_items,
         events=events,
         source_versions=[item for v in track.source_versions if (item := _source_version_read(v)) is not None],
-        master_deliveries=[item for d in track.master_deliveries if (item := _master_delivery_read(d)) is not None],
+        master_deliveries=(
+            [item for d in track.master_deliveries if (item := _master_delivery_read(d)) is not None]
+            if can_see_mastering
+            else [track_read.current_master_delivery] if track_read.current_master_delivery is not None else []
+        ),
         discussions=discussions,
         workflow_config=wf_config_schema,
         mention_candidates=build_mention_candidates(

@@ -10,7 +10,6 @@ from app.ws_manager import manager as track_manager
 from app.ws_manager import notification_manager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, select
 
 from app.config import settings
@@ -47,6 +46,7 @@ from app.routers import albums, auth, checklists, circles, discussions, issues, 
 from app.security import _decode_token, _resolve_websocket_user
 from app.services.maintenance import _backfill_workflow_data, _periodic_cleanup, _seed_demo_data
 from app.services.audio_analysis import enqueue_audio_analysis_backfill, set_audio_analysis_event_loop
+from app.services.static_uploads import PublicImageStaticFiles
 from app.track_permissions import ensure_track_visibility
 
 logger = logging.getLogger(__name__)
@@ -238,10 +238,10 @@ app.include_router(workflow.router)
 
 try:
     upload_path = settings.get_upload_path()
-    app.mount("/uploads", StaticFiles(directory=str(upload_path)), name="uploads")
+    app.mount("/uploads", PublicImageStaticFiles(directory=str(upload_path)), name="uploads")
 except Exception:
     logging.getLogger(__name__).warning(
-        "Failed to mount /uploads static files — uploaded audio will be inaccessible",
+        "Failed to mount /uploads static images — uploaded images will be inaccessible",
         exc_info=True,
     )
 

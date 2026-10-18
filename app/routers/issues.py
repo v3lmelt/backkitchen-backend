@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -23,6 +23,7 @@ from app.models.issue_audio import IssueAudio
 from app.models.issue_image import IssueImage
 from app.services.audio import extract_audio_metadata
 from app.models.issue import Issue, IssueMarker, IssuePhase, IssueStatus, MarkerType
+from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track
 from app.models.user import User
@@ -34,6 +35,7 @@ from app.schemas.schemas import (
 )
 from app.security import get_current_user, get_current_user_optional, get_user_from_token_param
 from app.services.attachments import (
+    ALLOWED_IMAGE_EXTENSIONS,
     ALLOWED_IMAGE_TYPES,
     AUDIO_MIME_MAP,
     IMAGE_EXT_MAP,
@@ -55,7 +57,13 @@ from app.services.track_queries import (
     track_composer_actor_ids_for_notify,
     track_composer_actor_ordered_ids,
 )
-from app.track_permissions import ensure_track_visibility, peer_identity_anonymize_user_ids_for_viewer
+from app.track_permissions import (
+    ensure_track_visibility,
+    is_mastering_participant,
+    issue_phase_requires_mastering_participant,
+    issue_visible_to_user,
+    peer_identity_anonymize_user_ids_for_viewer,
+)
 from app.track_serializers import build_comment_read, build_issue_detail_for_user, build_issue_read
 from app.workflow_engine import (
     ASSIGNMENT_ACTIVE_STATUSES,
@@ -119,6 +127,9 @@ def _match_custom_step_phase(track: Track, album: Album, phase: str):
 
 def _ensure_custom_issue_permission(track: Track, album: Album, user: User, phase: str, db: Session) -> str:
     step = _match_custom_step_phase(track, album, phase)
+    phase = infer_issue_phase_for_step(step)
+    if issue_phase_requires_mastering_participant(phase, album) and not is_mastering_participant(user, track, album):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only mastering participants can create issues for this step.")
 
     if not user_matches_role_or_assignment(user, album, track, step, db):
         raise HTTPException(
@@ -126,7 +137,7 @@ def _ensure_custom_issue_permission(track: Track, album: Album, user: User, phas
             detail="Only the assigned user can create issues for this step.",
         )
 
-    return infer_issue_phase_for_step(step)
+    return phase
 
 
 def _infer_issue_phase_for_track(track: Track, album: Album) -> str:
@@ -240,14 +251,7 @@ def _status_handler_ids(issue: Issue, track: Track, album: Album, db: Session) -
 
 
 def _ensure_issue_visible_to_user(issue: Issue, track: Track, user: User) -> None:
-    album = track.album
-    db = Session.object_session(issue) or Session.object_session(track)
-    if album is not None and db is not None and is_album_manager(album, user, db):
-        return
-    if album is not None and user.id == album.producer_id:
-        return
-    # Pending-discussion issues are hidden from composers until discussion ends.
-    if is_track_composer(track, user.id) and _is_submitter_hidden_issue_status(issue.status):
+    if not issue_visible_to_user(issue, track, user):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found.")
 
 
@@ -335,6 +339,22 @@ def _mention_context_for_visibility(visibility: str) -> str:
     return "issue_internal" if visibility == "internal" else "issue_public"
 
 
+def _visible_issue_notification_user_ids(
+    db: Session, issue: Issue, track: Track, user_ids: list[int],
+) -> list[int]:
+    if not user_ids or (
+        not issue_phase_requires_mastering_participant(issue.phase, track.album)
+        and issue.master_delivery_id is None
+    ):
+        return user_ids
+    visible_ids = {
+        user.id
+        for user in db.scalars(select(User).where(User.id.in_(user_ids)))
+        if issue_visible_to_user(issue, track, user)
+    }
+    return [user_id for user_id in user_ids if user_id in visible_ids]
+
+
 def _notify_user_mentions(
     db: Session,
     user_ids: list[int],
@@ -345,6 +365,7 @@ def _notify_user_mentions(
     issue: Issue,
     background_tasks: BackgroundTasks,
 ) -> None:
+    user_ids = _visible_issue_notification_user_ids(db, issue, track, user_ids)
     if not user_ids:
         return
     notify(
@@ -637,6 +658,7 @@ async def create_issue(
         payload={"phase": effective_phase, "title": issue_title, "issue_id": issue.id},
     )
     notify_ids = track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id)
+    notify_ids = _visible_issue_notification_user_ids(db, issue, track, notify_ids)
     if notify_ids and not _is_submitter_hidden_issue_status(issue.status):
         notify(db, notify_ids, "new_issue", f"新问题：{issue.title}",
                f"「{track.title}」上有新的审核问题",
@@ -690,12 +712,19 @@ def list_issues(
         .order_by(Issue.created_at)
         .options(selectinload(Issue.markers), selectinload(Issue.audios), selectinload(Issue.images))
     ).all())
-    if is_track_composer(track, current_user.id, db):
-        issues = [issue for issue in issues if not _is_submitter_hidden_issue_status(issue.status)]
+    issues = [issue for issue in issues if issue_visible_to_user(issue, track, current_user)]
     # Pre-fetch all issue authors
     author_ids = {i.author_id for i in issues}
     users_cache = {u.id: u for u in db.scalars(select(User).where(User.id.in_(author_ids))).all()} if author_ids else {}
     anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    delivery_ids = {issue.master_delivery_id for issue in issues if issue.master_delivery_id is not None}
+    master_delivery_metadata = {
+        row.id: (row.delivery_number, row.workflow_cycle)
+        for row in db.execute(
+            select(MasterDelivery.id, MasterDelivery.delivery_number, MasterDelivery.workflow_cycle)
+            .where(MasterDelivery.id.in_(delivery_ids))
+        )
+    } if delivery_ids else {}
     return [
         build_issue_read(
             issue,
@@ -704,6 +733,7 @@ def list_issues(
             anonymize_user_ids=anonymize_user_ids,
             viewer_user=current_user,
             viewer_track=track,
+            master_delivery_metadata=master_delivery_metadata,
         )
         for issue in issues
     ]
@@ -886,7 +916,8 @@ async def update_issue(
 
     if old_status != new_status and current_user.id != issue.author_id:
         track = db.get(Track, issue.track_id)
-        notify(db, [issue.author_id], "issue_status_changed", "问题状态已更新",
+        notify_ids = _visible_issue_notification_user_ids(db, issue, track, [issue.author_id])
+        notify(db, notify_ids, "issue_status_changed", "问题状态已更新",
                f"「{issue.title}」被标记为 {new_status.value}",
                related_track_id=track.id if track else None,
                related_issue_id=issue.id,
@@ -899,7 +930,10 @@ async def update_issue(
     ):
         notify(
             db,
-            track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id),
+            _visible_issue_notification_user_ids(
+                db, issue, track,
+                track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id),
+            ),
             "new_issue",
             f"新问题：{issue.title}",
             f"「{track.title}」上有新的审核问题",
@@ -1061,6 +1095,7 @@ async def add_comment(
     if comment_visibility == "public":
         participant_ids.extend(track_composer_actor_ids_for_notify(track, album, db, skip_user_id=current_user.id))
     notify_ids = [uid for uid in dict.fromkeys(participant_ids) if uid != current_user.id]
+    notify_ids = _visible_issue_notification_user_ids(db, issue, track, notify_ids)
     if notify_ids:
         notify(db, notify_ids, "new_comment", "新评论",
                f"「{track.title}」的问题「{issue.title}」有新评论",
@@ -1204,6 +1239,14 @@ def batch_update_issues(
     for issue in issues:
         db.refresh(issue)
     anonymize_user_ids = _peer_anonymize_user_ids(db, track, current_user)
+    delivery_ids = {issue.master_delivery_id for issue in issues if issue.master_delivery_id is not None}
+    master_delivery_metadata = {
+        row.id: (row.delivery_number, row.workflow_cycle)
+        for row in db.execute(
+            select(MasterDelivery.id, MasterDelivery.delivery_number, MasterDelivery.workflow_cycle)
+            .where(MasterDelivery.id.in_(delivery_ids))
+        )
+    } if delivery_ids else {}
     return [
         build_issue_read(
             issue,
@@ -1211,6 +1254,7 @@ def batch_update_issues(
             anonymize_user_ids=anonymize_user_ids,
             viewer_user=current_user,
             viewer_track=track,
+            master_delivery_metadata=master_delivery_metadata,
         )
         for issue in issues
     ]
@@ -1243,21 +1287,27 @@ def serve_issue_audio(
     _ensure_issue_visible_to_user(issue, track, user)
 
     if audio.storage_backend == "r2":
-        from app.services.r2 import public_url
+        from app.services.r2 import generate_download_url
 
-        url = public_url(audio.file_path)
+        url = generate_download_url(audio.file_path)
+        headers = {"Cache-Control": "private, no-store"}
         if resolve == "json":
-            return {"url": url}
-        return RedirectResponse(url, status_code=302)
+            return JSONResponse({"url": url}, headers=headers)
+        return RedirectResponse(url, status_code=302, headers=headers)
 
     if resolve == "json":
-        return {"url": None}
+        return JSONResponse({"url": None}, headers={"Cache-Control": "private, no-store"})
 
     file_path = settings.get_upload_path() / audio.file_path
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Audio file missing from disk.")
     media_type = AUDIO_MIME_MAP.get(file_path.suffix.lower(), "audio/octet-stream")
-    return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)
+    return FileResponse(
+        path=str(file_path),
+        media_type=media_type,
+        filename=audio.original_filename,
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 # ── comment audio file serving ───────────────────────────────────────────────
@@ -1289,22 +1339,28 @@ def serve_comment_audio(
     _ensure_comment_visible_to_user(comment, track, user, db)
 
     if audio.storage_backend == "r2":
-        from app.services.r2 import public_url
+        from app.services.r2 import generate_download_url
 
-        url = public_url(audio.file_path)
+        url = generate_download_url(audio.file_path)
+        headers = {"Cache-Control": "private, no-store"}
         if resolve == "json":
-            return {"url": url}
-        return RedirectResponse(url, status_code=302)
+            return JSONResponse({"url": url}, headers=headers)
+        return RedirectResponse(url, status_code=302, headers=headers)
 
     if resolve == "json":
-        return {"url": None}
+        return JSONResponse({"url": None}, headers={"Cache-Control": "private, no-store"})
 
     # Local file
     file_path = settings.get_upload_path() / audio.file_path
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Audio file missing from disk.")
     media_type = AUDIO_MIME_MAP.get(file_path.suffix.lower(), "audio/octet-stream")
-    return FileResponse(path=str(file_path), media_type=media_type, filename=audio.original_filename)
+    return FileResponse(
+        path=str(file_path),
+        media_type=media_type,
+        filename=audio.original_filename,
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 # ── comment edit / delete ──────────────────────────────────────────────────
@@ -1404,3 +1460,53 @@ def get_comment_history(
         .order_by(EditHistory.created_at.desc())
     ).all())
     return [EditHistoryRead.model_validate(h) for h in histories]
+
+
+def _attachment_image_response(file_path: str) -> FileResponse:
+    upload_root = settings.get_upload_path().resolve()
+    path = (upload_root / file_path).resolve()
+    if (
+        not path.is_relative_to(upload_root)
+        or path.suffix.lower() not in ALLOWED_IMAGE_EXTENSIONS
+        or not path.is_file()
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found.")
+    return FileResponse(path, headers={"Cache-Control": "private, no-store"})
+
+
+@router.get("/api/issue-images/{image_id}/file")
+def get_issue_image(
+    image_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FileResponse:
+    image = db.get(IssueImage, image_id)
+    if image is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found.")
+    issue = db.get(Issue, image.issue_id)
+    track = db.get(Track, issue.track_id) if issue else None
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found.")
+    ensure_track_visibility(track, current_user, db)
+    _ensure_issue_visible_to_user(issue, track, current_user)
+    return _attachment_image_response(image.file_path)
+
+
+@router.get("/api/comment-images/{image_id}/file")
+def get_comment_image(
+    image_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FileResponse:
+    image = db.get(CommentImage, image_id)
+    if image is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found.")
+    comment = db.get(Comment, image.comment_id)
+    issue = db.get(Issue, comment.issue_id) if comment else None
+    track = db.get(Track, issue.track_id) if issue else None
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found.")
+    ensure_track_visibility(track, current_user, db)
+    _ensure_issue_visible_to_user(issue, track, current_user)
+    _ensure_comment_visible_to_user(comment, track, current_user, db)
+    return _attachment_image_response(image.file_path)

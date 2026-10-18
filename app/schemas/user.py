@@ -27,6 +27,14 @@ class RegisterRequest(BaseModel):
     password: str = Field(..., min_length=8)
 
 
+class ComposerAccountRead(BaseModel):
+    id: int
+    username: str
+    display_name: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class UserRead(UserBase):
     id: int
     email: str | None = None
