@@ -220,14 +220,22 @@ def current_source_version(track: Track) -> TrackSourceVersion | None:
     return max(track.source_versions, key=lambda item: item.version_number)
 
 
+def latest_current_cycle_master_delivery(track: Track) -> MasterDelivery | None:
+    """Select a delivery from this workflow cycle without historical fallback."""
+    return max(
+        (item for item in track.master_deliveries if item.workflow_cycle == track.workflow_cycle),
+        key=lambda item: (item.delivery_number, item.id),
+        default=None,
+    )
+
+
 def current_master_delivery(track: Track) -> MasterDelivery | None:
+    """Select a playback delivery, retaining a prior-cycle fallback after reopen."""
+    current = latest_current_cycle_master_delivery(track)
+    if current is not None:
+        return current
     if not track.master_deliveries:
         return None
-    current_cycle_deliveries = [
-        item for item in track.master_deliveries if item.workflow_cycle == track.workflow_cycle
-    ]
-    if current_cycle_deliveries:
-        return max(current_cycle_deliveries, key=lambda item: item.delivery_number)
     latest_source = current_source_version(track)
     if latest_source is not None and latest_source.workflow_cycle == track.workflow_cycle:
         return None

@@ -90,6 +90,8 @@ class IssueRead(IssueBase):
     source_version_id: int | None = None
     source_version_number: int | None = None
     master_delivery_id: int | None = None
+    master_delivery_number: int | None = None
+    master_delivery_workflow_cycle: int | None = None
     status: IssueStatus
     markers: list[IssueMarkerRead] = []
     audios: list[IssueAudioRead] = []

@@ -46,7 +46,10 @@ def upload_file(local_path: Path, object_key: str, dry_run: bool) -> bool:
 
     client = get_r2_client()
     try:
-        client.upload_file(str(local_path), settings.R2_BUCKET_NAME, object_key)
+        client.upload_file(
+            str(local_path), settings.R2_BUCKET_NAME, object_key,
+            ExtraArgs={"CacheControl": "private, no-store"},
+        )
         if not object_exists(object_key):
             log.error("  FAIL (verify failed): %s", object_key)
             return False

@@ -41,7 +41,7 @@ from app.services.track_queries import (
     ASSIGNMENT_CANCEL_REASON_REASSIGNED,
     ASSIGNMENT_CANCEL_REASON_SUPERSEDED,
     ASSIGNMENT_CANCEL_REASON_REVISION_REQUESTED,
-    current_master_delivery,
+    latest_current_cycle_master_delivery,
     current_source_version,
     is_track_composer_actor,
     log_track_event,
@@ -1084,8 +1084,8 @@ def get_allowed_action_names(
                     actions.append("confirm_delivery")
 
     # Final review: add approve_final for producer/submitter who haven't approved yet
-    if step and step.ui_variant == "final_review" and db is not None:
-        delivery = current_master_delivery(track)
+    if step and (step.ui_variant == "final_review" or step.id == "final_review") and db is not None:
+        delivery = latest_current_cycle_master_delivery(track)
         if delivery:
             is_producer = is_album_manager(album, user, db)
             is_submitter = is_track_composer_actor(track, album, user.id, db)

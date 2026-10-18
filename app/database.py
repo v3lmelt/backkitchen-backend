@@ -2,14 +2,13 @@ from collections.abc import Generator
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.config import settings
 
+# File-backed SQLite uses QueuePool so concurrent sessions own separate transactions.
 engine = create_engine(
     settings.DATABASE_URL,
     connect_args={"check_same_thread": False},  # SQLite-specific
-    poolclass=StaticPool,
     echo=False,
 )
 
