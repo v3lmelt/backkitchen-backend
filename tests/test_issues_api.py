@@ -1,7 +1,9 @@
 import json
 import sys
+from datetime import datetime
 from io import BytesIO
 from types import SimpleNamespace
+from urllib.parse import unquote
 
 import pytest
 from sqlalchemy import func, select
@@ -307,6 +309,12 @@ def test_create_multi_reviewer_public_issue_stays_open_and_visible(
     assert response.status_code == 201
     issue_id = response.json()["id"]
     assert response.json()["status"] == IssueStatus.OPEN.value
+    image = response.json()["images"][0]
+    assert image["image_url"].startswith(f"/api/issue-images/{image['id']}/file?revision=")
+    assert datetime.fromisoformat(unquote(image["image_url"].split("?revision=", 1)[1])) == datetime.fromisoformat(image["created_at"])
+    attachment = client.get(image["image_url"], headers=auth_headers(submitter))
+    assert attachment.status_code == 200, attachment.text
+    assert attachment.content == b"pngdata"
     assert client.get(f"/api/issues/{issue_id}", headers=auth_headers(submitter)).status_code == 200
     submitter_list = client.get(f"/api/tracks/{track.id}/issues", headers=auth_headers(submitter))
     assert submitter_list.status_code == 200
@@ -504,7 +512,12 @@ def test_add_comment_persists_images(client, db_session, factory, auth_headers):
     assert response.status_code == 201
     body = response.json()
     assert len(body["images"]) == 2
-    assert all(image["image_url"].startswith("/uploads/comment_images/") for image in body["images"])
+    for image, expected in zip(body["images"], [b"pngdata", b"webpdata"]):
+        assert image["image_url"].startswith(f"/api/comment-images/{image['id']}/file?revision=")
+        assert datetime.fromisoformat(unquote(image["image_url"].split("?revision=", 1)[1])) == datetime.fromisoformat(image["created_at"])
+        attachment = client.get(image["image_url"], headers=auth_headers(submitter))
+        assert attachment.status_code == 200, attachment.text
+        assert attachment.content == expected
 
     comments = db_session.scalars(select(Comment).where(Comment.issue_id == issue.id)).all()
     assert len(comments) == 1
@@ -649,7 +662,7 @@ def test_create_issue_accepts_r2_audio_key_scoped_to_own_track(
         SimpleNamespace(
             object_exists=lambda key: True,
             download_to_temp=lambda key: __import__("pathlib").Path(factory._audio_file(stem="issue-r2", ext=".wav")),
-            public_url=lambda key: f"https://cdn.example.com/{key}",
+            generate_download_url=lambda key: f"https://download.example.com/{key}?signed=test",
         ),
     )
     producer = factory.user(role="producer")
@@ -754,7 +767,7 @@ def test_issue_audio_route_redirects_r2_attachments(client, db_session, factory,
     monkeypatch.setitem(
         sys.modules,
         "app.services.r2",
-        SimpleNamespace(public_url=lambda key: f"https://cdn.example.com/{key}"),
+        SimpleNamespace(generate_download_url=lambda key: f"https://download.example.com/{key}?signed=test"),
     )
 
     response = client.get(
@@ -764,7 +777,8 @@ def test_issue_audio_route_redirects_r2_attachments(client, db_session, factory,
     )
 
     assert response.status_code == 302
-    assert response.headers["location"] == "https://cdn.example.com/issues/1/example.wav"
+    assert response.headers["location"] == "https://download.example.com/issues/1/example.wav?signed=test"
+    assert response.headers["cache-control"] == "private, no-store"
 
 
 def test_list_issues_for_track(client, factory, auth_headers):

@@ -833,3 +833,78 @@ def test_cleanup_expired_exports_uses_album_bound_artifacts(tmp_path, monkeypatc
     assert export_path.exists() is False
     with albums_router._export_temp_store_lock:
         assert download_id not in albums_router._export_temp_store
+
+
+def test_composer_candidates_circle_scope_and_search(client, db_session, factory, auth_headers):
+    owner = factory.user(role="producer")
+    nova = factory.user(username="nova", display_name="Twin")
+    echo = factory.user(username="echo", display_name="Twin")
+    co_producer = factory.user(username="co-producer")
+    outsider = factory.user(role="producer")
+    deleted = factory.user(username="deleted")
+    suspended = factory.user(username="suspended")
+    literal = factory.user(username="literal%_name")
+    circle = client.post(
+        "/api/circles", headers=auth_headers(owner), json={"name": "Candidate Circle"}
+    ).json()
+    circle_id = circle["id"]
+    # Owners remain in scope even when a legacy circle lacks their membership link.
+    db_session.query(CircleMember).filter_by(circle_id=circle_id, user_id=owner.id).delete()
+    for user in [nova, echo, co_producer, deleted, suspended, literal]:
+        db_session.add(CircleMember(
+            circle_id=circle_id, user_id=user.id,
+            role="co_producer" if user == co_producer else "member",
+        ))
+    deleted.deleted_at = datetime.now(timezone.utc)
+    suspended.suspended_at = datetime.now(timezone.utc)
+    album = factory.album(producer=owner, mastering_engineer=echo)
+    album.circle_id = circle_id
+    db_session.commit()
+    url = f"/api/albums/{album.id}/composer-candidates"
+    expected_ids = sorted([owner.id, nova.id, echo.id, co_producer.id, literal.id])
+
+    response = client.get(url, headers=auth_headers(co_producer))
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()] == expected_ids
+    assert all(set(row) == {"id", "username", "display_name"} for row in response.json())
+    for query, ids in [
+        ("  TWIN  ", [nova.id, echo.id]),
+        ("NoVa", [nova.id]),
+        (str(echo.id), [echo.id]),
+        ("%", [literal.id]),
+        ("_", [literal.id]),
+        ("9" * 100, []),
+        ("9007199254740992", []),
+    ]:
+        result = client.get(url, params={"q": query}, headers=auth_headers(owner))
+        assert result.status_code == 200
+        assert [row["id"] for row in result.json()] == ids
+    for user in [nova, outsider]:
+        assert client.get(url, headers=auth_headers(user)).status_code == 403
+    assert client.get("/api/albums/999999/composer-candidates", headers=auth_headers(owner)).json() == {
+        "detail": "Album not found."
+    }
+    assert client.get("/api/albums/999999/composer-candidates", headers=auth_headers(owner)).status_code == 404
+
+
+def test_composer_candidates_independent_album_and_limit(client, db_session, factory, auth_headers):
+    producer = factory.user(role="producer")
+    member = factory.user()
+    album = factory.album(producer=producer, mastering_engineer=member)
+    accounts = [factory.user(username=f"candidate-{index:02}") for index in range(52)]
+    deleted = factory.user(username="candidate-deleted")
+    deleted.deleted_at = datetime.now(timezone.utc)
+    suspended = factory.user(username="candidate-suspended")
+    suspended.suspended_at = datetime.now(timezone.utc)
+    db_session.commit()
+    url = f"/api/albums/{album.id}/composer-candidates"
+    assert client.get(url, headers=auth_headers(producer)).json() == []
+    assert client.get(url, headers=auth_headers(member)).status_code == 403
+    response = client.get(url, params={"q": "candidate"}, headers=auth_headers(producer))
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()] == [user.id for user in accounts[:50]]
+    response = client.get(url, params={"q": str(accounts[-1].id)}, headers=auth_headers(producer))
+    assert response.json() == [{
+        "id": accounts[-1].id, "username": accounts[-1].username,
+        "display_name": accounts[-1].display_name,
+    }]

@@ -108,6 +108,7 @@ from app.services.track_queries import (
     current_source_version,
     get_all_album_member_ids,
     is_track_composer_actor,
+    latest_current_cycle_master_delivery,
     log_track_event,
     track_composer_actor_ids_for_notify,
     track_composer_ids,
@@ -115,6 +116,7 @@ from app.services.track_queries import (
 from app.schemas.audio_analysis import AudioSpecs
 from app.services.audio_analysis import enqueue_audio_analysis
 from app.track_permissions import (
+    can_access_master_audio,
     ensure_album_visibility,
     ensure_track_visibility,
     mask_user_read_if_needed,
@@ -170,13 +172,13 @@ def sanitize_filename(name: str) -> str:
     """Return a filesystem-safe stem from an arbitrary Unicode string.
 
     Unsafe characters are replaced with underscores; consecutive underscores
-    and whitespace are collapsed.  Truncated to 200 chars to leave room for
-    a version suffix and file extension.
+    and whitespace are collapsed. Truncated to 180 characters; `_save_upload`
+    also enforces the filesystem byte limit after adding suffixes.
     """
     s = _UNSAFE_CHARS.sub('_', name)
     s = _COLLAPSE.sub('_', s)
     s = s.strip('_')
-    return s[:200] or 'untitled'
+    return s[:180] or 'untitled'
 
 
 def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float | None]:
@@ -189,7 +191,11 @@ def _save_upload(file: UploadFile, stem: str | None = None) -> tuple[str, float 
             detail=f"Unsupported audio format: {ext}. Allowed: {', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}",
         )
     upload_dir = settings.get_upload_path()
-    unique_name = f"{stem or uuid.uuid4().hex}{ext}"
+    suffix = f"_{uuid.uuid4().hex}{ext}"
+    # Linux limits each filename component to 255 bytes, not Unicode characters.
+    stem_bytes = (stem or "audio").encode("utf-8")[:255 - len(suffix.encode("utf-8"))]
+    bounded_stem = stem_bytes.decode("utf-8", errors="ignore")
+    unique_name = f"{bounded_stem}{suffix}"
     dest = upload_dir / unique_name
     stream_upload_sync(file, dest, MAX_AUDIO_UPLOAD_SIZE)
     meta = extract_audio_metadata(dest)
@@ -567,13 +573,12 @@ def _serve_path(path_str: str, filename_prefix: str, *, immutable: bool = False)
 def _serve_audio(
     file_path: str, storage_backend: str, filename_prefix: str, resolve: str | None = None,
     *, immutable: bool = False,
-) -> FileResponse | RedirectResponse | dict:
+) -> FileResponse | RedirectResponse | JSONResponse | dict:
     """Serve an audio file from local disk or redirect to R2 presigned URL.
 
     When ``resolve='json'`` and storage is R2, return a JSON dict with the
-    presigned URL instead of a 307 redirect.  This lets the frontend obtain
-    the direct R2 URL without hitting cross-origin redirect issues (e.g.
-    wavesurfer.js ``fetch`` cannot follow a cross-origin 307).
+    presigned URL instead of a redirect. This lets the frontend obtain the
+    direct R2 URL without cross-origin redirect issues.
 
     Set ``immutable=True`` only for versioned URLs whose content can never
     change (e.g. source-version snapshots addressed by their numeric ID).
@@ -581,12 +586,13 @@ def _serve_audio(
     so that browsers always revalidate after a new file is uploaded.
     """
     if storage_backend == "r2":
-        from app.services.r2 import public_url
+        from app.services.r2 import generate_download_url
 
-        url = public_url(file_path)
+        url = generate_download_url(file_path)
+        headers = {"Cache-Control": "private, no-store"}
         if resolve == "json":
-            return JSONResponse({"url": url})
-        return RedirectResponse(url, status_code=302)
+            return JSONResponse({"url": url}, headers=headers)
+        return RedirectResponse(url, status_code=302, headers=headers)
     if resolve == "json":
         return {"url": None}
     return _serve_path(file_path, filename_prefix, immutable=immutable)
@@ -1090,8 +1096,8 @@ def request_master_delivery_upload(
     from app.services.r2 import make_object_key
 
     delivery_number = 1
-    delivery = current_master_delivery(track)
-    if delivery and delivery.workflow_cycle == track.workflow_cycle:
+    delivery = latest_current_cycle_master_delivery(track)
+    if delivery is not None:
         delivery_number = delivery.delivery_number + 1
     object_key = make_object_key(f"tracks/{track_id}/master", delivery_number, params.filename)
     return _presign_upload(object_key, params.content_type)
@@ -1114,8 +1120,8 @@ def confirm_master_delivery_upload(
     _ensure_delivery_upload_permission(track, album, current_user)
 
     delivery_number = 1
-    current_del = current_master_delivery(track)
-    if current_del and current_del.workflow_cycle == track.workflow_cycle:
+    current_del = latest_current_cycle_master_delivery(track)
+    if current_del is not None:
         delivery_number = current_del.delivery_number + 1
     _validate_r2_object_key(
         params.object_key,
@@ -1164,15 +1170,7 @@ def confirm_delivery(
     # Only the latest delivery in the current workflow cycle may be confirmed.
     # Confirming a stale delivery would let the mastering engineer advance the
     # track from an outdated upload.
-    latest_in_cycle = db.scalar(
-        select(MasterDelivery)
-        .where(
-            MasterDelivery.track_id == track_id,
-            MasterDelivery.workflow_cycle == track.workflow_cycle,
-        )
-        .order_by(MasterDelivery.delivery_number.desc(), MasterDelivery.id.desc())
-        .limit(1)
-    )
+    latest_in_cycle = latest_current_cycle_master_delivery(track)
     if latest_in_cycle is None or latest_in_cycle.id != delivery.id:
         raise HTTPException(status_code=409, detail="Only the latest master delivery can be confirmed.")
     _ensure_delivery_confirm_permission(track, album, current_user)
@@ -2324,8 +2322,8 @@ def upload_master_delivery(
         raise HTTPException(status_code=422, detail="Master delivery requires an audio file.")
 
     delivery_number = 1
-    current_delivery = current_master_delivery(track)
-    if current_delivery and current_delivery.workflow_cycle == track.workflow_cycle:
+    current_delivery = latest_current_cycle_master_delivery(track)
+    if current_delivery is not None:
         delivery_number = current_delivery.delivery_number + 1
     file_path, _duration = _save_upload(file, f"{sanitize_filename(track.title)}_master_v{delivery_number}")
     delivery = MasterDelivery(
@@ -2365,9 +2363,9 @@ def approve_final_review(
         not is_album_manager(album, current_user, db) and not is_track_composer_actor(track, album, current_user.id, db)
     ):
         raise HTTPException(status_code=403, detail="Only the producer or a track composer can approve final review.")
-    delivery = current_master_delivery(track)
+    delivery = latest_current_cycle_master_delivery(track)
     if delivery is None:
-        raise HTTPException(status_code=409, detail="No master delivery available.")
+        raise HTTPException(status_code=409, detail="No master delivery available in the current workflow cycle.")
 
     now = datetime.now(timezone.utc)
     is_producer = is_album_manager(album, current_user, db)
@@ -2595,8 +2593,10 @@ def serve_master_audio(
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
-    ensure_track_visibility(track, current_user, db)
+    album = ensure_track_visibility(track, current_user, db)
     delivery = current_master_delivery(track)
+    if not can_access_master_audio(current_user, track, album, delivery):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this master audio.")
     if delivery is None:
         raise HTTPException(status_code=404, detail="No master delivery is available for this track.")
     if not delivery.file_path:
@@ -2618,11 +2618,13 @@ def get_master_delivery_audio(
     track = db.get(Track, track_id)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
-    ensure_track_visibility(track, current_user, db)
+    album = ensure_track_visibility(track, current_user, db)
 
     delivery = db.get(MasterDelivery, delivery_id)
     if delivery is None or delivery.track_id != track_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found.")
+    if not can_access_master_audio(current_user, track, album, delivery):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this master audio.")
     if not delivery.file_path:
         raise HTTPException(status_code=404, detail="This master delivery does not include an audio file.")
 

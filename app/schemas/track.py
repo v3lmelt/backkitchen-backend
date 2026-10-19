@@ -10,6 +10,7 @@ from app.schemas.issue import IssueRead
 from app.schemas.user import UserRead
 from app.schemas.audio_analysis import AudioAnalysisRead, AudioSpecs, AudioSpecCheck
 from app.schemas.workflow import (
+    ReopenRequestRead,
     WorkflowConfigSchema,
     WorkflowEventRead,
     WorkflowStepDefSchema,
@@ -161,9 +162,12 @@ class TrackRead(TrackBase):
     viewer_is_album_manager: bool = False
     viewer_can_force_track_status: bool = False
     viewer_can_manage_review: bool = False
+    viewer_can_open_workflow: bool = False
+    viewer_has_pending_work: bool = False
     # Server-computed viewer-context flags (replace client-side re-derivation).
     viewer_is_composer_actor: bool = False
     viewer_is_mastering_participant: bool = False
+    viewer_can_access_master_audio: bool = False
     # None when the track has no current workflow step.
     viewer_is_step_assignee: bool | None = None
     review_state: TrackReviewStateRead | None = None
@@ -190,6 +194,7 @@ class TrackRead(TrackBase):
     current_source_version: TrackSourceVersionRead | None = None
     current_master_delivery: MasterDeliveryRead | None = None
     pending_source_followup_request: SourceFollowupRequestRead | None = None
+    pending_reopen_request: ReopenRequestRead | None = None
     allowed_actions: list[str] = []
     workflow_step: "WorkflowStepDefSchema | None" = None
     workflow_transitions: list["WorkflowTransitionOption"] | None = None

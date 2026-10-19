@@ -11,7 +11,8 @@ from app.anon import fnv1a_anon_token
 from app.circle_permissions import album_manager_user_ids, is_album_manager, require_album_manager
 from app.models.album import Album
 from app.models.comment import Comment
-from app.models.issue import Issue, IssueStatus
+from app.models.issue import Issue, IssuePhase, IssueStatus
+from app.models.master_delivery import MasterDelivery
 from app.models.stage_assignment import StageAssignment
 from app.models.track import Track, TrackStatus
 from app.models.user import User
@@ -20,6 +21,7 @@ from app.services.track_queries import (
     engaged_assignment_status_clause,
     get_album_member_ids,
     is_track_composer,
+    latest_current_cycle_master_delivery,
     track_composer_ids,
 )
 from app.workflow_engine import (
@@ -29,6 +31,7 @@ from app.workflow_engine import (
     get_steps,
     infer_issue_phase_for_step,
     parse_workflow_config,
+    target_is_mastering_related,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +105,39 @@ def is_mastering_participant(
         return viewer_is_album_manager
     db = Session.object_session(album)
     return is_album_manager(album, user, db) if db is not None else user.id == album.producer_id
+
+
+def can_access_master_audio(
+    user: User,
+    track: Track,
+    album: Album,
+    delivery: MasterDelivery | None = None,
+    *,
+    viewer_is_mastering_participant: bool | None = None,
+) -> bool:
+    """Authorize master audio after the caller has checked track visibility.
+
+    Participants keep workspace/history access. Other visible viewers may only
+    access the latest file delivery in a completed track's current cycle.
+    """
+    if delivery is not None and delivery.track_id != track.id:
+        return False
+    participant = (
+        viewer_is_mastering_participant
+        if viewer_is_mastering_participant is not None
+        else is_mastering_participant(user, track, album)
+    )
+    if participant:
+        return True
+    if track.status != TrackStatus.COMPLETED:
+        return False
+    current = latest_current_cycle_master_delivery(track)
+    return (
+        current is not None
+        and current.delivery_kind == "file"
+        and bool(current.file_path)
+        and (delivery is None or delivery.id == current.id)
+    )
 
 
 def _hash_user_id(user_id: int) -> str:
@@ -252,16 +288,59 @@ def track_allowed_actions(
     )
 
 
-def issue_visible_to_user(issue: Issue, track: Track, user: User) -> bool:
+def issue_phase_requires_mastering_participant(phase: str, album: Album | None) -> bool:
+    if phase in {IssuePhase.MASTERING, IssuePhase.FINAL_REVIEW, "mastering_revision"}:
+        return True
+    if phase in {IssuePhase.PEER, IssuePhase.PRODUCER} or album is None:
+        return False
+    steps = get_steps(parse_workflow_config(album))
+    step = get_step_by_id(steps, phase)
+    if step is None:
+        return False
+    if infer_issue_phase_for_step(step) == IssuePhase.FINAL_REVIEW or target_is_mastering_related(step):
+        return True
+    if step.type == "revision" and step.return_to:
+        return_step = get_step_by_id(steps, step.return_to)
+        return return_step is not None and (
+            infer_issue_phase_for_step(return_step) == IssuePhase.FINAL_REVIEW
+            or target_is_mastering_related(return_step)
+        )
+    return False
+
+
+def issue_visible_to_user(
+    issue: Issue, track: Track, user: User, *,
+    viewer_is_album_manager: bool | None = None,
+    viewer_is_mastering_participant: bool | None = None,
+) -> bool:
     album = track.album
-    db = Session.object_session(album) if album is not None else None
-    if album is not None and db is not None and is_album_manager(album, user, db):
+    if (
+        issue_phase_requires_mastering_participant(issue.phase, album)
+        or issue.master_delivery_id is not None
+    ):
+        if album is None:
+            return False
+        participant = (
+            viewer_is_mastering_participant
+            if viewer_is_mastering_participant is not None
+            else is_mastering_participant(
+                user, track, album, viewer_is_album_manager=viewer_is_album_manager,
+            )
+        )
+        if not participant:
+            return False
+    if viewer_is_album_manager is None:
+        db = Session.object_session(album) if album is not None else None
+        viewer_is_album_manager = (
+            album is not None and db is not None and is_album_manager(album, user, db)
+        )
+    if album is not None and viewer_is_album_manager:
         return True
     if album is not None and user.id == album.producer_id:
         return True
     return not (
-        is_track_composer(track, user.id)
-        and issue.status in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}
+        issue.status in {IssueStatus.PENDING_DISCUSSION, IssueStatus.INTERNAL_RESOLVED}
+        and is_track_composer(track, user.id)
     )
 
 

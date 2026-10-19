@@ -14,8 +14,8 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Cache-Control for public R2 objects (30 days)
-_R2_CACHE_CONTROL = "public, max-age=2592000"
+# Audio objects and signed downloads must not be stored in shared or browser caches.
+_R2_CACHE_CONTROL = "private, no-store"
 
 
 @lru_cache(maxsize=1)
@@ -31,10 +31,18 @@ def get_r2_client():
     )
 
 
-def public_url(object_key: str) -> str:
-    """Return the public CDN URL for an R2 object."""
-    base = settings.R2_PUBLIC_URL.rstrip("/")
-    return f"{base}/{object_key}"
+def generate_download_url(object_key: str) -> str:
+    """Return a short-lived signed GET URL for an authorized audio request."""
+    client = get_r2_client()
+    return client.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": settings.R2_BUCKET_NAME,
+            "Key": object_key,
+            "ResponseCacheControl": _R2_CACHE_CONTROL,
+        },
+        ExpiresIn=300,
+    )
 
 
 def generate_upload_url(object_key: str, content_type: str) -> str:

@@ -7,6 +7,7 @@ import time
 import uuid
 import zipfile
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
-from sqlalchemy import func as sqlfunc, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import func as sqlfunc, func, or_, select
+from sqlalchemy.orm import Session, selectinload
 
 from app.admin_permissions import has_admin_role
 from app.circle_permissions import album_viewer_circle_role, is_album_manager, is_circle_bound_album_manager, is_circle_manager, require_album_manager
@@ -36,6 +37,7 @@ from app.models.workflow_template import WorkflowTemplate
 from app.notifications import notify
 from app.realtime import broadcast_track_updated
 from app.schemas.schemas import AlbumCreate, AlbumDeadlineUpdate, AlbumMetadataUpdate, AlbumRead, AlbumStats, AlbumTeamUpdate, TrackOrderUpdate, TrackRead, UserRead, WebhookConfig, WebhookDeliveryRead, WorkflowConfigSchema, WorkflowEventRead
+from app.schemas.user import ComposerAccountRead
 from app.security import get_current_user
 from app.services.album_scope import AlbumScope, album_scope_condition
 from app.services.attachments import ALLOWED_IMAGE_EXTENSIONS, ALLOWED_IMAGE_TYPES
@@ -43,7 +45,7 @@ from app.services.upload import stream_upload
 from app.services.webhook import build_webhook_payload, post_webhook
 from app.services.track_queries import (
     album_tracks_completed,
-    current_master_delivery,
+    latest_current_cycle_master_delivery,
     get_album_member_ids,
     get_all_album_member_ids,
     is_album_completed,
@@ -51,13 +53,50 @@ from app.services.track_queries import (
 )
 from app.services.audio_specs import read_specs
 from app.schemas.audio_analysis import AudioSpecs
-from app.track_permissions import ensure_album_manager, ensure_album_visibility, peer_identity_anonymize_user_ids_for_viewer
-from app.track_serializers import annotate_workflow_step_metadata, build_event_read, build_track_read
+from app.track_permissions import ensure_album_manager, ensure_album_visibility, is_mastering_participant, issue_visible_to_user, peer_identity_anonymize_user_ids_for_viewer
+from app.track_serializers import IssueEventAudience, annotate_workflow_step_metadata, build_event_read, build_track_read, issue_event_visible_to_audience
 from app.workflow_engine import migrate_tracks_on_workflow_change, parse_workflow_config
 from app.workflow_defaults import DEFAULT_WORKFLOW_CONFIG
-from app.workflow_user_scope import validate_circle_workflow_user_scope
+from app.workflow_user_scope import circle_workflow_user_ids, validate_circle_workflow_user_scope
 
 router = APIRouter(prefix="/api/albums", tags=["albums"])
+
+
+@router.get("/{album_id}/composer-candidates", response_model=list[ComposerAccountRead])
+def list_composer_candidates(
+    album_id: int,
+    q: str = Query(default="", max_length=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[ComposerAccountRead]:
+    album = db.get(Album, album_id)
+    if album is None:
+        raise HTTPException(status_code=404, detail="Album not found.")
+    require_album_manager(album, current_user, db)
+
+    query = q.strip()
+    statement = select(User).where(User.deleted_at.is_(None), User.suspended_at.is_(None))
+    if album.circle_id is not None:
+        user_ids = circle_workflow_user_ids(db, album.circle_id)
+        if not user_ids:
+            return []
+        statement = statement.where(User.id.in_(user_ids))
+    elif not query:
+        return []
+
+    if query:
+        matches = [
+            User.username.icontains(query, autoescape=True),
+            User.display_name.icontains(query, autoescape=True),
+        ]
+        if query.isascii() and query.isdecimal() and 1 <= int(query) <= 9007199254740991:
+            matches.append(User.id == int(query))
+        statement = statement.where(or_(*matches))
+
+    return [
+        ComposerAccountRead.model_validate(user)
+        for user in db.scalars(statement.order_by(User.id).limit(50)).all()
+    ]
 
 
 def _parse_album_json(value: str | None, *, fallback: str) -> list[str] | dict[str, str] | None:
@@ -222,6 +261,111 @@ def _apply_album_team_changes(
             db.add(AlbumMember(album_id=album.id, user_id=user_id))
 
 
+def _iter_visible_album_events(
+    albums: list[Album],
+    active_album_ids: set[int],
+    db: Session,
+    current_user: User,
+    *,
+    event_type: str | None = None,
+) -> Iterator[tuple[int, WorkflowEventRead]]:
+    """Read bounded event pages; callers remove albums after their visible cap."""
+    if not active_album_ids:
+        return
+    album_by_id = {album.id: album for album in albums}
+    album_managers = {
+        album.id: is_album_manager(album, current_user, db)
+        for album in albums
+    }
+    fallback_audiences = {
+        album.id: IssueEventAudience(
+            album=album,
+            known_issue_ids=frozenset(),
+            visible_issue_ids=frozenset(),
+            can_see_mastering=album_managers[album.id] or current_user.id == album.mastering_engineer_id,
+        )
+        for album in albums
+    }
+    audiences_by_track: dict[int, IssueEventAudience] = {}
+    anonymize_by_album: dict[int, set[int]] = defaultdict(set)
+    tracks = db.scalars(
+        select(Track)
+        .where(Track.album_id.in_(active_album_ids))
+        .options(
+            selectinload(Track.composer_links),
+            selectinload(Track.issues).load_only(
+                Issue.id, Issue.track_id, Issue.phase, Issue.status, Issue.master_delivery_id,
+            ),
+        )
+    ).all()
+    for track in tracks:
+        album = album_by_id[track.album_id]
+        participant = is_mastering_participant(
+            current_user, track, album, viewer_is_album_manager=album_managers[album.id],
+        )
+        audiences_by_track[track.id] = IssueEventAudience(
+            album=album,
+            known_issue_ids=frozenset(issue.id for issue in track.issues),
+            visible_issue_ids=frozenset(
+                issue.id for issue in track.issues
+                if issue_visible_to_user(
+                    issue, track, current_user,
+                    viewer_is_album_manager=album_managers[album.id],
+                    viewer_is_mastering_participant=participant,
+                )
+            ),
+            can_see_mastering=participant,
+        )
+        anonymize_by_album[album.id].update(
+            peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
+        )
+
+    actors_by_id: dict[int, User] = {}
+    fetched_actor_ids: set[int] = set()
+    cursor: tuple[datetime, int] | None = None
+    page_size = 100
+    while active_album_ids:
+        statement = select(WorkflowEvent).where(WorkflowEvent.album_id.in_(active_album_ids))
+        if event_type:
+            statement = statement.where(WorkflowEvent.event_type == event_type)
+        if cursor is not None:
+            created_at, event_id = cursor
+            statement = statement.where(or_(
+                WorkflowEvent.created_at < created_at,
+                (WorkflowEvent.created_at == created_at) & (WorkflowEvent.id < event_id),
+            ))
+        page = list(db.scalars(
+            statement.order_by(WorkflowEvent.created_at.desc(), WorkflowEvent.id.desc()).limit(page_size)
+        ).all())
+        if not page:
+            return
+        actor_ids = {
+            event.actor_user_id for event in page
+            if event.actor_user_id is not None and event.actor_user_id not in fetched_actor_ids
+        }
+        if actor_ids:
+            actors_by_id.update({
+                actor.id: actor
+                for actor in db.scalars(select(User).where(User.id.in_(actor_ids))).all()
+            })
+            fetched_actor_ids.update(actor_ids)
+        for event in page:
+            if event.album_id not in active_album_ids:
+                continue
+            audience = audiences_by_track.get(event.track_id)
+            if audience is None or audience.album.id != event.album_id:
+                audience = fallback_audiences[event.album_id]
+            event_read = build_event_read(
+                event, db, users_cache=actors_by_id,
+                anonymize_user_ids=anonymize_by_album.get(event.album_id),
+            )
+            if issue_event_visible_to_audience(event.event_type, event_read.payload, audience):
+                yield event.album_id, event_read
+        if len(page) < page_size:
+            return
+        cursor = page[-1].created_at, page[-1].id
+
+
 def _build_album_stats_summary_map(
     albums: list[Album],
     db: Session,
@@ -316,56 +460,15 @@ def _build_album_stats_summary_map(
                     pass
                 break
 
-    ranked_events = (
-        select(
-            WorkflowEvent.id.label("event_id"),
-            func.row_number()
-            .over(
-                partition_by=WorkflowEvent.album_id,
-                order_by=(WorkflowEvent.created_at.desc(), WorkflowEvent.id.desc()),
-            )
-            .label("event_rank"),
-        )
-        .where(WorkflowEvent.album_id.in_(album_ids))
-        .subquery()
-    )
-    recent_events = list(
-        db.scalars(
-            select(WorkflowEvent)
-            .join(ranked_events, WorkflowEvent.id == ranked_events.c.event_id)
-            .where(ranked_events.c.event_rank <= recent_event_limit)
-            .order_by(WorkflowEvent.album_id, WorkflowEvent.created_at.desc(), WorkflowEvent.id.desc())
-        ).all()
-    )
-
-    actor_ids = {event.actor_user_id for event in recent_events if event.actor_user_id}
-    actors_by_id: dict[int, User] = {}
-    if actor_ids:
-        actors_by_id = {
-            user.id: user
-            for user in db.scalars(select(User).where(User.id.in_(actor_ids))).all()
-        }
-
-    anonymize_user_ids_by_album: dict[int, set[int]] = defaultdict(set)
-    if recent_events:
-        recent_event_album_ids = sorted({event.album_id for event in recent_events})
-        for track in db.scalars(select(Track).where(Track.album_id.in_(recent_event_album_ids))).all():
-            album = album_by_id.get(track.album_id)
-            if album is None:
-                continue
-            anonymize_user_ids_by_album[track.album_id].update(
-                peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
-            )
-
-    for event in recent_events:
-        stats_by_id[event.album_id].recent_events.append(
-            build_event_read(
-                event,
-                db,
-                users_cache=actors_by_id,
-                anonymize_user_ids=anonymize_user_ids_by_album.get(event.album_id),
-            )
-        )
+    if recent_event_limit > 0:
+        active_album_ids = set(album_ids)
+        for album_id, event_read in _iter_visible_album_events(albums, active_album_ids, db, current_user):
+            recent = stats_by_id[album_id].recent_events
+            recent.append(event_read)
+            if len(recent) >= recent_event_limit:
+                active_album_ids.remove(album_id)
+            if not active_album_ids:
+                break
 
     return stats_by_id
 
@@ -806,32 +909,18 @@ def get_album_activity(
         raise HTTPException(status_code=404, detail="Album not found.")
     ensure_album_visibility(album, current_user, db)
 
-    stmt = select(WorkflowEvent).where(WorkflowEvent.album_id == album_id)
-    if event_type:
-        stmt = stmt.where(WorkflowEvent.event_type == event_type)
-    stmt = stmt.order_by(WorkflowEvent.created_at.desc()).offset(offset).limit(limit)
-
-    events = list(db.scalars(stmt).all())
-    actor_ids = {e.actor_user_id for e in events if e.actor_user_id}
-    actors_by_id: dict[int, User] = {}
-    if actor_ids:
-        actors_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(actor_ids))).all()}
-
-    anonymize_user_ids: set[int] = set()
-    for track in db.scalars(select(Track).where(Track.album_id == album_id)).all():
-        anonymize_user_ids.update(
-            peer_identity_anonymize_user_ids_for_viewer(db, track, album, current_user)
-        )
-
-    return [
-        build_event_read(
-            e,
-            db,
-            users_cache=actors_by_id,
-            anonymize_user_ids=anonymize_user_ids,
-        )
-        for e in events
-    ]
+    events: list[WorkflowEventRead] = []
+    visible_offset = 0
+    for _, event_read in _iter_visible_album_events(
+        [album], {album_id}, db, current_user, event_type=event_type,
+    ):
+        if visible_offset < offset:
+            visible_offset += 1
+            continue
+        events.append(event_read)
+        if len(events) >= limit:
+            break
+    return events
 
 
 @router.get("/{album_id}/tracks", response_model=list[TrackRead])
@@ -1134,8 +1223,8 @@ async def export_album_stream(
     # Snapshot track data to avoid lazy-load issues inside the async generator
     track_snapshots: list[dict] = []
     for track in completed_tracks:
-        delivery = current_master_delivery(track)
-        if delivery is None:
+        delivery = latest_current_cycle_master_delivery(track)
+        if delivery is None or delivery.delivery_kind != "file" or not delivery.file_path:
             continue
         track_snapshots.append({
             "title": track.title,
